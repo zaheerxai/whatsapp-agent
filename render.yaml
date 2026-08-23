@@ -3,7 +3,7 @@ services:
     name: mojo-whatsapp-agent
     runtime: python
     plan: free
-    region: oregon                    # change if you prefer (oregon, frankfurt, singapore, etc.)
+    region: singapore                  # change if you prefer (oregon, frankfurt, singapore, etc.)
     buildCommand: pip install -r requirements.txt
     startCommand: python whatsapp_agent.py
     healthCheckPath: /health

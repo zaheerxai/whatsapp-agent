@@ -35,6 +35,18 @@ from supabase import create_client, Client
 # Import this AFTER load_dotenv() so it can see the variables
 import admin_commands
 
+import time as _time
+
+def _timed(label):
+    class Timer:
+        def __enter__(self):
+            self.start = _time.perf_counter()
+            return self
+        def __exit__(self, *args):
+            ms = (_time.perf_counter() - self.start) * 1000
+            print(f"[TIMING] {label}: {ms:.0f} ms")
+    return Timer()
+
 
 DEFAULT_UTC_OFFSET = 5.0  # Default to Pakistan Standard Time (+5)
 DEFAULT_TIMEZONE = "Asia/Karachi"
@@ -252,6 +264,24 @@ CONTACTS_CACHE_TTL = 300  # Cache expires after 5 minutes (300 seconds)
 # --- CHAT HISTORY CACHE ---
 CHAT_HISTORY_CACHE = {}
 MAX_HISTORY_CACHE = 150  # Matches the max limit in detect_summary_history_limit
+
+
+FEATURE_FLAG_CACHE = {}
+FEATURE_FLAG_TTL = 60  # seconds
+
+def is_feature_enabled(chat_id, feature):
+    """Cached version – original logic stays the same."""
+    key = (chat_id, feature)
+    now = time.time()
+    if key in FEATURE_FLAG_CACHE:
+        enabled, ts = FEATURE_FLAG_CACHE[key]
+        if now - ts < FEATURE_FLAG_TTL:
+            return enabled
+
+    # original logic (copy from admin_commands or keep calling it)
+    enabled = admin_commands.is_feature_enabled(chat_id, feature)  # keep using the real one
+    FEATURE_FLAG_CACHE[key] = (enabled, now)
+    return enabled
 
 def async_update_group_cache(chat_id, group_jid, contacts_map):
     """Fetches group metadata in the background so it doesn't block AI replies."""
@@ -1721,57 +1751,60 @@ def process_message(client, message):
         print(f"[STALE MESSAGE SKIPPED] from {sender_number} (Age: {int(time.time() - msg_time)}s)")
         return
 
-    if admin_commands.is_feature_enabled(chat_id, "chat_memory"):
+    with _timed("1. feature flags + memory + timezone"):
+        if admin_commands.is_feature_enabled(chat_id, "chat_memory"):
+            # FIX: Mapped to db_sender_id (LID)
+            maybe_save_memory(chat_id, db_sender_id, text_content)
+
+        # ==========================================
+        # LOGIC 3: GENERATE AND SAVE AI REPLY
+        # ==========================================
+        
+        lowered_text = text_content.lower()
+        
+        history_limit = detect_summary_history_limit(text_content)
+        if history_limit is not None:
+            print(f"[DYNAMIC CONTEXT EXTENSION] Fetching {history_limit} messages for summary request.")
+        else:
+            history_limit = 20
+
+        ai_answer = None
+
+        # 1. Personal timezone setting
         # FIX: Mapped to db_sender_id (LID)
-        maybe_save_memory(chat_id, db_sender_id, text_content)
+        tz_reply = maybe_set_timezone(db_sender_id, text_content)
+        if tz_reply:
+            ai_answer = tz_reply
 
-    # ==========================================
-    # LOGIC 3: GENERATE AND SAVE AI REPLY
-    # ==========================================
-    
-    lowered_text = text_content.lower()
-    
-    history_limit = detect_summary_history_limit(text_content)
-    if history_limit is not None:
-        print(f"[DYNAMIC CONTEXT EXTENSION] Fetching {history_limit} messages for summary request.")
-    else:
-        history_limit = 20
+        # 2. Reminders Check (Only if 'reminders' feature is explicitly ON)
+        elif admin_commands.is_feature_enabled(chat_id, "reminders"):
+            if any(phrase in lowered_text for phrase in ("my reminders", "list reminders", "what reminders", "show reminders")):
+                print("[REMINDER INTENT] Listing active reminders...")
+                # FIX: Mapped to db_sender_id (LID)
+                ai_answer = list_reminders(chat_id, db_sender_id)
+                
+            elif "cancel reminder" in lowered_text or "delete reminder" in lowered_text:
+                print("[REMINDER INTENT] Cancelling reminder...")
+                # FIX: Mapped to db_sender_id (LID)
+                ai_answer = cancel_reminders(chat_id, db_sender_id, text_content)
+                
+            elif "remind" in lowered_text:
+                print("[REMINDER INTENT DETECTED] Routing to deterministic time parser...")
+                # FIX: Mapped to db_sender_id (LID)
+                ai_answer = handle_reminder_request(chat_id, db_sender_id, text_content, msg_time)
 
-    ai_answer = None
-
-    # 1. Personal timezone setting
-    # FIX: Mapped to db_sender_id (LID)
-    tz_reply = maybe_set_timezone(db_sender_id, text_content)
-    if tz_reply:
-        ai_answer = tz_reply
-
-    # 2. Reminders Check (Only if 'reminders' feature is explicitly ON)
-    elif admin_commands.is_feature_enabled(chat_id, "reminders"):
-        if any(phrase in lowered_text for phrase in ("my reminders", "list reminders", "what reminders", "show reminders")):
-            print("[REMINDER INTENT] Listing active reminders...")
-            # FIX: Mapped to db_sender_id (LID)
-            ai_answer = list_reminders(chat_id, db_sender_id)
-            
-        elif "cancel reminder" in lowered_text or "delete reminder" in lowered_text:
-            print("[REMINDER INTENT] Cancelling reminder...")
-            # FIX: Mapped to db_sender_id (LID)
-            ai_answer = cancel_reminders(chat_id, db_sender_id, text_content)
-            
-        elif "remind" in lowered_text:
-            print("[REMINDER INTENT DETECTED] Routing to deterministic time parser...")
-            # FIX: Mapped to db_sender_id (LID)
-            ai_answer = handle_reminder_request(chat_id, db_sender_id, text_content, msg_time)
-    
     # 3. Fallback to Media or General LLM Chat
     if not ai_answer:
         if media_kind:
-            # FIX: Mapped to db_sender_id (LID)
-            ai_answer = handle_media_message(message, media_kind, chat_id, db_sender_id, text_content, target_media_msg, msg_time, history_limit)
+            with _timed("2. media handling"):
+                # FIX: Mapped to db_sender_id (LID)
+                ai_answer = handle_media_message(message, media_kind, chat_id, db_sender_id, text_content, target_media_msg, msg_time, history_limit)
         else:
             # Check if basic LLM text conversation is enabled
             if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                # FIX: Mapped to db_sender_id (LID)
-                ai_answer = get_ai_response(chat_id, db_sender_id, msg_time, history_limit)
+                with _timed("3. AI response (history + contacts + LLM)"):
+                    # FIX: Mapped to db_sender_id (LID)
+                    ai_answer = get_ai_response(chat_id, db_sender_id, msg_time, history_limit)
             else:
                 print(f"[FEATURE OFF] 'ai_chat' is disabled for {chat_id}.")
                 if admin_commands.has_any_feature_enabled(chat_id):
