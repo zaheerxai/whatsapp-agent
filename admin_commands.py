@@ -27,6 +27,7 @@ Setup:
 
 import os
 import re
+import unicodedata
 
 OWNER_SENDER_ID = os.getenv("OWNER_SENDER_ID")  # bare number/LID, no @server suffix
 
@@ -68,51 +69,81 @@ def is_admin_message(sender_id, is_group):
     return bool(OWNER_SENDER_ID) and (not is_group) and sender_id == OWNER_SENDER_ID
 
 
+def _norm_name(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00a0", " ")  # non-breaking space
+    s = re.sub(r"\s+", " ", s).strip().casefold()
+    return s
+
 def resolve_chat_id(target):
-    """Resolves phone numbers, group names, or 'all'/'*' into proper WhatsApp chat_ids."""
-    target_str = str(target).strip()
-    
-    # 1. Global target
+    target_str = (target or "").strip()
+    if not target_str:
+        return target_str
     if target_str.lower() in ("all", "*"):
         return "*"
-    
-    # 2. Already a valid ID
-    if "@s.whatsapp.net" in target_str or "@g.us" in target_str:
+    if "@g.us" in target_str or "@s.whatsapp.net" in target_str:
         return target_str
 
-    # 3. Search Groups by exact/case-insensitive name
+    needle = _norm_name(target_str)
+
+    # --- Groups (same source as /chats) ---
     if _client:
         try:
-            for g in _client.get_joined_groups():
-                # Handle potential protobuf byte/string issues and invisible spaces
-                g_name = getattr(g.GroupName, "Name", "")
-                if isinstance(g_name, bytes):
-                    g_name = g_name.decode("utf-8", errors="ignore")
-                
-                clean_name = str(g_name).strip().replace('\xa0', ' ').lower()
-                if clean_name == target_str.lower():
-                    return f"{g.JID.User}@{g.JID.Server}"
+            groups = list(_client.get_joined_groups() or [])
+            exact, partial = [], []
+            for g in groups:
+                name = (getattr(getattr(g, "GroupName", None), "Name", None) or "").strip()
+                jid = getattr(g, "JID", None)
+                if not name or not jid or not getattr(jid, "User", None):
+                    continue
+                chat_id = f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
+                n = _norm_name(name)
+                if n == needle:
+                    exact.append((name, chat_id))
+                elif needle in n or n in needle:
+                    partial.append((name, chat_id))
+
+            if len(exact) == 1:
+                return exact[0][1]
+            if len(exact) > 1:
+                opts = ", ".join(f"“{n}” → {i}" for n, i in exact)
+                raise ValueError(f"Multiple groups match exactly: {opts}")
+
+            if len(partial) == 1:
+                return partial[0][1]
+            if len(partial) > 1:
+                opts = ", ".join(f"“{n}” → {i}" for n, i in partial[:8])
+                raise ValueError(
+                    f"Ambiguous group “{target_str}”. Matches: {opts}. "
+                    f"Paste the full id from /chats."
+                )
+        except ValueError:
+            raise
         except Exception as e:
             print(f"Error resolving group name: {e}")
 
-    # 4. Search Contacts by display name or nickname
+    # --- Contacts by display name / nickname ---
     if _get_contacts_map:
         try:
             res = _get_contacts_map()
             contacts_map = res[0] if isinstance(res, tuple) else res
-            for s_id, name in contacts_map.items():
-                if name and str(name).strip().lower() == target_str.lower():
-                    return s_id if "@" in s_id else f"{s_id}@s.whatsapp.net"
+            for s_id, name in (contacts_map or {}).items():
+                if name and _norm_name(name) == needle:
+                    return s_id if "@" in str(s_id) else f"{s_id}@s.whatsapp.net"
         except Exception as e:
             print(f"Error resolving contact name: {e}")
 
-    # 5. Clean phone numbers (Only if it's an actual number format)
-    clean_num = re.sub(r'\D', '', target_str)
-    if clean_num and len(clean_num) > 7:
+    # --- Phone number (not LID) ---
+    clean_num = re.sub(r"\D", "", target_str)
+    if len(clean_num) >= 8:
         return f"{clean_num}@s.whatsapp.net"
 
-    # 6. Failed to resolve
-    return None
+    raise ValueError(
+        f"Could not find a group or contact named '{target_str}'. "
+        f"Use /chats and match the name exactly, or paste the full …@g.us id."
+    )
 
 def handle_admin_command(text_content):
     """Parses '/command args' and dispatches to registered handler."""
@@ -242,7 +273,10 @@ def cmd_status(args):
     lines = [f"Agent Global Switch: {'🟢 ON' if agent_on else '🔴 OFF'}"]
     target = args.strip()
     if target:
-        resolved_id = resolve_chat_id(target)
+        try:
+            resolved_id = resolve_chat_id(target)
+        except ValueError as e:
+            return f"❌ {e}"
         
         # Explicit error mapping if it couldn't be resolved
         if resolved_id is None:
@@ -261,28 +295,86 @@ def cmd_status(args):
 def cmd_chats(args):
     lines = ["GROUPS:"]
     try:
-        for g in _client.get_joined_groups():
-            chat_id = f"{g.JID.User}@{g.JID.Server}"
-            lines.append(f"- {g.GroupName.Name} → {chat_id}")
-        if len(lines) == 1:
+        groups = list(_client.get_joined_groups() or [])
+        if not groups:
             lines.append("(none)")
+        for g in groups:
+            name = (getattr(getattr(g, "GroupName", None), "Name", None) or "?").strip()
+            jid = getattr(g, "JID", None)
+            if jid and getattr(jid, "User", None):
+                chat_id = f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
+                lines.append(f"- {name} → {chat_id}")
+            else:
+                lines.append(f"- {name} → (no jid)")
     except Exception as e:
         lines.append(f"(couldn't fetch groups: {e})")
 
-    lines.append("\nPRIVATE CHATS SEEN RECENTLY:")
+    lines.append("\nPRIVATE CHATS / CONTACTS:")
+    seen = {}  # chat_key -> display label
+
+    # 1) Contacts table (best source for “everyone we know”)
     try:
-        response = _supabase.table("chat_history").select("chat_id").execute()
-        seen = sorted(set(r["chat_id"] for r in response.data if "@g.us" not in r["chat_id"]))
-        res = _get_contacts_map() if _get_contacts_map else {}
-        contacts = res[0] if isinstance(res, tuple) else res
-        if not seen:
-            lines.append("(none)")
-        for chat_id in seen:
-            bare_id = chat_id.split("@")[0]
-            name = contacts.get(bare_id, bare_id)
-            lines.append(f"- {name} → {chat_id}")
+        res = _get_contacts_map() if _get_contacts_map else ({}, {})
+        contacts_map = res[0] if isinstance(res, tuple) else res
+        for s_id, name in (contacts_map or {}).items():
+            if not s_id or s_id in ("mojo_agent", "voice_transcript", "document_text"):
+                continue
+            # Prefer phone-looking ids for display key when possible
+            key = s_id if "@" in str(s_id) else f"{s_id}@s.whatsapp.net"
+            # Skip pure group jids if any leaked in
+            if str(key).endswith("@g.us"):
+                continue
+            label = name or s_id
+            seen[str(key)] = label
     except Exception as e:
-        lines.append(f"(couldn't fetch private chats: {e})")
+        lines.append(f"(contacts fetch failed: {e})")
+
+    # 2) chat_history — paginate so we don't only see recent slice
+    try:
+        page_size = 1000
+        start = 0
+        history_ids = set()
+        while True:
+            response = (
+                _supabase.table("chat_history")
+                .select("chat_id")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            rows = response.data or []
+            if not rows:
+                break
+            for r in rows:
+                cid = r.get("chat_id") or ""
+                if not cid or "@g.us" in cid or cid == "status@broadcast":
+                    continue
+                history_ids.add(cid)
+            if len(rows) < page_size:
+                break
+            start += page_size
+            if start > 20000:  # safety cap
+                break
+
+        for cid in history_ids:
+            if cid not in seen:
+                bare = cid.split("@")[0]
+                # Try to name from contacts by bare id
+                label = None
+                try:
+                    res = _get_contacts_map() if _get_contacts_map else ({}, {})
+                    cmap = res[0] if isinstance(res, tuple) else res
+                    label = (cmap or {}).get(bare) or (cmap or {}).get(cid)
+                except Exception:
+                    pass
+                seen[cid] = label or bare
+    except Exception as e:
+        lines.append(f"(chat_history fetch failed: {e})")
+
+    if not seen:
+        lines.append("(none)")
+    else:
+        for cid, label in sorted(seen.items(), key=lambda x: (x[1] or "").casefold()):
+            lines.append(f"- {label} → {cid}")
 
     return "\n".join(lines)
 
