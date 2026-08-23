@@ -266,23 +266,6 @@ CHAT_HISTORY_CACHE = {}
 MAX_HISTORY_CACHE = 150  # Matches the max limit in detect_summary_history_limit
 
 
-FEATURE_FLAG_CACHE = {}
-FEATURE_FLAG_TTL = 60  # seconds
-
-def is_feature_enabled(chat_id, feature):
-    """Cached version – original logic stays the same."""
-    key = (chat_id, feature)
-    now = time.time()
-    if key in FEATURE_FLAG_CACHE:
-        enabled, ts = FEATURE_FLAG_CACHE[key]
-        if now - ts < FEATURE_FLAG_TTL:
-            return enabled
-
-    # original logic (copy from admin_commands or keep calling it)
-    enabled = admin_commands.is_feature_enabled(chat_id, feature)  # keep using the real one
-    FEATURE_FLAG_CACHE[key] = (enabled, now)
-    return enabled
-
 def async_update_group_cache(chat_id, group_jid, contacts_map):
     """Fetches group metadata in the background so it doesn't block AI replies."""
     try:
@@ -607,20 +590,26 @@ def get_group_memory(chat_id):
 
 
 def get_media_kind(message):
-    """Check the underlying message structure directly."""
     try:
         msg_obj = message.Message
-        if msg_obj.imageMessage and msg_obj.imageMessage.mimetype: 
+        if msg_obj.imageMessage and (msg_obj.imageMessage.mimetype or msg_obj.imageMessage.URL):
             return "image"
-        if msg_obj.videoMessage and msg_obj.videoMessage.mimetype:
+        if msg_obj.videoMessage and (msg_obj.videoMessage.mimetype or msg_obj.videoMessage.URL):
             if getattr(msg_obj.videoMessage, "gifPlayback", False):
                 return "gif"
             return "video"
-        if msg_obj.audioMessage and msg_obj.audioMessage.mimetype: 
+        if msg_obj.audioMessage and (msg_obj.audioMessage.mimetype or msg_obj.audioMessage.URL):
             return "audio"
-        if msg_obj.documentMessage and msg_obj.documentMessage.mimetype: 
+        # Documents: mimetype OR fileName/title is enough
+        doc = getattr(msg_obj, "documentMessage", None)
+        if doc and (
+            getattr(doc, "mimetype", None)
+            or getattr(doc, "fileName", None)
+            or getattr(doc, "title", None)
+            or getattr(doc, "URL", None)
+        ):
             return "document"
-        if msg_obj.stickerMessage and msg_obj.stickerMessage.mimetype: 
+        if msg_obj.stickerMessage and (msg_obj.stickerMessage.mimetype or msg_obj.stickerMessage.URL):
             return "sticker"
     except AttributeError:
         pass
@@ -706,6 +695,33 @@ def insert_chat_message(chat_id, sender_id, role, content, sender_num=None):
         print(f"Error saving message: {e}")
 
 
+def _guess_doc_meta(doc_msg, tmp_path):
+    mime = (getattr(doc_msg, "mimetype", None) or "").strip().lower()
+    name = (
+        getattr(doc_msg, "fileName", None)
+        or getattr(doc_msg, "title", None)
+        or os.path.basename(tmp_path)
+        or "file"
+    )
+    ext = os.path.splitext(name)[1].lower()
+
+    if not mime or mime == "application/octet-stream":
+        mime = {
+            ".txt": "text/plain",
+            ".md": "text/markdown",
+            ".csv": "text/csv",
+            ".json": "application/json",
+            ".pdf": "application/pdf",
+            ".doc": "application/msword",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xls": "application/vnd.ms-excel",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".ppt": "application/vnd.ms-powerpoint",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }.get(ext, mime or "application/octet-stream")
+    return mime, name
+
+
 def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20):
     
     # --- ADMIN FEATURE FLAG CHECKS (FRIENDLY REJECTION) ---
@@ -747,6 +763,84 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
         
         msg_to_download = target_media_msg if target_media_msg else message.Message
         client.download_any(msg_to_download, path=tmp_path)
+
+
+        if media_kind == "document":
+            doc_src = target_media_msg.documentMessage if target_media_msg else message.Message.documentMessage
+            mime, filename = _guess_doc_meta(doc_src, tmp_path)
+
+            # --- Plain text family: read as text, feed Groq (no vision) ---
+            if mime.startswith("text/") or mime in (
+                "application/json",
+                "application/xml",
+                "text/csv",
+                "text/markdown",
+            ) or filename.lower().endswith((".txt", ".md", ".csv", ".json", ".log")):
+                try:
+                    with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                        body = f.read()
+                except Exception:
+                    with open(tmp_path, "rb") as f:
+                        body = f.read().decode("utf-8", errors="replace")
+
+                # Cap size so prompts stay sane
+                if len(body) > 30000:
+                    body = body[:30000] + "\n\n…[truncated]…"
+
+                context_str = (
+                    f"[Document: {filename}]\n{body}"
+                    if not (text_content and text_content.strip())
+                    else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
+                )
+                insert_chat_message(chat_id, "document_text", "user", context_str)
+                if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
+                    return get_ai_response(chat_id, sender_id, msg_time=msg_time, history_limit=history_limit)
+                return f"📄 Read `{filename}` ({len(body)} chars). AI chat is off for this chat."
+
+            # --- PDF / Office: Gemini with REAL mime (not always pdf) ---
+            if mime in (
+                "application/pdf",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-powerpoint",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ) or filename.lower().endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")):
+                with open(tmp_path, "rb") as f:
+                    media_b64 = base64.b64encode(f.read()).decode("utf-8")
+                user_prompt = text_content.strip() if text_content else f"Summarize or explain this document ({filename})."
+                # Prefer PDF mime for Gemini when it's actually PDF; for office, still try with real mime
+                gemini_mime = mime if mime == "application/pdf" else "application/pdf"
+                # Note: Gemini file understanding is strongest on PDF/images.
+                # For docx/xlsx, converting server-side is ideal; until then, try PDF path only for .pdf
+                if not filename.lower().endswith(".pdf") and mime != "application/pdf":
+                    return (
+                        f"📄 Got `{filename}` ({mime}). "
+                        "I can fully read TXT/CSV/JSON and PDF. "
+                        "For Word/Excel/PowerPoint, please export as PDF or paste the text."
+                    )
+                gemini_response = client_gemini.chat.completions.create(
+                    model=GEMINI_MODEL,
+                    messages=[
+                        {"role": "system", "content": (
+                            "You are Mojo. The user sent a document. Extract and answer from its content. "
+                            "Keep it WhatsApp-short."
+                        )},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": user_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:{gemini_mime};base64,{media_b64}"}}
+                        ]},
+                    ],
+                )
+                return gemini_response.choices[0].message.content
+
+            return (
+                f"📄 Received `{filename}` ({mime or 'unknown type'}). "
+                "Supported for content reading: TXT, CSV, JSON, MD, PDF. "
+                "Other types — tell me what you need from it or convert to PDF/TXT."
+            )
+
 
         # A. Voice Notes (Whisper)
         if media_kind in ("audio", "ptt"):
@@ -1723,7 +1817,19 @@ def process_message(client, message):
     
     learn_bot_lid_from_message(message, BOT_PN)
 
-    is_bot_mentioned = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
+    native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
+    text_hit = False
+    if original_text:
+        low = original_text.lower()
+        if BOT_PN and f"@{BOT_PN}" in low:
+            text_hit = True
+        if BOT_LID and f"@{BOT_LID}" in low:
+            text_hit = True
+        # display-name wake (optional; your push name is aimojo)
+        if "@mojo" in low:
+            text_hit = True
+
+    is_bot_mentioned = native or text_hit
 
     if is_group:
         if not is_bot_mentioned:
