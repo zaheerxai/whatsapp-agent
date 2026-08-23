@@ -1,0 +1,5 @@
+openai
+neonize
+python-dotenv
+supabase
+tzdata

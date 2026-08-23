@@ -1,0 +1,8 @@
+.env
+*.db
+whatsapp_session.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
