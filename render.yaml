@@ -3,13 +3,13 @@ services:
     name: mojo-whatsapp-agent
     runtime: python
     plan: free
-    region: singapore                  # change if you prefer (oregon, frankfurt, singapore, etc.)
+    region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: python whatsapp_agent.py
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: "3.14.6"              # or whatever version you use locally
+        value: "3.12.8"
       - key: GROQ_API_KEY
         sync: false
       - key: GEMINI_API_KEY
@@ -21,5 +21,4 @@ services:
       - key: OWNER_SENDER_ID
         sync: false
       - key: RENDER_EXTERNAL_URL
-        sync: false                  # set the real value in the dashboard after first deploy
-      # Add any other secrets the same way
+        sync: false
