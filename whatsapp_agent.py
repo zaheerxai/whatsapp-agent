@@ -151,19 +151,34 @@ def get_session_path():
     return LOCAL_SESSION_FILE
 
 def start_health_server():
-    """Minimal HTTP health endpoint for Render free tier."""
+    """Minimal HTTP health endpoint for Render free tier + UptimeRobot."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import os
 
     port = int(os.environ.get("PORT", 10000))
 
     class HealthHandler(BaseHTTPRequestHandler):
+        def _send_ok(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
         def do_GET(self):
+            if self.path in ("/", "/health", "/healthz"):
+                self._send_ok()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_HEAD(self):
+            # UptimeRobot (and many monitors) use HEAD
             if self.path in ("/", "/health", "/healthz"):
                 self.send_response(200)
                 self.send_header("Content-type", "text/plain")
+                self.send_header("Content-Length", "2")
                 self.end_headers()
-                self.wfile.write(b"ok")
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -173,7 +188,7 @@ def start_health_server():
 
     def run():
         server = HTTPServer(("0.0.0.0", port), HealthHandler)
-        print(f"[HEALTH] Listening on 0.0.0.0:{port}  (paths: / /health /healthz)")
+        print(f"[HEALTH] Listening on 0.0.0.0:{port}  (GET/HEAD / /health /healthz)")
         server.serve_forever()
 
     t = threading.Thread(target=run, daemon=True)
