@@ -151,7 +151,7 @@ def get_session_path():
     return LOCAL_SESSION_FILE
 
 def start_health_server():
-    """Minimal HTTP health endpoint so Render free tier + external pingers stay happy."""
+    """Minimal HTTP health endpoint for Render free tier."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import os
 
@@ -159,16 +159,21 @@ def start_health_server():
 
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
+            if self.path in ("/", "/health", "/healthz"):
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         def log_message(self, format, *args):
-            return
+            return  # silence access logs
 
     def run():
         server = HTTPServer(("0.0.0.0", port), HealthHandler)
-        print(f"[HEALTH] Listening on port {port}")
+        print(f"[HEALTH] Listening on 0.0.0.0:{port}  (paths: / /health /healthz)")
         server.serve_forever()
 
     t = threading.Thread(target=run, daemon=True)
