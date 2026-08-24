@@ -4,25 +4,6 @@ admin_commands.py — control plane for the WhatsApp agent.
 Kept separate from whatsapp_agent.py on purpose: this is a distinct concern
 (who's allowed to do what) from message/media/AI handling, and keeping it
 apart means future edits to one rarely collide with edits to the other.
-
-Design choices, and why:
-- Commands are plain deterministic "/command args" syntax, NOT LLM-parsed.
-  A kill switch has to work even if Groq and Gemini are both down — it can't
-  depend on the thing it might need to turn off.
-- Two toggle layers: a single global "agent" switch (defaults ON), and
-  per-chat, per-feature flags (default OFF, as requested) that don't need a
-  schema change to add a new feature — just a name.
-- Authorization = sender matches OWNER_SENDER_ID AND the message is in the
-  private chat with the bot, never a group. Admin commands are checked BEFORE
-  the global kill switch and bypass it, or disabling the agent would lock out
-  the one command that re-enables it.
-
-Setup:
-1. Run the SQL in admin_schema.sql once in Supabase.
-2. Add OWNER_SENDER_ID to your .env (see below for how to find your own ID).
-3. In whatsapp_agent.py: `import admin_commands` near the top, then
-   `admin_commands.init(supabase, client, get_contacts_map)` right after
-   `client = NewClient(...)` is created.
 """
 
 import os
@@ -81,26 +62,24 @@ def _norm_name(s: str) -> str:
 
 
 def _group_display_name(g) -> str:
-    """Try several neonize/whatsmeow shapes for the group title."""
-    candidates = []
+    """Extract group name safely handling string and byte types."""
     gn = getattr(g, "GroupName", None) or getattr(g, "group_name", None)
     if gn is not None:
-        if isinstance(gn, str):
-            candidates.append(gn)
-        else:
-            for attr in ("Name", "name"):
-                v = getattr(gn, attr, None)
-                if v:
-                    candidates.append(v)
+        val = getattr(gn, "Name", None) or getattr(gn, "name", None) or gn
+        if isinstance(val, bytes):
+            val = val.decode("utf-8", errors="ignore")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+            
     for attr in ("Name", "name", "Subject", "subject"):
-        v = getattr(g, attr, None)
-        if v and not callable(v):
-            candidates.append(v)
-    for c in candidates:
-        t = str(c).strip()
-        if t:
-            return t
+        val = getattr(g, attr, None)
+        if val and not callable(val):
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="ignore")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     return ""
+
 
 def resolve_chat_id(target):
     target_str = (target or "").strip()
@@ -108,36 +87,33 @@ def resolve_chat_id(target):
         return target_str
     if target_str.lower() in ("all", "*"):
         return "*"
+        
     # Accept full JIDs as-is
     if "@g.us" in target_str or "@s.whatsapp.net" in target_str:
         return target_str
-    # Allow pasting bare group user id
-    if target_str.isdigit() and len(target_str) >= 10:
-        # Prefer group if it matches a joined group user id
-        if _client:
-            try:
-                for g in list(_client.get_joined_groups() or []):
-                    jid = getattr(g, "JID", None)
-                    if jid and str(getattr(jid, "User", "")) == target_str:
-                        return f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
-            except Exception:
-                pass
 
     needle = _norm_name(target_str)
 
+    # 1. Search Groups by name or group numerical JID
     if _client:
         try:
             groups = list(_client.get_joined_groups() or [])
             exact, partial = [], []
-            debug_names = []
+            
             for g in groups:
-                name = _group_display_name(g)
                 jid = getattr(g, "JID", None)
                 if not jid or not getattr(jid, "User", None):
                     continue
-                chat_id = f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
-                if name:
-                    debug_names.append(name)
+                
+                user_id = str(jid.User)
+                server = getattr(jid, "Server", None) or "g.us"
+                chat_id = f"{user_id}@{server}"
+                
+                # Direct match for bare group numeric ID
+                if target_str.isdigit() and target_str == user_id:
+                    return chat_id
+
+                name = _group_display_name(g)
                 n = _norm_name(name)
                 if not n:
                     continue
@@ -152,30 +128,21 @@ def resolve_chat_id(target):
                 opts = ", ".join(f"“{n}” → {i}" for n, i in exact)
                 raise ValueError(f"Multiple groups match exactly: {opts}")
 
-            if len(partial) == 1:
-                return partial[0][1]
-            if len(partial) > 1:
-                opts = ", ".join(f"“{n}” → {i}" for n, i in partial[:8])
-                raise ValueError(
-                    f"Ambiguous group “{target_str}”. Matches: {opts}. "
-                    f"Paste the full id from /chats."
-                )
-
-            # Helpful failure: show what the bot actually sees
-            if debug_names and needle:
-                sample = ", ".join(f"“{x}”" for x in debug_names[:6])
-                print(f"[RESOLVE] needle={needle!r} known_groups={debug_names!r}")
-                raise ValueError(
-                    f"Could not find a group or contact named '{target_str}'. "
-                    f"Joined groups I see: {sample}. "
-                    f"Paste the full …@g.us id from /chats if the name differs."
-                )
+            if len(exact) == 0:
+                if len(partial) == 1:
+                    return partial[0][1]
+                if len(partial) > 1:
+                    opts = ", ".join(f"“{n}” → {i}" for n, i in partial[:8])
+                    raise ValueError(
+                        f"Ambiguous group “{target_str}”. Matches: {opts}. "
+                        f"Paste the full id from /chats."
+                    )
         except ValueError:
             raise
         except Exception as e:
             print(f"Error resolving group name: {e}")
 
-    # --- Contacts by display name / nickname ---
+    # 2. Search Contacts by display name / nickname
     if _get_contacts_map:
         try:
             res = _get_contacts_map()
@@ -186,14 +153,17 @@ def resolve_chat_id(target):
         except Exception as e:
             print(f"Error resolving contact name: {e}")
 
+    # 3. Clean phone numbers
     clean_num = re.sub(r"\D", "", target_str)
     if len(clean_num) >= 8:
         return f"{clean_num}@s.whatsapp.net"
 
+    # 4. Nothing matched
     raise ValueError(
         f"Could not find a group or contact named '{target_str}'. "
-        f"Use /chats and match the name exactly, or paste the full …@g.us id."
+        f"Use /chats to match the name exactly, or paste the full ID."
     )
+
 
 def handle_admin_command(text_content):
     """Parses '/command args' and dispatches to registered handler."""
@@ -296,9 +266,8 @@ def _handle_enable_disable(args, enabled):
     except ValueError as e:
         return f"❌ {e}"
 
-    # Halt execution and warn if the name didn't map to a real group/contact
     if chat_target is None:
-        return f"❌ Could not find a group or contact named '{raw_target}'. Make sure the bot is added to the group and the name is spelled exactly right."
+        return f"❌ Could not find a group or contact named '{raw_target}'."
 
     features_to_toggle = KNOWN_FEATURES if target_feature == "all" else [target_feature]
 
@@ -331,16 +300,12 @@ def cmd_status(args):
         except ValueError as e:
             return f"❌ {e}"
         
-        # Explicit error mapping if it couldn't be resolved
-        if resolved_id is None:
-            return f"❌ Could not find a group or contact named '{target}'. Make sure the bot is added to the group and the name is spelled exactly right."
-            
         lines.append(f"\nFeature flags for {target} ({resolved_id}):")
         for feature in KNOWN_FEATURES:
             state = "🟢 ON" if is_feature_enabled(resolved_id, feature) else "🔴 OFF"
             lines.append(f"- {feature}: {state}")
     else:
-        lines.append("\nPass a phone number, group name, or 'all' to view feature flags (e.g. /status 923001234567, /status My Group, or /status all).")
+        lines.append("\nPass a phone number, group name, or 'all' to view feature flags.")
     return "\n".join(lines)
 
 
@@ -352,7 +317,7 @@ def cmd_chats(args):
         if not groups:
             lines.append("(none)")
         for g in groups:
-            name = (getattr(getattr(g, "GroupName", None), "Name", None) or "?").strip()
+            name = _group_display_name(g) or "?"
             jid = getattr(g, "JID", None)
             if jid and getattr(jid, "User", None):
                 chat_id = f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
@@ -362,8 +327,7 @@ def cmd_chats(args):
     except Exception as e:
         lines.append(f"(couldn't fetch groups: {e})")
 
-        lines.append("\nPRIVATE CHATS / CONTACTS:")
-    # bare_user -> (jid, label); prefer @s.whatsapp.net over @lid
+    lines.append("\nPRIVATE CHATS / CONTACTS:")
     by_bare = {}
 
     def _remember(cid: str, label: str):
@@ -400,7 +364,7 @@ def cmd_chats(args):
     except Exception as e:
         lines.append(f"(contacts fetch failed: {e})")
 
-    # 2) chat_history (paginated)
+    # 2) chat_history
     try:
         page_size = 1000
         start = 0
