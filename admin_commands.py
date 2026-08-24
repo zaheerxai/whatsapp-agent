@@ -62,22 +62,27 @@ def _norm_name(s: str) -> str:
 
 
 def _group_display_name(g) -> str:
-    """Extract group name safely handling string and byte types."""
-    gn = getattr(g, "GroupName", None) or getattr(g, "group_name", None)
-    if gn is not None:
-        val = getattr(gn, "Name", None) or getattr(gn, "name", None) or gn
-        if isinstance(val, bytes):
-            val = val.decode("utf-8", errors="ignore")
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-            
-    for attr in ("Name", "name", "Subject", "subject"):
-        val = getattr(g, attr, None)
-        if val and not callable(val):
+    """Extract group name safely handling string, byte types, and custom wrappers."""
+    try:
+        gn = getattr(g, "GroupName", None) or getattr(g, "group_name", None)
+        if gn is not None:
+            val = getattr(gn, "Name", None) or getattr(gn, "name", None) or gn
             if isinstance(val, bytes):
-                val = val.decode("utf-8", errors="ignore")
-            if isinstance(val, str) and val.strip():
-                return val.strip()
+                return val.decode("utf-8", errors="ignore").strip()
+            v_str = str(val).strip()
+            if v_str:
+                return v_str
+                
+        for attr in ("Name", "name", "Subject", "subject"):
+            val = getattr(g, attr, None)
+            if val and not callable(val):
+                if isinstance(val, bytes):
+                    return val.decode("utf-8", errors="ignore").strip()
+                v_str = str(val).strip()
+                if v_str:
+                    return v_str
+    except Exception:
+        pass
     return ""
 
 
@@ -93,12 +98,15 @@ def resolve_chat_id(target):
         return target_str
 
     needle = _norm_name(target_str)
+    needle_alpha = re.sub(r"[^a-z0-9]", "", needle)
+    
+    debug_groups = []
 
-    # 1. Search Groups by name or group numerical JID
+    # 1. Search Groups
     if _client:
         try:
             groups = list(_client.get_joined_groups() or [])
-            exact, partial = [], []
+            exact, partial, alpha_match = [], [], []
             
             for g in groups:
                 jid = getattr(g, "JID", None)
@@ -114,33 +122,46 @@ def resolve_chat_id(target):
                     return chat_id
 
                 name = _group_display_name(g)
-                n = _norm_name(name)
-                if not n:
+                if not name:
                     continue
+                    
+                debug_groups.append(name)
+                
+                n = _norm_name(name)
+                n_alpha = re.sub(r"[^a-z0-9]", "", n)
+
+                # Prioritize matching
                 if n == needle:
                     exact.append((name, chat_id))
                 elif needle in n or n in needle:
                     partial.append((name, chat_id))
+                elif needle_alpha and (needle_alpha in n_alpha or n_alpha in needle_alpha):
+                    alpha_match.append((name, chat_id))
 
             if len(exact) == 1:
                 return exact[0][1]
             if len(exact) > 1:
-                opts = ", ".join(f"“{n}” → {i}" for n, i in exact)
-                raise ValueError(f"Multiple groups match exactly: {opts}")
+                opts = ", ".join(f"'{n}'" for n, _ in exact)
+                raise ValueError(f"Multiple exact group matches: {opts}. Paste the ID.")
 
-            if len(exact) == 0:
+            if not exact:
                 if len(partial) == 1:
                     return partial[0][1]
                 if len(partial) > 1:
-                    opts = ", ".join(f"“{n}” → {i}" for n, i in partial[:8])
-                    raise ValueError(
-                        f"Ambiguous group “{target_str}”. Matches: {opts}. "
-                        f"Paste the full id from /chats."
-                    )
+                    opts = ", ".join(f"'{n}'" for n, _ in partial[:5])
+                    raise ValueError(f"Ambiguous group '{target_str}'. Matches: {opts}. Paste ID.")
+
+            if not exact and not partial:
+                if len(alpha_match) == 1:
+                    return alpha_match[0][1]
+                if len(alpha_match) > 1:
+                    opts = ", ".join(f"'{n}'" for n, _ in alpha_match[:5])
+                    raise ValueError(f"Ambiguous group '{target_str}'. Close matches: {opts}. Paste ID.")
+
         except ValueError:
             raise
         except Exception as e:
-            print(f"Error resolving group name: {e}")
+            print(f"Error checking groups: {e}")
 
     # 2. Search Contacts by display name / nickname
     if _get_contacts_map:
@@ -158,11 +179,16 @@ def resolve_chat_id(target):
     if len(clean_num) >= 8:
         return f"{clean_num}@s.whatsapp.net"
 
-    # 4. Nothing matched
-    raise ValueError(
-        f"Could not find a group or contact named '{target_str}'. "
-        f"Use /chats to match the name exactly, or paste the full ID."
-    )
+    # 4. Nothing matched - Highly descriptive error
+    err = f"Could not find '{target_str}'."
+    if debug_groups:
+        sample = ", ".join(f"'{x}'" for x in debug_groups[:6])
+        err += f" Groups I checked: {sample}."
+    else:
+        err += " (No joined groups found in memory right now)."
+    err += " Paste the full ID from /chats."
+    
+    raise ValueError(err)
 
 
 def handle_admin_command(text_content):
