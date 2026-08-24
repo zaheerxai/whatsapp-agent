@@ -1542,7 +1542,8 @@ print("Connecting... PLEASE WAIT FOR THE QR CODE.")
 # Resolve session path (local file wins for testing; otherwise pull from Supabase Storage)
 session_db = get_session_path()
 client = NewClient(session_db)
-admin_commands.init(supabase, client, get_contacts_maps)
+# Inject the LLM client and model name into the admin commands module
+admin_commands.init(supabase, client, get_contacts_maps, client_ai, MODEL_NAME)
 
 # Start health endpoint + session uploader + optional self-ping
 start_health_server()

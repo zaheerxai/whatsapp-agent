@@ -27,14 +27,17 @@ COMMANDS = {}
 _supabase = None
 _client = None
 _get_contacts_map = None
+_ai_client = None
+_model_name = None
 
-
-def init(supabase_client, whatsapp_client, contacts_map_fn):
+def init(supabase_client, whatsapp_client, contacts_map_fn, ai_client=None, model_name=None):
     """Call once, right after the WhatsApp client is created."""
-    global _supabase, _client, _get_contacts_map
+    global _supabase, _client, _get_contacts_map, _ai_client, _model_name
     _supabase = supabase_client
     _client = whatsapp_client
     _get_contacts_map = contacts_map_fn
+    _ai_client = ai_client
+    _model_name = model_name
 
 
 def command(name, help_text=""):
@@ -48,17 +51,6 @@ def command(name, help_text=""):
 def is_admin_message(sender_id, is_group):
     """Sender is configured owner AND message is in private chat with the bot."""
     return bool(OWNER_SENDER_ID) and (not is_group) and sender_id == OWNER_SENDER_ID
-
-
-def _norm_name(s: str) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKC", str(s))
-    s = s.replace("\u00a0", " ")
-    # zero-width / BOM chars WhatsApp sometimes leaves in titles
-    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
-    s = re.sub(r"\s+", " ", s).strip().casefold()
-    return s
 
 
 def _group_display_name(g) -> str:
@@ -97,17 +89,13 @@ def resolve_chat_id(target):
     if "@g.us" in target_str or "@s.whatsapp.net" in target_str:
         return target_str
 
-    needle = _norm_name(target_str)
-    needle_alpha = re.sub(r"[^a-z0-9]", "", needle)
-    
     debug_groups = []
+    available_chats = []
 
-    # 1. Search Groups
+    # 1. Collect Active Groups
     if _client:
         try:
             groups = list(_client.get_joined_groups() or [])
-            exact, partial, alpha_match = [], [], []
-            
             for g in groups:
                 jid = getattr(g, "JID", None)
                 if not jid or not getattr(jid, "User", None):
@@ -126,67 +114,68 @@ def resolve_chat_id(target):
                     continue
                     
                 debug_groups.append(name)
-                
-                n = _norm_name(name)
-                n_alpha = re.sub(r"[^a-z0-9]", "", n)
+                available_chats.append(f"Group: '{name}' -> {chat_id}")
 
-                # Prioritize matching
-                if n == needle:
-                    exact.append((name, chat_id))
-                elif needle in n or n in needle:
-                    partial.append((name, chat_id))
-                elif needle_alpha and (needle_alpha in n_alpha or n_alpha in needle_alpha):
-                    alpha_match.append((name, chat_id))
-
-            if len(exact) == 1:
-                return exact[0][1]
-            if len(exact) > 1:
-                opts = ", ".join(f"'{n}'" for n, _ in exact)
-                raise ValueError(f"Multiple exact group matches: {opts}. Paste the ID.")
-
-            if not exact:
-                if len(partial) == 1:
-                    return partial[0][1]
-                if len(partial) > 1:
-                    opts = ", ".join(f"'{n}'" for n, _ in partial[:5])
-                    raise ValueError(f"Ambiguous group '{target_str}'. Matches: {opts}. Paste ID.")
-
-            if not exact and not partial:
-                if len(alpha_match) == 1:
-                    return alpha_match[0][1]
-                if len(alpha_match) > 1:
-                    opts = ", ".join(f"'{n}'" for n, _ in alpha_match[:5])
-                    raise ValueError(f"Ambiguous group '{target_str}'. Close matches: {opts}. Paste ID.")
-
-        except ValueError:
-            raise
         except Exception as e:
             print(f"Error checking groups: {e}")
 
-    # 2. Search Contacts by display name / nickname
+    # 2. Collect Active Contacts
     if _get_contacts_map:
         try:
             res = _get_contacts_map()
             contacts_map = res[0] if isinstance(res, tuple) else res
             for s_id, name in (contacts_map or {}).items():
-                if name and _norm_name(name) == needle:
-                    return s_id if "@" in str(s_id) else f"{s_id}@s.whatsapp.net"
+                if name:
+                    cid = s_id if "@" in str(s_id) else f"{s_id}@s.whatsapp.net"
+                    available_chats.append(f"Contact: '{name}' -> {cid}")
         except Exception as e:
-            print(f"Error resolving contact name: {e}")
+            print(f"Error fetching contacts maps: {e}")
 
-    # 3. Clean phone numbers
+    # 3. Use LLM to intelligently match the target string
+    if _ai_client and _model_name and available_chats:
+        try:
+            chats_list_str = "\n".join(available_chats)
+            system_prompt = (
+                "You are an intelligent routing assistant. "
+                "I will give you a list of available WhatsApp groups and contacts with their IDs, "
+                "and a user's search query.\n"
+                "Your task is to find the best match for the user's query from the list.\n"
+                "Reply with ONLY the exact ID (e.g., 123456@g.us or 98765@s.whatsapp.net) of the best match. "
+                "Do NOT include any extra text, markdown, or punctuation.\n"
+                "If the query absolutely does not match anything in the list, reply EXACTLY with: NONE"
+            )
+            
+            user_prompt = f"AVAILABLE CHATS:\n{chats_list_str}\n\nUSER QUERY: '{target_str}'"
+
+            response = _ai_client.chat.completions.create(
+                model=_model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0
+            )
+            
+            llm_match = response.choices[0].message.content.strip()
+            
+            if llm_match != "NONE" and "@" in llm_match:
+                return llm_match
+        except Exception as e:
+            print(f"LLM match failed, falling back: {e}")
+
+    # 4. Fallback: Clean phone numbers
     clean_num = re.sub(r"\D", "", target_str)
     if len(clean_num) >= 8:
         return f"{clean_num}@s.whatsapp.net"
 
-    # 4. Nothing matched - Highly descriptive error
+    # 5. Nothing matched - Highly descriptive error
     err = f"Could not find '{target_str}'."
     if debug_groups:
         sample = ", ".join(f"'{x}'" for x in debug_groups[:6])
         err += f" Groups I checked: {sample}."
     else:
         err += " (No joined groups found in memory right now)."
-    err += " Paste the full ID from /chats."
+    err += " Paste the full ID from /chats if the name isn't working."
     
     raise ValueError(err)
 
