@@ -72,10 +72,35 @@ def is_admin_message(sender_id, is_group):
 def _norm_name(s: str) -> str:
     if not s:
         return ""
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u00a0", " ")  # non-breaking space
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.replace("\u00a0", " ")
+    # zero-width / BOM chars WhatsApp sometimes leaves in titles
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
     s = re.sub(r"\s+", " ", s).strip().casefold()
     return s
+
+
+def _group_display_name(g) -> str:
+    """Try several neonize/whatsmeow shapes for the group title."""
+    candidates = []
+    gn = getattr(g, "GroupName", None) or getattr(g, "group_name", None)
+    if gn is not None:
+        if isinstance(gn, str):
+            candidates.append(gn)
+        else:
+            for attr in ("Name", "name"):
+                v = getattr(gn, attr, None)
+                if v:
+                    candidates.append(v)
+    for attr in ("Name", "name", "Subject", "subject"):
+        v = getattr(g, attr, None)
+        if v and not callable(v):
+            candidates.append(v)
+    for c in candidates:
+        t = str(c).strip()
+        if t:
+            return t
+    return ""
 
 def resolve_chat_id(target):
     target_str = (target or "").strip()
@@ -83,23 +108,39 @@ def resolve_chat_id(target):
         return target_str
     if target_str.lower() in ("all", "*"):
         return "*"
+    # Accept full JIDs as-is
     if "@g.us" in target_str or "@s.whatsapp.net" in target_str:
         return target_str
+    # Allow pasting bare group user id
+    if target_str.isdigit() and len(target_str) >= 10:
+        # Prefer group if it matches a joined group user id
+        if _client:
+            try:
+                for g in list(_client.get_joined_groups() or []):
+                    jid = getattr(g, "JID", None)
+                    if jid and str(getattr(jid, "User", "")) == target_str:
+                        return f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
+            except Exception:
+                pass
 
     needle = _norm_name(target_str)
 
-    # --- Groups (same source as /chats) ---
     if _client:
         try:
             groups = list(_client.get_joined_groups() or [])
             exact, partial = [], []
+            debug_names = []
             for g in groups:
-                name = (getattr(getattr(g, "GroupName", None), "Name", None) or "").strip()
+                name = _group_display_name(g)
                 jid = getattr(g, "JID", None)
-                if not name or not jid or not getattr(jid, "User", None):
+                if not jid or not getattr(jid, "User", None):
                     continue
                 chat_id = f"{jid.User}@{getattr(jid, 'Server', None) or 'g.us'}"
+                if name:
+                    debug_names.append(name)
                 n = _norm_name(name)
+                if not n:
+                    continue
                 if n == needle:
                     exact.append((name, chat_id))
                 elif needle in n or n in needle:
@@ -119,6 +160,16 @@ def resolve_chat_id(target):
                     f"Ambiguous group “{target_str}”. Matches: {opts}. "
                     f"Paste the full id from /chats."
                 )
+
+            # Helpful failure: show what the bot actually sees
+            if debug_names and needle:
+                sample = ", ".join(f"“{x}”" for x in debug_names[:6])
+                print(f"[RESOLVE] needle={needle!r} known_groups={debug_names!r}")
+                raise ValueError(
+                    f"Could not find a group or contact named '{target_str}'. "
+                    f"Joined groups I see: {sample}. "
+                    f"Paste the full …@g.us id from /chats if the name differs."
+                )
         except ValueError:
             raise
         except Exception as e:
@@ -135,7 +186,6 @@ def resolve_chat_id(target):
         except Exception as e:
             print(f"Error resolving contact name: {e}")
 
-    # --- Phone number (not LID) ---
     clean_num = re.sub(r"\D", "", target_str)
     if len(clean_num) >= 8:
         return f"{clean_num}@s.whatsapp.net"
@@ -241,7 +291,10 @@ def _handle_enable_disable(args, enabled):
         return f"Usage: /{'enable' if enabled else 'disable'} {target_feature} <phone|group_name|all>. Try /chats to see chats."
 
     raw_target = parts[1].strip()
-    chat_target = resolve_chat_id(raw_target)
+    try:
+        chat_target = resolve_chat_id(raw_target)
+    except ValueError as e:
+        return f"❌ {e}"
 
     # Halt execution and warn if the name didn't map to a real group/contact
     if chat_target is None:
@@ -309,31 +362,48 @@ def cmd_chats(args):
     except Exception as e:
         lines.append(f"(couldn't fetch groups: {e})")
 
-    lines.append("\nPRIVATE CHATS / CONTACTS:")
-    seen = {}  # chat_key -> display label
+        lines.append("\nPRIVATE CHATS / CONTACTS:")
+    # bare_user -> (jid, label); prefer @s.whatsapp.net over @lid
+    by_bare = {}
 
-    # 1) Contacts table (best source for “everyone we know”)
+    def _remember(cid: str, label: str):
+        if not cid or cid.endswith("@g.us") or cid == "status@broadcast":
+            return
+        bare = cid.split("@")[0]
+        if not bare:
+            return
+        prev = by_bare.get(bare)
+        if not prev:
+            by_bare[bare] = (cid, label or bare)
+            return
+        old_cid, old_label = prev
+        prefer = cid
+        if old_cid.endswith("@s.whatsapp.net"):
+            prefer = old_cid
+        elif cid.endswith("@s.whatsapp.net"):
+            prefer = cid
+        elif old_cid.endswith("@lid") and not cid.endswith("@lid"):
+            prefer = cid
+        by_bare[bare] = (prefer, label or old_label or bare)
+
+    # 1) Contacts
     try:
         res = _get_contacts_map() if _get_contacts_map else ({}, {})
         contacts_map = res[0] if isinstance(res, tuple) else res
         for s_id, name in (contacts_map or {}).items():
             if not s_id or s_id in ("mojo_agent", "voice_transcript", "document_text"):
                 continue
-            # Prefer phone-looking ids for display key when possible
             key = s_id if "@" in str(s_id) else f"{s_id}@s.whatsapp.net"
-            # Skip pure group jids if any leaked in
             if str(key).endswith("@g.us"):
                 continue
-            label = name or s_id
-            seen[str(key)] = label
+            _remember(str(key), name or str(s_id))
     except Exception as e:
         lines.append(f"(contacts fetch failed: {e})")
 
-    # 2) chat_history — paginate so we don't only see recent slice
+    # 2) chat_history (paginated)
     try:
         page_size = 1000
         start = 0
-        history_ids = set()
         while True:
             response = (
                 _supabase.table("chat_history")
@@ -346,19 +416,7 @@ def cmd_chats(args):
                 break
             for r in rows:
                 cid = r.get("chat_id") or ""
-                if not cid or "@g.us" in cid or cid == "status@broadcast":
-                    continue
-                history_ids.add(cid)
-            if len(rows) < page_size:
-                break
-            start += page_size
-            if start > 20000:  # safety cap
-                break
-
-        for cid in history_ids:
-            if cid not in seen:
-                bare = cid.split("@")[0]
-                # Try to name from contacts by bare id
+                bare = cid.split("@")[0] if cid else ""
                 label = None
                 try:
                     res = _get_contacts_map() if _get_contacts_map else ({}, {})
@@ -366,14 +424,20 @@ def cmd_chats(args):
                     label = (cmap or {}).get(bare) or (cmap or {}).get(cid)
                 except Exception:
                     pass
-                seen[cid] = label or bare
+                _remember(cid, label or bare)
+            if len(rows) < page_size:
+                break
+            start += page_size
+            if start > 20000:
+                break
     except Exception as e:
         lines.append(f"(chat_history fetch failed: {e})")
 
-    if not seen:
+    if not by_bare:
         lines.append("(none)")
     else:
-        for cid, label in sorted(seen.items(), key=lambda x: (x[1] or "").casefold()):
+        rows = sorted(by_bare.values(), key=lambda x: (x[1] or "").casefold())
+        for cid, label in rows:
             lines.append(f"- {label} → {cid}")
 
     return "\n".join(lines)
