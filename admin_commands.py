@@ -343,50 +343,58 @@ def cmd_chats(args):
         lines.append(f"(couldn't fetch groups: {e})")
 
     lines.append("\nPRIVATE CHATS / CONTACTS:")
-    by_bare = {}
+    # phone_digits -> display name  (one row per real number)
+    by_phone = {}
 
-    def _remember(cid: str, label: str):
-        if not cid or cid.endswith("@g.us") or cid == "status@broadcast":
-            return
-        bare = cid.split("@")[0]
-        if not bare:
-            return
-        prev = by_bare.get(bare)
-        if not prev:
-            by_bare[bare] = (cid, label or bare)
-            return
-        old_cid, old_label = prev
-        prefer = cid
-        if old_cid.endswith("@s.whatsapp.net"):
-            prefer = old_cid
-        elif cid.endswith("@s.whatsapp.net"):
-            prefer = cid
-        elif old_cid.endswith("@lid") and not cid.endswith("@lid"):
-            prefer = cid
-        by_bare[bare] = (prefer, label or old_label or bare)
+    def _looks_like_phone(s: str) -> bool:
+        d = re.sub(r"\D", "", s or "")
+        # real WA numbers are usually 8–15 digits; LIDs are often longer
+        return 8 <= len(d) <= 15
 
-    # 1) Contacts
+    def _remember_phone(phone: str, label: str):
+        digits = re.sub(r"\D", "", phone or "")
+        if not _looks_like_phone(digits):
+            return
+        label = (label or "").strip() or digits
+        prev = by_phone.get(digits)
+        # Prefer a real name over a bare number
+        if not prev or (prev == digits and label != digits):
+            by_phone[digits] = label
+
+    # --- A) Contacts table (best names + sender_num) ---
     try:
-        res = _get_contacts_map() if _get_contacts_map else ({}, {})
-        contacts_map = res[0] if isinstance(res, tuple) else res
-        for s_id, name in (contacts_map or {}).items():
-            if not s_id or s_id in ("mojo_agent", "voice_transcript", "document_text"):
+        rows = (
+            _supabase.table("contacts")
+            .select("sender_id, display_name, nickname, sender_num")
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            name = (row.get("nickname") or row.get("display_name") or "").strip()
+            sid = str(row.get("sender_id") or "")
+            snum = str(row.get("sender_num") or "").strip()
+
+            # Prefer explicit sender_num
+            if snum and _looks_like_phone(snum):
+                _remember_phone(snum, name or snum)
                 continue
-            key = s_id if "@" in str(s_id) else f"{s_id}@s.whatsapp.net"
-            if str(key).endswith("@g.us"):
-                continue
-            _remember(str(key), name or str(s_id))
+
+            # sender_id is already a phone (no @lid)
+            bare = sid.split("@")[0] if sid else ""
+            if "@lid" not in sid.lower() and _looks_like_phone(bare):
+                _remember_phone(bare, name or bare)
     except Exception as e:
         lines.append(f"(contacts fetch failed: {e})")
 
-    # 2) chat_history
+    # --- B) chat_history: only phone-shaped chat_ids ---
     try:
         page_size = 1000
         start = 0
         while True:
             response = (
                 _supabase.table("chat_history")
-                .select("chat_id")
+                .select("chat_id, sender_num")
                 .range(start, start + page_size - 1)
                 .execute()
             )
@@ -394,16 +402,38 @@ def cmd_chats(args):
             if not rows:
                 break
             for r in rows:
-                cid = r.get("chat_id") or ""
-                bare = cid.split("@")[0] if cid else ""
-                label = None
-                try:
-                    res = _get_contacts_map() if _get_contacts_map else ({}, {})
-                    cmap = res[0] if isinstance(res, tuple) else res
-                    label = (cmap or {}).get(bare) or (cmap or {}).get(cid)
-                except Exception:
-                    pass
-                _remember(cid, label or bare)
+                cid = (r.get("chat_id") or "").strip()
+                snum = (r.get("sender_num") or "").strip()
+
+                if snum and _looks_like_phone(snum):
+                    # Try to name from contacts map
+                    label = None
+                    try:
+                        res = _get_contacts_map() if _get_contacts_map else ({}, {})
+                        cmap = res[0] if isinstance(res, tuple) else res
+                        bare = re.sub(r"\D", "", snum)
+                        label = (cmap or {}).get(bare) or (cmap or {}).get(snum)
+                    except Exception:
+                        pass
+                    _remember_phone(snum, label or snum)
+                    continue
+
+                if not cid or "@g.us" in cid or cid == "status@broadcast":
+                    continue
+                # Only accept …@s.whatsapp.net (skip pure @lid)
+                if cid.endswith("@lid"):
+                    continue
+                bare = cid.split("@")[0]
+                if _looks_like_phone(bare):
+                    label = None
+                    try:
+                        res = _get_contacts_map() if _get_contacts_map else ({}, {})
+                        cmap = res[0] if isinstance(res, tuple) else res
+                        label = (cmap or {}).get(bare) or (cmap or {}).get(cid)
+                    except Exception:
+                        pass
+                    _remember_phone(bare, label or bare)
+
             if len(rows) < page_size:
                 break
             start += page_size
@@ -412,15 +442,13 @@ def cmd_chats(args):
     except Exception as e:
         lines.append(f"(chat_history fetch failed: {e})")
 
-    if not by_bare:
+    if not by_phone:
         lines.append("(none)")
     else:
-        rows = sorted(by_bare.values(), key=lambda x: (x[1] or "").casefold())
-        for cid, label in rows:
-            lines.append(f"- {label} → {cid}")
+        for phone, name in sorted(by_phone.items(), key=lambda x: (x[1] or "").casefold()):
+            lines.append(f"- {name} → {phone}")
 
     return "\n".join(lines)
-
 
 @command("help", "Lists all available commands.")
 def cmd_help(args):

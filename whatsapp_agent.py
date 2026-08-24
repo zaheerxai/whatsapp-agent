@@ -471,7 +471,7 @@ def get_contacts_maps():
 
     # 2. Otherwise, fetch from Supabase
     try:
-        response = supabase.table("contacts").select("sender_id, display_name, nickname").execute()
+        response = supabase.table("contacts").select("sender_id, display_name, nickname, sender_num").execute()
         contacts_map = {}
         reverse_map = {}
         
