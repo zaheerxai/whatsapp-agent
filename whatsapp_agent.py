@@ -765,7 +765,7 @@ def _guess_doc_meta(doc_msg, tmp_path):
     )
     ext = os.path.splitext(name)[1].lower()
 
-    if not mime or mime == "application/octet-stream":
+    if not mime or mime in ("application/octet-stream", "application/zip"):
         mime = {
             ".txt": "text/plain",
             ".md": "text/markdown",
@@ -779,7 +779,87 @@ def _guess_doc_meta(doc_msg, tmp_path):
             ".ppt": "application/vnd.ms-powerpoint",
             ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         }.get(ext, mime or "application/octet-stream")
-    return mime, name
+    return mime, name, ext
+
+
+def extract_document_text(tmp_path, mime, ext, max_chars=30000) -> str:
+    """Return plain text from common document types. Raises on hard failure."""
+    path = tmp_path
+    text = ""
+
+    # --- plain text family ---
+    if (
+        mime.startswith("text/")
+        or mime in ("application/json", "application/xml")
+        or ext in (".txt", ".md", ".csv", ".json", ".log")
+    ):
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+
+    # --- Word (.docx) ---
+    elif ext == ".docx" or "wordprocessingml" in mime:
+        from docx import Document
+        doc = Document(path)
+        parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        # tables
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        text = "\n".join(parts)
+
+    # --- Excel (.xlsx) ---
+    elif ext == ".xlsx" or "spreadsheetml" in mime:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        chunks = []
+        for sheet in wb.worksheets:
+            chunks.append(f"## Sheet: {sheet.title}")
+            for i, row in enumerate(sheet.iter_rows(values_only=True)):
+                if i > 200:  # cap rows per sheet
+                    chunks.append("…[more rows truncated]…")
+                    break
+                vals = ["" if v is None else str(v) for v in row]
+                if any(v.strip() for v in vals):
+                    chunks.append("\t".join(vals))
+        wb.close()
+        text = "\n".join(chunks)
+
+    # --- PowerPoint (.pptx) ---
+    elif ext == ".pptx" or "presentationml" in mime:
+        from pptx import Presentation
+        prs = Presentation(path)
+        parts = []
+        for i, slide in enumerate(prs.slides, 1):
+            parts.append(f"## Slide {i}")
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text and shape.text.strip():
+                    parts.append(shape.text.strip())
+        text = "\n".join(parts)
+
+    # --- PDF: leave to Gemini (return empty → caller uses vision path) ---
+    elif ext == ".pdf" or mime == "application/pdf":
+        return ""
+
+    # --- legacy .doc / .xls / .ppt ---
+    elif ext in (".doc", ".xls", ".ppt"):
+        raise ValueError(
+            f"Legacy format {ext} is not supported. "
+            "Please re-save as .docx / .xlsx / .pptx or PDF."
+        )
+
+    else:
+        raise ValueError(f"Unsupported document type: {name_safe(ext, mime)}")
+
+    text = (text or "").strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n…[truncated]…"
+    return text
+
+
+def name_safe(ext, mime):
+    return f"{ext or '?'} ({mime or 'unknown'})"
 
 
 def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
@@ -841,26 +921,32 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 
 
         if media_kind == "document":
-            doc_src = target_media_msg.documentMessage if target_media_msg else message.Message.documentMessage
-            mime, filename = _guess_doc_meta(doc_src, tmp_path)
+            if not admin_commands.is_feature_enabled(chat_id, "documents"):
+                print(f"[FEATURE OFF] 'documents' disabled for {chat_id}.")
+                return (
+                    "📄 Document reading is currently turned off for this chat."
+                    if admin_commands.has_any_feature_enabled(chat_id)
+                    else None
+                )
 
-            # --- 1. Plain text family: read as text, feed Groq ---
-            if mime.startswith("text/") or mime in (
-                "application/json",
-                "application/xml",
-                "text/csv",
-                "text/markdown",
-            ) or filename.lower().endswith((".txt", ".md", ".csv", ".json", ".log")):
-                try:
-                    with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
-                        body = f.read()
-                except Exception:
-                    with open(tmp_path, "rb") as f:
-                        body = f.read().decode("utf-8", errors="replace")
+            doc_src = (
+                target_media_msg.documentMessage
+                if target_media_msg and getattr(target_media_msg, "documentMessage", None)
+                else message.Message.documentMessage
+            )
+            mime, filename, ext = _guess_doc_meta(doc_src, tmp_path)
 
-                if len(body) > 30000:
-                    body = body[:30000] + "\n\n…[truncated]…"
+            # --- Office + text: extract → normal chat LLM (with history) ---
+            try:
+                body = extract_document_text(tmp_path, mime, ext)
+            except Exception as e:
+                print(f"[DOC EXTRACT ERROR] {filename}: {e}")
+                return (
+                    f"📄 Got `{filename}`, but couldn't read it ({e}). "
+                    "Try PDF, DOCX, XLSX, PPTX, or TXT."
+                )
 
+            if body:
                 context_str = (
                     f"[Document: {filename}]\n{body}"
                     if not (text_content and text_content.strip())
@@ -868,87 +954,57 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 )
                 insert_chat_message(chat_id, "document_text", "user", context_str)
                 if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                    return get_ai_response(chat_id, sender_id, msg_time=msg_time, history_limit=history_limit)
-                return f"📄 Read `{filename}` ({len(body)} chars). AI chat is off for this chat."
-
-            # --- 2. NEW: Modern Office Docs (extract text locally) ---
-            elif filename.lower().endswith((".docx", ".xlsx", ".pptx")):
-                try:
-                    ext = os.path.splitext(filename)[1].lower()
-                    body = ""
-                    
-                    if ext == ".docx":
-                        import docx
-                        doc = docx.Document(tmp_path)
-                        body = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                        
-                    elif ext == ".xlsx":
-                        import openpyxl
-                        # data_only=True reads calculated formula results, not the formulas themselves
-                        wb = openpyxl.load_workbook(tmp_path, data_only=True)
-                        lines = []
-                        for sheet in wb.worksheets:
-                            lines.append(f"\n--- Sheet: {sheet.title} ---")
-                            for row in sheet.iter_rows(values_only=True):
-                                # Filter out completely empty rows
-                                if any(cell is not None for cell in row):
-                                    lines.append(" | ".join(str(c) if c is not None else "" for c in row))
-                        body = "\n".join(lines)
-                        
-                    elif ext == ".pptx":
-                        import pptx
-                        prs = pptx.Presentation(tmp_path)
-                        lines = []
-                        for i, slide in enumerate(prs.slides):
-                            lines.append(f"\n--- Slide {i+1} ---")
-                            for shape in slide.shapes:
-                                if hasattr(shape, "text") and shape.text.strip():
-                                    lines.append(shape.text.strip())
-                        body = "\n".join(lines)
-                        
-                except Exception as e:
-                    print(f"Error reading Office file: {e}")
-                    return f"📄 Failed to read `{filename}`. Make sure it's not corrupted or password-protected."
-
-                if len(body) > 30000:
-                    body = body[:30000] + "\n\n…[truncated]…"
-
-                context_str = (
-                    f"[Document: {filename}]\n{body}"
-                    if not (text_content and text_content.strip())
-                    else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
+                    return get_ai_response(
+                        chat_id, sender_id, msg_time=msg_time, history_limit=history_limit
+                    )
+                return (
+                    f"📄 Read `{filename}` ({len(body)} chars). "
+                    "AI chat is off for this chat."
                 )
-                
-                insert_chat_message(chat_id, "document_text", "user", context_str)
-                if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                    return get_ai_response(chat_id, sender_id, msg_time=msg_time, history_limit=history_limit)
-                return f"📄 Read `{filename}` ({len(body)} chars). AI chat is off."
 
-            # --- 3. PDF ONLY: Route to Gemini with Vision ---
-            elif mime == "application/pdf" or filename.lower().endswith(".pdf"):
+            # --- PDF (no local text): Gemini ---
+            if ext == ".pdf" or mime == "application/pdf":
                 with open(tmp_path, "rb") as f:
                     media_b64 = base64.b64encode(f.read()).decode("utf-8")
-                user_prompt = text_content.strip() if text_content else f"Summarize or explain this document ({filename})."
-                
-                gemini_response = client_gemini.chat.completions.create(
-                    model=GEMINI_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are Mojo. The user sent a document. Extract and answer from its content. Keep it WhatsApp-short."},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": user_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{media_b64}"}}
-                        ]},
-                    ],
+                user_prompt = (
+                    text_content.strip()
+                    if text_content and text_content.strip()
+                    else f"Summarize or explain this PDF ({filename})."
                 )
-                return gemini_response.choices[0].message.content
+                try:
+                    gemini_response = client_gemini.chat.completions.create(
+                        model=GEMINI_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are Mojo. The user sent a PDF. "
+                                    "Answer from its content. Keep it WhatsApp-short."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": user_prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:application/pdf;base64,{media_b64}"
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    )
+                    return gemini_response.choices[0].message.content
+                except Exception as e:
+                    print(f"[PDF GEMINI ERROR] {e}")
+                    return "📄 Couldn't read that PDF right now. Try again or paste the text."
 
-            # --- 4. Unsupported Fallback ---
-            else:
-                return (
-                    f"📄 Received `{filename}` ({mime or 'unknown type'}). "
-                    "I can fully read TXT, CSV, JSON, PDF, DOCX, XLSX, and PPTX. "
-                    "For older formats (like .doc or .xls), please export them to a modern format or PDF first!"
-                )
+            return (
+                f"📄 Received `{filename}` ({mime}). "
+                "Supported: TXT, CSV, JSON, MD, PDF, DOCX, XLSX, PPTX."
+            )
 
 
         # A. Voice Notes (Whisper)
