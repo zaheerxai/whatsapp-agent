@@ -1651,7 +1651,11 @@ def process_message(client, message):
         elif hasattr(message, "from_me"): is_from_me = message.from_me
     except: pass
     
+    # Learn bot LID from our own outbound traffic, then ignore the message
     if is_from_me:
+        if not BOT_PN:
+            refresh_bot_identities(client)
+        learn_bot_lid_from_message(message, BOT_PN)
         return
 
     # Broadcast/bulk sends
@@ -1879,7 +1883,7 @@ def process_message(client, message):
         if "@mojo" in low or "@aimojo" in low:
             text_hit = True
 
-        is_bot_mentioned = native or text_hit
+    is_bot_mentioned = native or text_hit
 
     REACTION_MEDIA = {"sticker", "image", "gif"}
     has_quote = bool(ctx and getattr(ctx, "quotedMessage", None))
