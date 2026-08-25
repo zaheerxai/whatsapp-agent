@@ -844,7 +844,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             doc_src = target_media_msg.documentMessage if target_media_msg else message.Message.documentMessage
             mime, filename = _guess_doc_meta(doc_src, tmp_path)
 
-            # --- Plain text family: read as text, feed Groq (no vision) ---
+            # --- 1. Plain text family: read as text, feed Groq ---
             if mime.startswith("text/") or mime in (
                 "application/json",
                 "application/xml",
@@ -858,7 +858,6 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     with open(tmp_path, "rb") as f:
                         body = f.read().decode("utf-8", errors="replace")
 
-                # Cap size so prompts stay sane
                 if len(body) > 30000:
                     body = body[:30000] + "\n\n…[truncated]…"
 
@@ -872,49 +871,84 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     return get_ai_response(chat_id, sender_id, msg_time=msg_time, history_limit=history_limit)
                 return f"📄 Read `{filename}` ({len(body)} chars). AI chat is off for this chat."
 
-            # --- PDF / Office: Gemini with REAL mime (not always pdf) ---
-            if mime in (
-                "application/pdf",
-                "application/msword",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "application/vnd.ms-excel",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "application/vnd.ms-powerpoint",
-                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            ) or filename.lower().endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")):
+            # --- 2. NEW: Modern Office Docs (extract text locally) ---
+            elif filename.lower().endswith((".docx", ".xlsx", ".pptx")):
+                try:
+                    ext = os.path.splitext(filename)[1].lower()
+                    body = ""
+                    
+                    if ext == ".docx":
+                        import docx
+                        doc = docx.Document(tmp_path)
+                        body = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                        
+                    elif ext == ".xlsx":
+                        import openpyxl
+                        # data_only=True reads calculated formula results, not the formulas themselves
+                        wb = openpyxl.load_workbook(tmp_path, data_only=True)
+                        lines = []
+                        for sheet in wb.worksheets:
+                            lines.append(f"\n--- Sheet: {sheet.title} ---")
+                            for row in sheet.iter_rows(values_only=True):
+                                # Filter out completely empty rows
+                                if any(cell is not None for cell in row):
+                                    lines.append(" | ".join(str(c) if c is not None else "" for c in row))
+                        body = "\n".join(lines)
+                        
+                    elif ext == ".pptx":
+                        import pptx
+                        prs = pptx.Presentation(tmp_path)
+                        lines = []
+                        for i, slide in enumerate(prs.slides):
+                            lines.append(f"\n--- Slide {i+1} ---")
+                            for shape in slide.shapes:
+                                if hasattr(shape, "text") and shape.text.strip():
+                                    lines.append(shape.text.strip())
+                        body = "\n".join(lines)
+                        
+                except Exception as e:
+                    print(f"Error reading Office file: {e}")
+                    return f"📄 Failed to read `{filename}`. Make sure it's not corrupted or password-protected."
+
+                if len(body) > 30000:
+                    body = body[:30000] + "\n\n…[truncated]…"
+
+                context_str = (
+                    f"[Document: {filename}]\n{body}"
+                    if not (text_content and text_content.strip())
+                    else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
+                )
+                
+                insert_chat_message(chat_id, "document_text", "user", context_str)
+                if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
+                    return get_ai_response(chat_id, sender_id, msg_time=msg_time, history_limit=history_limit)
+                return f"📄 Read `{filename}` ({len(body)} chars). AI chat is off."
+
+            # --- 3. PDF ONLY: Route to Gemini with Vision ---
+            elif mime == "application/pdf" or filename.lower().endswith(".pdf"):
                 with open(tmp_path, "rb") as f:
                     media_b64 = base64.b64encode(f.read()).decode("utf-8")
                 user_prompt = text_content.strip() if text_content else f"Summarize or explain this document ({filename})."
-                # Prefer PDF mime for Gemini when it's actually PDF; for office, still try with real mime
-                gemini_mime = mime if mime == "application/pdf" else "application/pdf"
-                # Note: Gemini file understanding is strongest on PDF/images.
-                # For docx/xlsx, converting server-side is ideal; until then, try PDF path only for .pdf
-                if not filename.lower().endswith(".pdf") and mime != "application/pdf":
-                    return (
-                        f"📄 Got `{filename}` ({mime}). "
-                        "I can fully read TXT/CSV/JSON and PDF. "
-                        "For Word/Excel/PowerPoint, please export as PDF or paste the text."
-                    )
+                
                 gemini_response = client_gemini.chat.completions.create(
                     model=GEMINI_MODEL,
                     messages=[
-                        {"role": "system", "content": (
-                            "You are Mojo. The user sent a document. Extract and answer from its content. "
-                            "Keep it WhatsApp-short."
-                        )},
+                        {"role": "system", "content": "You are Mojo. The user sent a document. Extract and answer from its content. Keep it WhatsApp-short."},
                         {"role": "user", "content": [
                             {"type": "text", "text": user_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:{gemini_mime};base64,{media_b64}"}}
+                            {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{media_b64}"}}
                         ]},
                     ],
                 )
                 return gemini_response.choices[0].message.content
 
-            return (
-                f"📄 Received `{filename}` ({mime or 'unknown type'}). "
-                "Supported for content reading: TXT, CSV, JSON, MD, PDF. "
-                "Other types — tell me what you need from it or convert to PDF/TXT."
-            )
+            # --- 4. Unsupported Fallback ---
+            else:
+                return (
+                    f"📄 Received `{filename}` ({mime or 'unknown type'}). "
+                    "I can fully read TXT, CSV, JSON, PDF, DOCX, XLSX, and PPTX. "
+                    "For older formats (like .doc or .xls), please export them to a modern format or PDF first!"
+                )
 
 
         # A. Voice Notes (Whisper)
