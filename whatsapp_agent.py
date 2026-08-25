@@ -766,7 +766,7 @@ def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
     return False
 
 
-def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False):
+def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False,):
     
     # --- ADMIN FEATURE FLAG CHECKS (FRIENDLY REJECTION) ---
     chat_has_any_feature = admin_commands.has_any_feature_enabled(chat_id)
@@ -1879,13 +1879,32 @@ def process_message(client, message):
         if "@mojo" in low or "@aimojo" in low:
             text_hit = True
 
-    is_bot_mentioned = native or text_hit
+        is_bot_mentioned = native or text_hit
 
-    # Sticker / image / GIF quoting the bot = reaction (no @ required)
+    REACTION_MEDIA = {"sticker", "image", "gif"}
+    has_quote = bool(ctx and getattr(ctx, "quotedMessage", None))
+
+    # Groups: must be a reply to the bot.
+    # Private: any sticker/image/GIF that quotes *something* counts as a reaction
+    # (DMs often have no participant on the quote).
     is_media_reaction_to_bot = (
-        is_reply_to_bot
-        and media_kind in REACTION_MEDIA
+        media_kind in REACTION_MEDIA
+        and (
+            is_reply_to_bot
+            or (not is_group and has_quote)
+        )
     )
+
+    # --- temporary debug (remove after it works) ---
+    print(
+        f"[DEBUG REACTION] media_kind={media_kind!r} "
+        f"ctx={bool(ctx)} is_reply_to_bot={is_reply_to_bot} "
+        f"is_media_reaction_to_bot={is_media_reaction_to_bot} "
+        f"is_group={is_group} has_quote={has_quote} "
+        f"BOT_PN={BOT_PN} BOT_LID={BOT_LID} "
+        f"participant={getattr(ctx, 'participant', None) if ctx else None}"
+    )
+    # -----------------------------------------------
 
     if is_group:
         if not (is_bot_mentioned or is_media_reaction_to_bot):
@@ -1897,7 +1916,6 @@ def process_message(client, message):
     else:
         print(f"\n[PRIVATE MESSAGE] from {sender_number}")
 
-    
     if is_media_reaction_to_bot:
         q = (quoted_text or "").strip()
         kind_label = {
