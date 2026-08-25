@@ -294,8 +294,10 @@ def _user_of(jid_or_str) -> str:
     if not jid_or_str:
         return ""
     if isinstance(jid_or_str, str):
-        return jid_or_str.split("@")[0].strip()
-    return str(getattr(jid_or_str, "User", getattr(jid_or_str, "user", "")) or "").strip()
+        u = jid_or_str.split("@")[0].strip()
+    else:
+        u = str(getattr(jid_or_str, "User", getattr(jid_or_str, "user", "")) or "").strip()
+    return u.split(":")[0].strip()  # Strips multi-device IDs like :4 or :12
 
 def _server_of(jid_or_str) -> str:
     if not jid_or_str:
@@ -410,7 +412,7 @@ def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
 
 def quoted_matches_recent_bot_reply(chat_id, quoted_text) -> bool:
     q = (quoted_text or "").strip()
-    if not q or len(q) < 5:
+    if not q:
         return False
     try:
         rows = (
@@ -662,6 +664,17 @@ def get_media_kind(message):
         pass
     return None
 
+def get_context_info(msg_obj):
+    if not msg_obj:
+        return None
+    for msg_type in ("stickerMessage", "extendedTextMessage", "imageMessage", "videoMessage", "documentMessage", "audioMessage"):
+        sub_msg = getattr(msg_obj, msg_type, None)
+        if sub_msg:
+            for attr in ("contextInfo", "ContextInfo", "context_info"):
+                ctx = getattr(sub_msg, attr, None)
+                if ctx:
+                    return ctx
+    return None
 
 def detect_summary_history_limit(text):
     """If text is asking for a summary, figure out how many messages to pull in.
@@ -770,13 +783,9 @@ def _guess_doc_meta(doc_msg, tmp_path):
 
 
 def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
-    """True if this message is a reply/quote to one of the bot's messages."""
     if not ctx:
         return False
-
     bot_ids = {x for x in (bot_pn, bot_lid, bot_jid_user) if x}
-
-    # A) participant on the quoted message (group)
     participant = getattr(ctx, "participant", None) or getattr(ctx, "Participant", None)
     if participant:
         u = _user_of(participant)
@@ -785,11 +794,6 @@ def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
         s = str(participant)
         if any(b and b in s for b in bot_ids):
             return True
-
-    # B) some builds expose stanzaId / quoted sender differently — optional
-    # C) if quotedMessage exists and we only care "user is replying in-thread to us",
-    #    participant match is the main signal WhatsApp sends for group quotes.
-
     return False
 
 
@@ -1749,21 +1753,21 @@ def process_message(client, message):
     except AttributeError:
         pass
 
+    # Use robust context extraction helper
+    ctx = get_context_info(message.Message)
+
     if ctx:
-        # A. Check if this is a direct quote/reply to the bot
         if ctx.participant and bot_jid and bot_jid in ctx.participant:
             is_reply_to_bot = True
             
-        # B. Check if the bot was natively tagged via WhatsApp's @ mention system
         if hasattr(ctx, "mentionedJID") and ctx.mentionedJID:
             for jid in ctx.mentionedJID:
                 if bot_jid and bot_jid in jid:
                     is_bot_mentioned = True
                     
-        # C. Extract quoted text and media robustly
-        quoted = ctx.quotedMessage
+        # Robust quoted message extraction across casing variants
+        quoted = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
         if quoted:
-            # Text extraction
             q_conv = getattr(quoted, "conversation", "")
             q_ext = getattr(quoted, "extendedTextMessage", None)
             q_ext_text = getattr(q_ext, "text", "") if q_ext else ""
@@ -1776,7 +1780,6 @@ def process_message(client, message):
 
             quoted_text = q_conv or q_ext_text or q_img_cap or q_vid_cap or q_doc_cap
 
-            # Media extraction (Checking mimetype to prevent empty protobuf false positives)
             q_audio = getattr(quoted, "audioMessage", None)
             q_sticker = getattr(quoted, "stickerMessage", None)
 
@@ -1790,10 +1793,7 @@ def process_message(client, message):
                 media_kind = "sticker"
                 target_media_msg = quoted
             elif q_vid and getattr(q_vid, "mimetype", ""):
-                if getattr(q_vid, "gifPlayback", False):
-                    media_kind = "gif"
-                else:
-                    media_kind = "video"
+                media_kind = "gif" if getattr(q_vid, "gifPlayback", False) else "video"
                 target_media_msg = quoted
             elif q_doc and getattr(q_doc, "mimetype", ""):
                 media_kind = "document"
