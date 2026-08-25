@@ -925,17 +925,28 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 
 
     # --- MEDIA DOWNLOAD & PROCESSING ---
-    suffix = {
-        "image": ".jpg", 
-        "video": ".mp4", 
-        "gif": ".mp4",
-        "document": ".pdf",
-        "audio": ".ogg", 
-        "ptt": ".ogg", 
-        "sticker": ".webp",
-        "user_created_sticker": ".webp"
-    }.get(media_kind, ".bin")
-    
+    if media_kind == "document":
+        # Get the real file extension before creating the temp file
+        doc_src = (
+            target_media_msg.documentMessage
+            if target_media_msg and getattr(target_media_msg, "documentMessage", None)
+            else getattr(message.Message, "documentMessage", None)
+        )
+        orig_name = getattr(doc_src, "fileName", None) or getattr(doc_src, "title", None) or "file.pdf"
+        _, ext = os.path.splitext(orig_name)
+        suffix = ext.lower() if ext else ".pdf"
+    else:
+        # Standard media mappings
+        suffix = {
+            "image": ".jpg", 
+            "video": ".mp4", 
+            "gif": ".mp4",
+            "audio": ".ogg", 
+            "ptt": ".ogg", 
+            "sticker": ".webp",
+            "user_created_sticker": ".webp"
+        }.get(media_kind, ".bin")
+        
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -959,7 +970,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 if target_media_msg and getattr(target_media_msg, "documentMessage", None)
                 else message.Message.documentMessage
             )
-            
+
             mime, filename, ext = _guess_doc_meta(doc_src, tmp_path)
             magic = _file_magic_kind(tmp_path)
             print(f"[DOC] name={filename!r} ext={ext!r} mime={mime!r} magic={magic}")
