@@ -624,7 +624,12 @@ def get_media_kind(message):
         ):
             return "document"
         sticker = getattr(msg_obj, "stickerMessage", None)
-        if sticker and (getattr(sticker, "mimetype", None) or getattr(sticker, "URL", None) or getattr(sticker, "directPath", None)):
+        if sticker and (
+            getattr(sticker, "mimetype", None)
+            or getattr(sticker, "URL", None)
+            or getattr(sticker, "directPath", None)
+            or getattr(sticker, "mediaKey", None)
+        ):
             return "sticker"
     except AttributeError:
         pass
@@ -1708,6 +1713,8 @@ def process_message(client, message):
             ctx = message.Message.documentMessage.contextInfo
         elif message.Message.audioMessage and message.Message.audioMessage.contextInfo:
             ctx = message.Message.audioMessage.contextInfo
+        elif getattr(message.Message, "stickerMessage", None) and message.Message.stickerMessage.contextInfo:
+            ctx = message.Message.stickerMessage.contextInfo
     except AttributeError:
         pass
 
