@@ -394,6 +394,20 @@ def is_bot_natively_mentioned(ctx, bot_pn, bot_lid) -> bool:
                 
     return False
 
+def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
+    if not ctx:
+        return False
+    bot_ids = {x for x in (bot_pn, bot_lid, bot_jid_user) if x}
+    participant = getattr(ctx, "participant", None) or getattr(ctx, "Participant", None)
+    if participant:
+        u = _user_of(participant)
+        if u and u in bot_ids:
+            return True
+        s = str(participant)
+        if any(b and b in s for b in bot_ids):
+            return True
+    return False
+
 def get_tzinfo(tz_val):
     """Robustly parse IANA strings, numeric float offsets, or fallback to default."""
     if not tz_val:
@@ -747,7 +761,7 @@ def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
     return False
 
 
-def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20):
+def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False):
     
     # --- ADMIN FEATURE FLAG CHECKS (FRIENDLY REJECTION) ---
     chat_has_any_feature = admin_commands.has_any_feature_enabled(chat_id)
@@ -1668,24 +1682,6 @@ def process_message(client, message):
 
     text_content = original_text
 
-    if is_media_reaction_to_bot:
-        q = (quoted_text or "").strip()
-        kind_label = {
-            "sticker": "sticker",
-            "image": "image",
-            "gif": "GIF",
-        }.get(media_kind, media_kind)
-        reaction_note = (
-            f"[User is reacting to your previous message with a {kind_label}. "
-            f"Treat this as their reaction/feedback to what you said"
-            + (f': "{q[:300]}"' if q else "")
-            + ". Respond naturally to the reaction — short, in-character, same language vibe.]"
-        )
-        if text_content.strip():
-            text_content = f"{reaction_note}\n\nUser caption: {text_content}"
-        else:
-            text_content = reaction_note
-
     media_kind = get_media_kind(message)
     target_media_msg = None
 
@@ -1894,6 +1890,25 @@ def process_message(client, message):
     else:
         print(f"\n[PRIVATE MESSAGE] from {sender_number}")
 
+    
+    if is_media_reaction_to_bot:
+        q = (quoted_text or "").strip()
+        kind_label = {
+            "sticker": "sticker",
+            "image": "image",
+            "gif": "GIF",
+        }.get(media_kind, media_kind or "media")
+        reaction_note = (
+            f"[User is reacting to your previous message with a {kind_label}. "
+            f"Treat this as their reaction/feedback to what you said"
+            + (f': "{q[:300]}"' if q else "")
+            + ". Respond naturally to the reaction — short, in-character, same language vibe.]"
+        )
+        if text_content.strip():
+            text_content = f"{reaction_note}\n\nUser caption: {text_content}"
+        else:
+            text_content = reaction_note
+
     # --- TIMESTAMP EXTRACTION & OFFLINE SPAM GUARD ---
     msg_time = time.time()
     try:
@@ -1960,7 +1975,7 @@ def process_message(client, message):
         if media_kind:
             with _timed("2. media handling"):
                 # FIX: Mapped to db_sender_id (LID)
-                ai_answer = handle_media_message(message, media_kind, chat_id, db_sender_id, text_content, target_media_msg, msg_time, history_limit)
+                ai_answer = handle_media_message(message, media_kind, chat_id, db_sender_id, text_content, target_media_msg, msg_time, history_limit, is_reaction_to_bot=is_media_reaction_to_bot)
         else:
             # Check if basic LLM text conversation is enabled
             if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
