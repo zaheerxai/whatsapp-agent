@@ -408,6 +408,33 @@ def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
             return True
     return False
 
+def quoted_matches_recent_bot_reply(chat_id, quoted_text) -> bool:
+    q = (quoted_text or "").strip()
+    if not q or len(q) < 5:
+        return False
+    try:
+        rows = (
+            supabase.table("chat_history")
+            .select("content")
+            .eq("chat_id", chat_id)
+            .eq("role", "assistant")
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+            .data
+            or []
+        )
+        q_norm = " ".join(q.lower().split())
+        for row in rows:
+            c = " ".join((row.get("content") or "").lower().split())
+            if not c:
+                continue
+            if q_norm in c or c in q_norm:
+                return True
+    except Exception as e:
+        print(f"[REACTION] history match failed: {e}")
+    return False
+
 def get_tzinfo(tz_val):
     """Robustly parse IANA strings, numeric float offsets, or fallback to default."""
     if not tz_val:
@@ -1871,6 +1898,20 @@ def process_message(client, message):
     is_reply_to_bot = is_quote_of_bot(ctx, BOT_PN, BOT_LID, bot_jid)
 
     REACTION_MEDIA = {"sticker", "image", "gif"}  # optional: add "video" if you want
+
+    has_quote = bool(ctx and getattr(ctx, "quotedMessage", None))
+
+    # Group: participant is often bot LID — if LID unknown, match quoted text to our last replies
+    if (
+        not is_reply_to_bot
+        and is_group
+        and has_quote
+        and quoted_text
+        and media_kind in ("sticker", "image", "gif")
+    ):
+        if quoted_matches_recent_bot_reply(chat_id, quoted_text):
+            is_reply_to_bot = True
+            print("[REACTION] Quote matched recent bot reply via chat_history")
 
     native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
     text_hit = False
