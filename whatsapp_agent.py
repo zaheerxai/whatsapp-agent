@@ -781,6 +781,26 @@ def _guess_doc_meta(doc_msg, tmp_path):
         }.get(ext, mime or "application/octet-stream")
     return mime, name, ext
 
+def _file_magic_kind(path: str) -> str:
+    """Return 'pdf' | 'zip_ooxml' | 'ole' | 'text' | 'unknown' from bytes."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except Exception:
+        return "unknown"
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"PK"):  # zip → xlsx/docx/pptx
+        return "zip_ooxml"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):  # old .doc/.xls/.ppt
+        return "ole"
+    # rough text
+    try:
+        head.decode("utf-8")
+        return "text"
+    except Exception:
+        return "unknown"
+
 
 def extract_document_text(tmp_path, mime, ext, max_chars=30000) -> str:
     """Return plain text from common document types. Raises on hard failure."""
@@ -811,6 +831,11 @@ def extract_document_text(tmp_path, mime, ext, max_chars=30000) -> str:
 
     # --- Excel (.xlsx) ---
     elif ext == ".xlsx" or "spreadsheetml" in mime:
+        if _file_magic_kind(path) != "zip_ooxml":
+            raise ValueError(
+                "File is not a real .xlsx (content is not an Excel package). "
+                "Open it in Excel and Save As .xlsx, or send PDF/CSV."
+            )
         from openpyxl import load_workbook
         wb = load_workbook(path, read_only=True, data_only=True)
         chunks = []
@@ -934,36 +959,18 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 if target_media_msg and getattr(target_media_msg, "documentMessage", None)
                 else message.Message.documentMessage
             )
+            
             mime, filename, ext = _guess_doc_meta(doc_src, tmp_path)
+            magic = _file_magic_kind(tmp_path)
+            print(f"[DOC] name={filename!r} ext={ext!r} mime={mime!r} magic={magic}")
 
-            # --- Office + text: extract → normal chat LLM (with history) ---
-            try:
-                body = extract_document_text(tmp_path, mime, ext)
-            except Exception as e:
-                print(f"[DOC EXTRACT ERROR] {filename}: {e}")
-                return (
-                    f"📄 Got `{filename}`, but couldn't read it ({e}). "
-                    "Try PDF, DOCX, XLSX, PPTX, or TXT."
-                )
+            # Filename/extension lied — content is actually PDF
+            if magic == "pdf":
+                ext = ".pdf"
+                mime = "application/pdf"
 
-            if body:
-                context_str = (
-                    f"[Document: {filename}]\n{body}"
-                    if not (text_content and text_content.strip())
-                    else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
-                )
-                insert_chat_message(chat_id, "document_text", "user", context_str)
-                if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                    return get_ai_response(
-                        chat_id, sender_id, msg_time=msg_time, history_limit=history_limit
-                    )
-                return (
-                    f"📄 Read `{filename}` ({len(body)} chars). "
-                    "AI chat is off for this chat."
-                )
-
-            # --- PDF (no local text): Gemini ---
-            if ext == ".pdf" or mime == "application/pdf":
+            # --- PDF → Gemini (do NOT openpyxl) ---
+            if magic == "pdf" or ext == ".pdf" or mime == "application/pdf":
                 with open(tmp_path, "rb") as f:
                     media_b64 = base64.b64encode(f.read()).decode("utf-8")
                 user_prompt = (
@@ -1000,6 +1007,40 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 except Exception as e:
                     print(f"[PDF GEMINI ERROR] {e}")
                     return "📄 Couldn't read that PDF right now. Try again or paste the text."
+
+            # Named like Office but bytes are not OOXML/text
+            if magic not in ("zip_ooxml", "text") and ext in (".xlsx", ".docx", ".pptx"):
+                return (
+                    f"📄 `{filename}` is named like Office, but the file content is not "
+                    f"(detected: {magic}). Re-export from Excel/Word as real .xlsx/.docx, "
+                    "or send a real PDF."
+                )
+
+            # --- Office + text: extract → normal chat LLM ---
+            try:
+                body = extract_document_text(tmp_path, mime, ext)
+            except Exception as e:
+                print(f"[DOC EXTRACT ERROR] {filename}: {e}")
+                return (
+                    f"📄 Got `{filename}`, but couldn't read it ({e}). "
+                    "Try PDF, DOCX, XLSX, PPTX, or TXT."
+                )
+
+            if body:
+                context_str = (
+                    f"[Document: {filename}]\n{body}"
+                    if not (text_content and text_content.strip())
+                    else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
+                )
+                insert_chat_message(chat_id, "document_text", "user", context_str)
+                if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
+                    return get_ai_response(
+                        chat_id, sender_id, msg_time=msg_time, history_limit=history_limit
+                    )
+                return (
+                    f"📄 Read `{filename}` ({len(body)} chars). "
+                    "AI chat is off for this chat."
+                )
 
             return (
                 f"📄 Received `{filename}` ({mime}). "
