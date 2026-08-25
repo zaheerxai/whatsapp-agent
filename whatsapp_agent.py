@@ -609,7 +609,8 @@ def get_media_kind(message):
             or getattr(doc, "URL", None)
         ):
             return "document"
-        if msg_obj.stickerMessage and (msg_obj.stickerMessage.mimetype or msg_obj.stickerMessage.URL):
+        sticker = getattr(msg_obj, "stickerMessage", None)
+        if sticker and (getattr(sticker, "mimetype", None) or getattr(sticker, "URL", None) or getattr(sticker, "directPath", None)):
             return "sticker"
     except AttributeError:
         pass
@@ -720,6 +721,30 @@ def _guess_doc_meta(doc_msg, tmp_path):
             ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         }.get(ext, mime or "application/octet-stream")
     return mime, name
+
+
+def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
+    """True if this message is a reply/quote to one of the bot's messages."""
+    if not ctx:
+        return False
+
+    bot_ids = {x for x in (bot_pn, bot_lid, bot_jid_user) if x}
+
+    # A) participant on the quoted message (group)
+    participant = getattr(ctx, "participant", None) or getattr(ctx, "Participant", None)
+    if participant:
+        u = _user_of(participant)
+        if u and u in bot_ids:
+            return True
+        s = str(participant)
+        if any(b and b in s for b in bot_ids):
+            return True
+
+    # B) some builds expose stanzaId / quoted sender differently — optional
+    # C) if quotedMessage exists and we only care "user is replying in-thread to us",
+    #    participant match is the main signal WhatsApp sends for group quotes.
+
+    return False
 
 
 def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20):
@@ -1643,6 +1668,24 @@ def process_message(client, message):
 
     text_content = original_text
 
+    if is_media_reaction_to_bot:
+        q = (quoted_text or "").strip()
+        kind_label = {
+            "sticker": "sticker",
+            "image": "image",
+            "gif": "GIF",
+        }.get(media_kind, media_kind)
+        reaction_note = (
+            f"[User is reacting to your previous message with a {kind_label}. "
+            f"Treat this as their reaction/feedback to what you said"
+            + (f': "{q[:300]}"' if q else "")
+            + ". Respond naturally to the reaction — short, in-character, same language vibe.]"
+        )
+        if text_content.strip():
+            text_content = f"{reaction_note}\n\nUser caption: {text_content}"
+        else:
+            text_content = reaction_note
+
     media_kind = get_media_kind(message)
     target_media_msg = None
 
@@ -1818,6 +1861,10 @@ def process_message(client, message):
     
     learn_bot_lid_from_message(message, BOT_PN)
 
+    is_reply_to_bot = is_quote_of_bot(ctx, BOT_PN, BOT_LID, bot_jid)
+
+    REACTION_MEDIA = {"sticker", "image", "gif"}  # optional: add "video" if you want
+
     native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
     text_hit = False
     if original_text:
@@ -1826,16 +1873,24 @@ def process_message(client, message):
             text_hit = True
         if BOT_LID and f"@{BOT_LID}" in low:
             text_hit = True
-        # display-name wake (optional; your push name is aimojo)
-        if "@mojo" in low:
+        if "@mojo" in low or "@aimojo" in low:
             text_hit = True
 
     is_bot_mentioned = native or text_hit
 
+    # Sticker / image / GIF quoting the bot = reaction (no @ required)
+    is_media_reaction_to_bot = (
+        is_reply_to_bot
+        and media_kind in REACTION_MEDIA
+    )
+
     if is_group:
-        if not is_bot_mentioned:
+        if not (is_bot_mentioned or is_media_reaction_to_bot):
             return
-        print(f"\n[GROUP WAKE WORD DETECTED] from {sender_number}")
+        if is_media_reaction_to_bot and not is_bot_mentioned:
+            print(f"\n[GROUP MEDIA REACTION TO BOT] {media_kind} from {sender_number}")
+        else:
+            print(f"\n[GROUP WAKE WORD DETECTED] from {sender_number}")
     else:
         print(f"\n[PRIVATE MESSAGE] from {sender_number}")
 
