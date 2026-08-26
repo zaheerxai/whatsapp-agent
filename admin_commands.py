@@ -450,6 +450,19 @@ def cmd_chats(args):
 
     return "\n".join(lines)
 
+@command("exportlog", "Usage: /exportlog [n] — last n msgs (all chats) → TXT → OneDrive (default n=200, max 5000)")
+def cmd_exportlog(args):
+    n = 200
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            return "Usage: /exportlog [n]  e.g. /exportlog 500"
+    n = max(1, min(n, 5000))
+    # call into main module helper (see below)
+    import whatsapp_agent as wa
+    return wa.export_chat_log_to_onedrive(n)
+
 @command("help", "Lists all available commands.")
 def cmd_help(args):
     lines = ["Available admin commands:"]

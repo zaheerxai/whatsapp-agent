@@ -34,6 +34,7 @@ from supabase import create_client, Client
 
 # Import this AFTER load_dotenv() so it can see the variables
 import admin_commands
+import file_ops
 
 import time as _time
 
@@ -240,11 +241,65 @@ def start_self_ping(interval_seconds=600):
     t.start()
     print(f"[SELF-PING] Started (every {interval_seconds}s) → {url}")
 
-
 # Trigger words that tell the bot to save something permanently.
 # This is the simple/cheap version — see maybe_save_memory_smart() below for a
 # version that catches rules that don't use any of these exact words.
 MEMORY_TRIGGERS = ["always remember"]
+
+
+
+
+def build_chat_debug_log_text(n: int = 200) -> str:
+    n = max(1, min(int(n), 5000))
+    rows = (
+        supabase.table("chat_history")
+        .select("created_at, chat_id, role, sender_id, sender_num, content")
+        .order("created_at", desc=True)
+        .limit(n)
+        .execute()
+        .data
+        or []
+    )
+    rows = list(reversed(rows))
+    contacts_map, _ = get_contacts_maps()
+
+    lines = [
+        f"# last {n} messages (all chats)",
+        f"# generated_utc={datetime.now(timezone.utc).isoformat()}",
+        "# timestamp | chat_id | role | lid | number | name | message",
+    ]
+    for row in rows:
+        lid = row.get("sender_id") or ""
+        number = row.get("sender_num") or ""
+        role = row.get("role") or ""
+        name = "mojo_agent" if role == "assistant" else (contacts_map.get(lid) or "-")
+        msg = (row.get("content") or "").replace("\n", "\\n")
+        lines.append(
+            f"{row.get('created_at','')} | {row.get('chat_id','')} | {role} | "
+            f"{lid} | {number} | {name} | {msg}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def export_chat_log_to_onedrive(n: int = 200) -> str:
+    text = build_chat_debug_log_text(n)
+    if not file_ops.onedrive_configured():
+        path = file_ops.write_text_file(
+            text, file_ops.make_timestamped_name(f"wa_chat_log_last{n}")
+        )
+        return f"⚠️ OneDrive not configured. Log saved locally: {path}"
+    try:
+        result = file_ops.write_and_upload_text(
+            text, filename_prefix=f"wa_chat_log_last{n}"
+        )
+        return (
+            f"✅ Exported last {n} messages → OneDrive/"
+            f"{result['folder']}/{result['remote_name']}\n"
+            f"{result.get('webUrl') or ''}"
+        )
+    except Exception as e:
+        return f"❌ Export failed: {e}"
+
 
 BOT_PN = None
 BOT_LID = None
