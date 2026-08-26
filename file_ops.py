@@ -198,3 +198,30 @@ def write_and_upload_text(
     finally:
         if delete_local:
             safe_remove(path)
+
+
+def write_and_upload_file(
+    local_path: str,
+    filename_prefix: str,
+    ext: str = "jpg",
+    remote_folder: Optional[str] = None,
+    delete_local: bool = True,
+) -> dict:
+    """
+    Upload an existing local file with a timestamped name.
+    Returns {local_path, remote_name, webUrl, size, folder, ...}
+    """
+    name = make_timestamped_name(filename_prefix, ext)
+    try:
+        meta = upload_to_onedrive(local_path, remote_folder=remote_folder, remote_name=name)
+        return {
+            "local_path": local_path,
+            "remote_name": name,
+            "webUrl": meta.get("webUrl"),
+            "id": meta.get("id"),
+            "size": meta.get("size"),
+            "folder": remote_folder or _folder(),
+        }
+    finally:
+        if delete_local:
+            safe_remove(local_path)

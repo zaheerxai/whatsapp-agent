@@ -455,13 +455,20 @@ def cmd_exportlog(args):
     n = 200
     if args:
         try:
-            n = int(args[0])
-        except ValueError:
+            n = int(args.strip().split()[0])  # full number, not first char
+        except (ValueError, IndexError):
             return "Usage: /exportlog [n]  e.g. /exportlog 500"
     n = max(1, min(n, 5000))
-    # call into main module helper (see below)
     import whatsapp_agent as wa
     return wa.export_chat_log_to_onedrive(n)
+
+@command("uploadimg", "Usage: send or reply to an image with /uploadimg [optional_name] — uploads to OneDrive")
+def cmd_uploadimg(args):
+    # Real work is done in process_message (needs media). This is only for /help + text-only misuse.
+    return (
+        "Send an image with caption /uploadimg, or reply to an image with /uploadimg.\n"
+        "Optional: /uploadimg my_screenshot"
+    )
 
 @command("help", "Lists all available commands.")
 def cmd_help(args):

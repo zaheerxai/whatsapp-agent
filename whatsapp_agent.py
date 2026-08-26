@@ -2062,6 +2062,63 @@ def process_message(client, message):
         return
 
     if admin_commands.is_admin_message(sender_number, is_group):
+        # --- /uploadimg needs media (caption or reply-to-image) ---
+        low = (original_text or "").strip().lower()
+        is_upload = low.startswith("/uploadimg") or low.startswith("/upload ")
+
+        if is_upload and media_kind in ("image", "sticker", "document", "video", "gif"):
+            # optional custom name from args
+            name_hint = ""
+            if " " in (original_text or "").strip():
+                name_hint = (original_text or "").strip().split(maxsplit=1)[1].strip()
+            name_hint = re.sub(r"[^\w\-]+", "_", name_hint)[:40] if name_hint else ""
+
+            suffix = {
+                "image": ".jpg",
+                "sticker": ".webp",
+                "video": ".mp4",
+                "gif": ".mp4",
+                "document": os.path.splitext(
+                    getattr(
+                        getattr(message.Message, "documentMessage", None),
+                        "fileName",
+                        None,
+                    )
+                    or "file.bin"
+                )[1]
+                or ".bin",
+            }.get(media_kind, ".bin")
+
+            prefix = name_hint or f"wa_{media_kind}"
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp_path = tmp.name
+                msg_to_dl = target_media_msg if target_media_msg else message.Message
+                client.download_any(msg_to_dl, path=tmp_path)
+
+                result = file_ops.write_and_upload_file(
+                    tmp_path,
+                    filename_prefix=prefix,
+                    ext=suffix.lstrip("."),
+                    delete_local=True,
+                )
+                tmp_path = None  # already removed by helper
+                admin_reply = (
+                    f"✅ Uploaded → OneDrive/{result['folder']}/{result['remote_name']}\n"
+                    f"{result.get('webUrl') or ''}"
+                )
+            except Exception as e:
+                print(f"[UPLOADIMG] {e}")
+                admin_reply = f"❌ Upload failed: {e}"
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+            client.reply_message(admin_reply, message)
+            return
+
+        # normal text admin commands
         admin_reply = admin_commands.handle_admin_command(text_content)
         if admin_reply is not None:
             print(f"[ADMIN COMMAND] {text_content}")
