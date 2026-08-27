@@ -1207,21 +1207,32 @@ def extract_reminder_data_via_ai(text_content, user_tz_str):
         
     now_local = now_utc.astimezone(tz)
     
-    system_prompt = f"""You are an advanced time-parsing engine.
-Extract the reminder details from the user's message and return ONLY a valid JSON object.
+    system_prompt = f"""You are an advanced time-parsing engine for WhatsApp reminders.
+Users often write in Roman Urdu / mixed English-Urdu (e.g. "1 min me paani peena hai", "remind mér ek minute me", "roz subah 7 baje").
+Extract the reminder details and return ONLY a valid JSON object.
 
 Current UTC Time: {now_utc.isoformat()}
 User's Local Time: {now_local.isoformat()}
 User's Timezone: {user_tz_str}
 
-JSON Schema Requirements:
+Roman Urdu time hints:
+- "ek min / 1 min / ek minute me" = 1 minute from now
+- "do min / 2 mins" = 2 minutes
+- "ek ghanta" = 1 hour
+- "kal" = tomorrow
+- "roz / daily / everyday" = recurring every day
+- "subah / morning", "sham / evening" — map to reasonable clock times if no exact hour given
+
+JSON Schema:
 {{
-  "message": "Cleaned reminder subject (e.g., 'pray 5 times' or 'saans leni hai'). Remove trigger words like 'remind me'. Keep their original language.",
-  "is_recurring": boolean (true if user says daily, everyday, or mentions days of the week. false if it's just multiple times today),
-  "recurring_days": array of lowercase strings like ["monday", "friday"] (or null if everyday),
-  "recurring_local_times": array of strings in 24-hour format like ["05:00", "13:00", "16:00"] (null if is_recurring is false),
-  "one_off_utc_times": array of ISO-8601 UTC datetimes like ["2026-08-13T10:00:00+00:00", "2026-08-13T10:01:00+00:00"] (null if is_recurring is true)
-}}"""
+  "message": "Cleaned subject only (e.g. 'paani peena hai' or 'debug'). Strip trigger words like remind/reminder/riemind/ریمائنڈ. Keep original language.",
+  "is_recurring": boolean (true if daily/roz/everyday or specific weekdays),
+  "recurring_days": array of lowercase English weekday names or null if everyday,
+  "recurring_local_times": array of "HH:MM" 24h local times (null if not recurring),
+  "one_off_utc_times": array of ISO-8601 UTC datetimes (null if recurring)
+}}
+
+If you cannot parse any concrete time, still return valid JSON with empty arrays so the caller can ask for clarification."""
 
     try:
         response = client_ai.chat.completions.create(
@@ -1569,17 +1580,35 @@ def reminder_scheduler():
 
 
 def cancel_reminders(chat_id, sender_id, text_content):
-    """Deactivates matching reminders. Simple substring match against the
-    reminder's own message text — good enough until someone has enough
-    reminders at once that this gets ambiguous."""
+    """Deactivates matching reminders. Supports 'all'/sab and token overlap
+    so Roman Urdu like 'paani wale reminders cancel' works."""
     try:
         response = supabase.table("reminders").select("*") \
             .eq("chat_id", chat_id).eq("sender_id", sender_id).eq("active", True).execute()
         if not response.data:
             return "You don't have any active reminders to cancel."
 
-        lowered = text_content.lower()
-        matched = [r for r in response.data if r["message"].lower() in lowered or lowered in r["message"].lower()]
+        lowered = (text_content or "").lower()
+        if any(w in lowered for w in (" all", "all ", "sab ", " saare", "saari", "everything", "pure ")):
+            for r in response.data:
+                supabase.table("reminders").update({"active": False}).eq("id", r["id"]).execute()
+            return "Cancelled all your active reminders: " + ", ".join(
+                f'"{r["message"]}"' for r in response.data
+            )
+
+        q_tokens = set(re.findall(r"\w+", lowered))
+        # drop common cancel verbs so they don't dilute match
+        q_tokens -= {"cancel", "karo", "delete", "remove", "reminder", "reminders", "the", "to", "from", "now", "on", "wale", "wali", "wala"}
+        matched = []
+        for r in response.data:
+            msg = (r.get("message") or "").lower()
+            if msg and (msg in lowered or lowered in msg):
+                matched.append(r)
+                continue
+            msg_tokens = set(re.findall(r"\w+", msg))
+            if q_tokens & msg_tokens:
+                matched.append(r)
+
         if not matched:
             names = ", ".join(f'"{r["message"]}"' for r in response.data)
             return f"Which one do you mean? You have: {names}"
@@ -1816,6 +1845,47 @@ session_db = get_session_path()
 client = NewClient(session_db)
 # Inject the LLM client and model name into the admin commands module
 admin_commands.init(supabase, client, get_contacts_maps, client_ai, MODEL_NAME)
+
+# --- Agentic tools + loop ---
+import agent_tools
+import agent_loop
+
+agent_tools.init_tools(
+    supabase=supabase,
+    client_ai=client_ai,
+    model_name=MODEL_NAME,
+    business_knowledge=BUSINESS_KNOWLEDGE,
+    default_timezone=DEFAULT_TIMEZONE,
+    owner_sender_id=os.getenv("OWNER_SENDER_ID") or "",
+    get_contacts_maps=get_contacts_maps,
+    get_user_timezone=get_user_timezone,
+    set_user_timezone=set_user_timezone,
+    get_tzinfo=get_tzinfo,
+    handle_reminder_request=handle_reminder_request,
+    list_reminders=list_reminders,
+    cancel_reminders=cancel_reminders,
+    get_group_memory=get_group_memory,
+    send_proactive_message=send_proactive_message,
+    file_ops_module=file_ops,
+    compute_next_occurrence=compute_next_occurrence,
+    extract_reminder_data_via_ai=extract_reminder_data_via_ai,
+    generate_reminder_confirmation=generate_reminder_confirmation,
+)
+
+agent_loop.init_agent(
+    client_ai=client_ai,
+    client_gemini=client_gemini,
+    model_name=MODEL_NAME,
+    gemini_model=GEMINI_MODEL,
+    business_knowledge=BUSINESS_KNOWLEDGE,
+    default_timezone=DEFAULT_TIMEZONE,
+    get_user_timezone=get_user_timezone,
+    get_world_clocks=get_world_clocks,
+    fetch_chat_history=fetch_chat_history,
+    get_contacts_maps=get_contacts_maps,
+    get_group_memory=get_group_memory,
+    get_tzinfo=get_tzinfo,
+)
 
 # Start health endpoint + session uploader + optional self-ping
 start_health_server()
@@ -2258,11 +2328,11 @@ def process_message(client, message):
             maybe_save_memory(chat_id, db_sender_id, text_content)
 
         # ==========================================
-        # LOGIC 3: GENERATE AND SAVE AI REPLY
+        # LOGIC 3: GENERATE AND SAVE AI REPLY (AGENTIC)
         # ==========================================
-        
+
         lowered_text = text_content.lower()
-        
+
         history_limit = detect_summary_history_limit(text_content)
         if history_limit is not None:
             print(f"[DYNAMIC CONTEXT EXTENSION] Fetching {history_limit} messages for summary request.")
@@ -2271,49 +2341,39 @@ def process_message(client, message):
 
         ai_answer = None
 
-        # 1. Personal timezone setting
-        # FIX: Mapped to db_sender_id (LID)
+        # Fast path: explicit timezone offset setting (still keyword for reliability)
         tz_reply = maybe_set_timezone(db_sender_id, text_content)
         if tz_reply:
             ai_answer = tz_reply
 
-        # 2. Reminders Check (Only if 'reminders' feature is explicitly ON)
-        elif admin_commands.is_feature_enabled(chat_id, "reminders"):
-            if any(phrase in lowered_text for phrase in ("my reminders", "list reminders", "what reminders", "show reminders")):
-                print("[REMINDER INTENT] Listing active reminders...")
-                # FIX: Mapped to db_sender_id (LID)
-                ai_answer = list_reminders(chat_id, db_sender_id)
-                
-            elif "cancel reminder" in lowered_text or "delete reminder" in lowered_text:
-                print("[REMINDER INTENT] Cancelling reminder...")
-                # FIX: Mapped to db_sender_id (LID)
-                ai_answer = cancel_reminders(chat_id, db_sender_id, text_content)
-                
-            elif "remind" in lowered_text:
-                print("[REMINDER INTENT DETECTED] Routing to deterministic time parser...")
-                # FIX: Mapped to db_sender_id (LID)
-                ai_answer = handle_reminder_request(chat_id, db_sender_id, text_content, msg_time)
-
-    # 3. Fallback to Media or General LLM Chat
     if not ai_answer:
         if media_kind:
             with _timed("2. media handling"):
-                # FIX: Mapped to db_sender_id (LID)
-                ai_answer = handle_media_message(message, media_kind, chat_id, db_sender_id, text_content, target_media_msg, msg_time, history_limit, is_reaction_to_bot=is_media_reaction_to_bot)
+                ai_answer = handle_media_message(
+                    message, media_kind, chat_id, db_sender_id, text_content,
+                    target_media_msg, msg_time, history_limit,
+                    is_reaction_to_bot=is_media_reaction_to_bot,
+                )
         else:
-            # Check if basic LLM text conversation is enabled
-            if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                with _timed("3. AI response (history + contacts + LLM)"):
-                    # FIX: Mapped to db_sender_id (LID)
-                    ai_answer = get_ai_response(chat_id, db_sender_id, msg_time, history_limit)
+            # Agentic path — tools handle reminders, knowledge, web, memory, etc.
+            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
+                with _timed("3. agent loop (tools + LLM)"):
+                    from agent_loop import run_agent
+                    ai_answer = run_agent(
+                        chat_id=chat_id,
+                        sender_id=db_sender_id,
+                        sender_num=db_sender_num,
+                        history_limit=history_limit,
+                        is_group=is_group,
+                        msg_time=msg_time,
+                    )
             else:
-                print(f"[FEATURE OFF] 'ai_chat' is disabled for {chat_id}.")
+                print(f"[FEATURE OFF] 'ai_chat'/'reminders' disabled for {chat_id}.")
                 if admin_commands.has_any_feature_enabled(chat_id):
                     ai_answer = "💬 AI text chat is currently turned off for this chat."
                 else:
-                    return # Completely silent if no features are active at all
+                    return
 
-    # If media handler or feature check returned None, stay completely silent
     if not ai_answer:
         return
 
