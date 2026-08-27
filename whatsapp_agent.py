@@ -1923,6 +1923,11 @@ start_health_server()
 start_session_uploader(interval_seconds=300)   # every 5 min is safe
 start_self_ping(interval_seconds=600)         # optional, every 10 min
 
+# Full agent log → local file + periodic overwrite to OneDrive/MojoAgent/mojo_agent_live.log
+import mojo_logging
+mojo_logging.setup_logging()
+mojo_logging.start_onedrive_log_sync(file_ops, interval_sec=90)
+
 
 def send_reaction(message, chat_id, emoji):
     """React to a message (⏳ while working on a reply, ✅ once it's sent) instead
@@ -1955,6 +1960,50 @@ def send_reaction(message, chat_id, emoji):
 
 # 4. WHATSAPP MESSAGE HANDLER (Using Decorators)
 @client.event(MessageEv)
+
+def extract_urls_from_text(*parts) -> list:
+    """Pull http(s) URLs from any message fragments (body, quote, matchedText)."""
+    import re as _re
+    found = []
+    seen = set()
+    for part in parts:
+        if not part:
+            continue
+        for u in _re.findall(r"https?://[^\s<>\"\'\]\)]+", str(part)):
+            u = u.rstrip(".,;:!?")
+            if u not in seen:
+                seen.add(u)
+                found.append(u)
+    return found
+
+
+def extract_urls_from_context(ctx, quoted_text, original_text) -> list:
+    """Also dig WhatsApp link-preview fields that often hold the real URL."""
+    urls = extract_urls_from_text(original_text, quoted_text)
+    if not ctx:
+        return urls
+    for attr in ("matchedText", "MatchedText", "entryPointConversionExternalAdReply", "conversionSource"):
+        val = getattr(ctx, attr, None)
+        if isinstance(val, str):
+            urls.extend(extract_urls_from_text(val))
+    # externalAdReply / link preview
+    for attr in ("externalAdReply", "ExternalAdReply", "quotedMessage"):
+        obj = getattr(ctx, attr, None)
+        if obj is None:
+            continue
+        for sub in ("originalURL", "OriginalURL", "sourceURL", "SourceURL", "mediaURL", "MediaURL", "URL", "url"):
+            v = getattr(obj, sub, None)
+            if isinstance(v, str):
+                urls.extend(extract_urls_from_text(v))
+    # dedupe preserve order
+    out, seen = [], set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def on_message(client: NewClient, message: MessageEv):
     # Instantly hand off the heavy lifting to a background thread — daemon=True so
     # a thread that's still mid-reply when the process is stopped doesn't hang it.
@@ -2019,6 +2068,7 @@ def process_message(client, message):
         original_text = message.Message.documentMessage.caption
 
     text_content = original_text
+    message_urls = []
 
     media_kind = get_media_kind(message)
     target_media_msg = None
@@ -2103,6 +2153,16 @@ def process_message(client, message):
             text_content = f"[Quoted Message]: {quoted_text}"
         else:
             text_content = f"{text_content}\n\n[Quoted Message]: {quoted_text}"
+
+    # Pull URLs from body + quote + link-preview metadata (quoted links often
+    # only appear in matchedText / externalAdReply, not in the caption).
+    message_urls = extract_urls_from_context(ctx, quoted_text, original_text)
+    if message_urls:
+        # Ensure the URL is visible in the text the agent sees
+        missing = [u for u in message_urls if u not in (text_content or "")]
+        if missing:
+            text_content = (text_content or "") + "\n\n[Linked URL]: " + " ".join(missing)
+        print(f"[URL DETECT] {message_urls}")
 
     if not text_content and not media_kind:
         return
@@ -2390,6 +2450,11 @@ def process_message(client, message):
             if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
                 with _timed("3. agent loop (tools + LLM)"):
                     from agent_loop import run_agent
+                    import logging as _logging
+                    _logging.getLogger("mojo").info(
+                        "run_agent chat=%s sender=%s urls=%s text=%r",
+                        chat_id, db_sender_id, message_urls, (text_content or "")[:200],
+                    )
                     ai_answer = run_agent(
                         chat_id=chat_id,
                         sender_id=db_sender_id,
@@ -2397,6 +2462,8 @@ def process_message(client, message):
                         history_limit=history_limit,
                         is_group=is_group,
                         msg_time=msg_time,
+                        force_urls=message_urls or None,
+                        latest_user_text=text_content,
                     )
             else:
                 print(f"[FEATURE OFF] 'ai_chat'/'reminders' disabled for {chat_id}.")

@@ -8,6 +8,7 @@ Hardened for Groq / Gemini tool-call format quirks.
 from __future__ import annotations
 
 import json
+import logging
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -209,6 +210,8 @@ def run_agent(
     is_group: bool = False,
     msg_time: Optional[float] = None,
     extra_user_note: Optional[str] = None,
+    force_urls: Optional[List[str]] = None,
+    latest_user_text: Optional[str] = None,
 ) -> str:
     """
     Full agentic turn. Returns final natural-language reply for WhatsApp.
@@ -297,25 +300,31 @@ def run_agent(
         if extra_user_note:
             messages.append({"role": "user", "content": extra_user_note})
 
-        # If the latest user text contains a URL, force the model to notice it
-        # (prevents recycling older GitHub context when a new link is sent).
+        # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
         import re as _re
-        last_user = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                last_user = m.get("content") or ""
-                break
-        urls_in_last = _re.findall(r"https?://[^\s<>\]\)]+", last_user)
+        urls_in_last = list(force_urls or [])
+        if not urls_in_last:
+            last_user = latest_user_text or ""
+            if not last_user:
+                for m in reversed(messages):
+                    if m.get("role") == "user":
+                        last_user = m.get("content") or ""
+                        break
+            urls_in_last = _re.findall(r"https?://[^\s<>\"\'\]\)]+", last_user)
+        # de-dupe
+        _seen = set()
+        urls_in_last = [u for u in urls_in_last if not (u in _seen or _seen.add(u))]
         if urls_in_last:
             messages.append({
                 "role": "system",
                 "content": (
-                    "PRIORITY: The user's latest message contains this URL(s): "
+                    "PRIORITY: The user's LATEST message is about this URL(s): "
                     + ", ".join(urls_in_last)
-                    + ". You MUST call browse_url on this URL before answering. "
-                    "Do not answer about a different/older URL from chat history."
+                    + ". You MUST call browse_url on THIS URL before answering. "
+                    "Ignore older GitHub or other links from chat history for this turn."
                 ),
             })
+            print(f"[AGENT] force browse_url for: {urls_in_last}")
 
         tool_ctx = {
             "chat_id": chat_id,
@@ -386,11 +395,13 @@ def run_agent(
                 except json.JSONDecodeError:
                     args = {}
                 print(f"[AGENT TOOL] step={step+1} {name}({args})")
+                logging.getLogger("mojo.agent").info("TOOL %s %s", name, args)
                 try:
                     observation = execute_tool(name, args, tool_ctx)
                 except Exception as te:
                     traceback.print_exc()
                     observation = f"Tool error: {te}"
+                logging.getLogger("mojo.agent").info("OBS %s", str(observation)[:500])
                 print(f"[AGENT OBS] {str(observation)[:400]}{'…' if len(str(observation)) > 400 else ''}")
                 messages.append(
                     {
@@ -417,4 +428,5 @@ def run_agent(
     except Exception as e:
         traceback.print_exc()
         print(f"[AGENT ERROR] {e}")
+        logging.getLogger("mojo.agent").exception("run_agent failed: %s", e)
         return "Thori si technical issue aa gayi — ek second baad dobara try karo."
