@@ -319,6 +319,7 @@ CONTACTS_CACHE_TTL = 300  # Cache expires after 5 minutes (300 seconds)
 
 # --- CHAT HISTORY CACHE ---
 CHAT_HISTORY_CACHE = {}
+LAST_URL_BY_CHAT = {}  # chat_id -> most recent URL seen in that chat
 MAX_HISTORY_CACHE = 150  # Matches the max limit in detect_summary_history_limit
 
 
@@ -1960,93 +1961,123 @@ def send_reaction(message, chat_id, emoji):
 
 # --- URL extraction helpers (must stay above the event handler) ---
 def extract_urls_from_text(*parts) -> list:
-    """Pull http(s) URLs from any message fragments (body, quote, matchedText)."""
+    """Pull http(s) URLs from plain text fragments. Fast, no object walking."""
     import re as _re
-    found = []
-    seen = set()
+    found, seen = [], set()
+    pat = _re.compile(r"https?://[^\s<>\"'\]\)]+")
     for part in parts:
-        if not part:
+        if not part or not isinstance(part, str):
             continue
-        for u in _re.findall(r"https?://[^\s<>\"\'\]\)]+", str(part)):
+        for u in pat.findall(part):
             u = u.rstrip(".,;:!?")
             if u not in seen:
                 seen.add(u)
                 found.append(u)
-        # bare domains that WhatsApp sometimes stores without scheme in previews
-        for u in _re.findall(r"(?:^|[\s])((?:www\.)?[a-zA-Z0-9-]+\.(?:com|net|org|io|ai|dev|co|pk|app)(?:/[^\s]*)?)", str(part)):
-            full = u if u.startswith("http") else "https://" + u
-            if full not in seen and " " not in full:
-                seen.add(full)
-                found.append(full)
     return found
 
 
-def _deep_collect_strings(obj, depth=0, out=None):
-    """Walk protobuf-ish objects / dicts / lists and collect all strings."""
-    if out is None:
-        out = []
-    if depth > 6 or obj is None:
-        return out
-    if isinstance(obj, str):
-        if obj.strip():
-            out.append(obj)
-        return out
-    if isinstance(obj, (bytes, bytearray)):
-        return out
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _deep_collect_strings(v, depth + 1, out)
-        return out
-    if isinstance(obj, (list, tuple)):
-        for v in obj:
-            _deep_collect_strings(v, depth + 1, out)
-        return out
-    # protobuf / neonize message objects
-    for attr in dir(obj):
-        if attr.startswith("_"):
-            continue
+def _safe_str_attr(obj, *names):
+    if obj is None:
+        return ""
+    for n in names:
         try:
-            val = getattr(obj, attr)
+            v = getattr(obj, n, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
         except Exception:
-            continue
-        if callable(val):
-            continue
-        if isinstance(val, str) and val.strip():
-            out.append(val)
-        elif val is not None and not isinstance(val, (int, float, bool, bytes)):
-            try:
-                _deep_collect_strings(val, depth + 1, out)
-            except Exception:
-                pass
-    return out
+            pass
+    return ""
 
 
-def extract_urls_from_context(ctx, quoted_text, original_text) -> list:
-    """Dig body, quote text, and full contextInfo tree for any URL."""
-    urls = extract_urls_from_text(original_text, quoted_text)
-    if ctx is not None:
-        try:
-            blob = _deep_collect_strings(ctx)
-            urls.extend(extract_urls_from_text(*blob))
-        except Exception as e:
-            print(f"[URL deep extract] {e}")
-    # dedupe preserve order
+def extract_quoted_text_and_urls(ctx) -> tuple:
+    """
+    Return (quoted_text, urls) from ContextInfo without recursive dir()-walking
+    (that was freezing process_message for 60s+ on neonize protobufs).
+    """
+    if ctx is None:
+        return "", []
+
+    urls = []
+    quoted_text = ""
+
+    # 1) Direct string fields on contextInfo (link previews / matched text)
+    for name in (
+        "matchedText", "MatchedText",
+        "conversionSource", "ConversionSource",
+        "entryPointConversionSource", "EntryPointConversionSource",
+    ):
+        s = _safe_str_attr(ctx, name)
+        if s:
+            urls.extend(extract_urls_from_text(s))
+
+    # 2) externalAdReply / link preview card
+    for reply_name in ("externalAdReply", "ExternalAdReply", "extAdReply", "ExtAdReply"):
+        reply = getattr(ctx, reply_name, None)
+        if reply is None:
+            continue
+        for sub in (
+            "originalURL", "OriginalURL", "originalUrl",
+            "sourceURL", "SourceURL", "sourceUrl",
+            "mediaURL", "MediaURL", "mediaUrl",
+            "thumbnailURL", "ThumbnailURL",
+            "title", "Title", "body", "Body", "containsAutoReply",
+        ):
+            s = _safe_str_attr(reply, sub)
+            if s:
+                urls.extend(extract_urls_from_text(s))
+                if not quoted_text and not s.startswith("http"):
+                    quoted_text = s
+
+    # 3) quotedMessage payload
+    quoted = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
+    if quoted is not None:
+        # plain conversation
+        q_conv = _safe_str_attr(quoted, "conversation", "Conversation")
+        # extended text
+        q_ext = getattr(quoted, "extendedTextMessage", None) or getattr(quoted, "ExtendedTextMessage", None)
+        q_ext_text = _safe_str_attr(q_ext, "text", "Text") if q_ext else ""
+        # also dig preview on the *quoted* extended message
+        if q_ext is not None:
+            q_ctx = getattr(q_ext, "contextInfo", None) or getattr(q_ext, "ContextInfo", None)
+            if q_ctx is not None:
+                for name in ("matchedText", "MatchedText"):
+                    urls.extend(extract_urls_from_text(_safe_str_attr(q_ctx, name)))
+                for reply_name in ("externalAdReply", "ExternalAdReply"):
+                    reply = getattr(q_ctx, reply_name, None)
+                    if reply is None:
+                        continue
+                    for sub in ("originalURL", "OriginalURL", "sourceURL", "SourceURL", "mediaURL", "MediaURL"):
+                        urls.extend(extract_urls_from_text(_safe_str_attr(reply, sub)))
+        # captions on media quotes
+        q_img = getattr(quoted, "imageMessage", None) or getattr(quoted, "ImageMessage", None)
+        q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
+        q_doc = getattr(quoted, "documentMessage", None) or getattr(quoted, "DocumentMessage", None)
+        q_cap = (
+            _safe_str_attr(q_img, "caption", "Caption")
+            or _safe_str_attr(q_vid, "caption", "Caption")
+            or _safe_str_attr(q_doc, "caption", "Caption", "title", "Title", "fileName", "FileName")
+        )
+        quoted_text = q_conv or q_ext_text or q_cap or quoted_text
+        urls.extend(extract_urls_from_text(quoted_text))
+
+    # dedupe urls
     out, seen = [], set()
     for u in urls:
         if u not in seen:
             seen.add(u)
             out.append(u)
-    return out
+    return quoted_text, out
 
 
-def urls_from_recent_history(chat_id, limit=8) -> list:
-    """Fallback: last user messages in this chat that contained a URL."""
+def urls_from_recent_history(chat_id, limit=12) -> list:
+    """Most recent URLs the user (or anyone) posted in this chat."""
     try:
         hist = fetch_chat_history(chat_id, limit) or []
         found = []
+        for msg in reversed(hist):  # newest first after reverse of chrono list... 
+            # hist is chronological; walk newest-first
+            pass
         for msg in reversed(hist):
-            if msg.get("role") != "user":
-                continue
             found.extend(extract_urls_from_text(msg.get("content") or ""))
         out, seen = [], set()
         for u in found:
@@ -2057,7 +2088,6 @@ def urls_from_recent_history(chat_id, limit=8) -> list:
     except Exception as e:
         print(f"[URL history fallback] {e}")
         return []
-
 
 
 # 4. WHATSAPP MESSAGE HANDLER (Using Decorators)
@@ -2185,106 +2215,123 @@ def _process_message_inner(client, message):
                 if bot_jid and bot_jid in jid:
                     is_bot_mentioned = True
                     
-        # Robust quoted message extraction across casing variants
+        # Quoted message + URL extraction (FAST — no recursive dir() walks)
         quoted = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
-        if quoted:
-            q_conv = getattr(quoted, "conversation", "")
-            q_ext = getattr(quoted, "extendedTextMessage", None)
-            q_ext_text = getattr(q_ext, "text", "") if q_ext else ""
-            q_img = getattr(quoted, "imageMessage", None)
-            q_img_cap = getattr(q_img, "caption", "") if q_img else ""
-            q_vid = getattr(quoted, "videoMessage", None)
-            q_vid_cap = getattr(q_vid, "caption", "") if q_vid else ""
-            q_doc = getattr(quoted, "documentMessage", None)
-            q_doc_cap = getattr(q_doc, "caption", "") if q_doc else ""
-
-            quoted_text = q_conv or q_ext_text or q_img_cap or q_vid_cap or q_doc_cap
-
-            q_audio = getattr(quoted, "audioMessage", None)
-            q_sticker = getattr(quoted, "stickerMessage", None)
-
-            if q_audio and getattr(q_audio, "mimetype", ""):
+        q_text, q_urls = extract_quoted_text_and_urls(ctx)
+        if q_text:
+            quoted_text = q_text
+        if quoted is not None and not media_kind:
+            # media-kind detection on quoted payload (same as before, light)
+            q_audio = getattr(quoted, "audioMessage", None) or getattr(quoted, "AudioMessage", None)
+            q_img = getattr(quoted, "imageMessage", None) or getattr(quoted, "ImageMessage", None)
+            q_sticker = getattr(quoted, "stickerMessage", None) or getattr(quoted, "StickerMessage", None)
+            q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
+            q_doc = getattr(quoted, "documentMessage", None) or getattr(quoted, "DocumentMessage", None)
+            if q_audio and getattr(q_audio, "mimetype", None):
                 media_kind = "audio"
                 target_media_msg = quoted
-            elif q_img and getattr(q_img, "mimetype", ""):
+            elif q_img and getattr(q_img, "mimetype", None):
                 media_kind = "image"
                 target_media_msg = quoted
-            elif q_sticker and getattr(q_sticker, "mimetype", ""):
+            elif q_sticker and getattr(q_sticker, "mimetype", None):
                 media_kind = "sticker"
                 target_media_msg = quoted
-            elif q_vid and getattr(q_vid, "mimetype", ""):
+            elif q_vid and getattr(q_vid, "mimetype", None):
                 media_kind = "gif" if getattr(q_vid, "gifPlayback", False) else "video"
                 target_media_msg = quoted
-            elif q_doc and getattr(q_doc, "mimetype", ""):
+            elif q_doc and (getattr(q_doc, "mimetype", None) or getattr(q_doc, "fileName", None)):
                 media_kind = "document"
                 target_media_msg = quoted
 
-    # Append quoted text for AI context ONLY (Do not use this combined string for trigger checks)
+    # Append quoted text for AI context
     if quoted_text:
         if not text_content:
             text_content = f"[Quoted Message]: {quoted_text}"
         else:
             text_content = f"{text_content}\n\n[Quoted Message]: {quoted_text}"
 
-    # Pull URLs from body + quote + full contextInfo tree (quoted links often
-    # only live in preview fields, not in the visible caption).
-    message_urls = extract_urls_from_context(ctx, quoted_text, original_text)
+    # URLs from current body + quote/preview
+    message_urls = extract_urls_from_text(original_text, quoted_text)
+    if ctx is not None:
+        _, ctx_urls = extract_quoted_text_and_urls(ctx)
+        for u in ctx_urls:
+            if u not in message_urls:
+                message_urls.append(u)
 
-    # If user said "details/iska/this" while quoting a link but protocol gave us
-    # no URL, fall back to the most recent URL the user posted in this chat.
+    # History fallback: short/referential captions while quoting something
     _ref = (original_text or "").strip().lower()
-    _referential = any(
-        w in _ref
-        for w in (
-            "detail", "details", "iska", "is ka", "ye", "this", "uska", "batao",
-            "scene", "tell me", "kya hai", "about this", "about it",
-        )
-    ) or (len(_ref) < 40 and bool(quoted_text or ctx))
+    _referential = (
+        any(w in _ref for w in (
+            "detail", "details", "iska", "is ka", "ye ", "this", "uska", "batao",
+            "scene", "tell me", "kya hai", "about this", "about it", "sunao",
+        ))
+        or (len(_ref) <= 48 and (bool(quoted_text) or bool(ctx)))
+    )
     if not message_urls and _referential:
-        # chat_id not fully resolved yet below — use MessageSource early
         try:
             _ms = getattr(message.Info, "MessageSource", None)
             _cj = getattr(_ms, "Chat", None)
             _sj = getattr(_ms, "Sender", None)
             _sa = getattr(_ms, "SenderAlt", None)
-            _cu = _jid_user(_cj)
-            _cs = _jid_server(_cj)
-            # Mirror main chat_id normalization for private LID chats
+            _cu, _cs = _jid_user(_cj), _jid_server(_cj)
             if _cs == "lid":
                 _alt = _jid_user(_sa) or _jid_user(_sj)
-                if _alt and _alt.isdigit():
-                    _early_chat = f"{_alt}@s.whatsapp.net"
-                else:
-                    _early_chat = f"{_cu}@{_cs}" if _cu and _cs else None
+                _early_chat = f"{_alt}@s.whatsapp.net" if _alt and str(_alt).isdigit() else (f"{_cu}@{_cs}" if _cu and _cs else None)
             else:
                 _early_chat = f"{_cu}@{_cs}" if _cu and _cs else None
         except Exception:
             _early_chat = None
         if _early_chat:
-            hist_urls = urls_from_recent_history(_early_chat, limit=10)
+            hist_urls = urls_from_recent_history(_early_chat, limit=15)
+            if not hist_urls and _early_chat in LAST_URL_BY_CHAT:
+                hist_urls = [LAST_URL_BY_CHAT[_early_chat]]
             if hist_urls:
-                message_urls = [hist_urls[0]]  # most recent
-                print(f"[URL HISTORY FALLBACK] {message_urls}")
+                message_urls = [hist_urls[0]]
+                print(f"[URL HISTORY FALLBACK] chat={_early_chat} -> {message_urls}")
+                try:
+                    import logging as _lg
+                    _lg.getLogger("mojo").info("URL HISTORY FALLBACK %s -> %s", _early_chat, message_urls)
+                except Exception:
+                    pass
 
     if message_urls:
         missing = [u for u in message_urls if u not in (text_content or "")]
         if missing:
             text_content = (text_content or "") + "\n\n[Linked URL]: " + " ".join(missing)
         print(f"[URL DETECT] {message_urls}")
+        # Remember for later "Details"/"iska" replies in this chat
+        try:
+            _ms2 = getattr(message.Info, "MessageSource", None)
+            _cj2 = getattr(_ms2, "Chat", None)
+            _cu2, _cs2 = _jid_user(_cj2), _jid_server(_cj2)
+            _cid = f"{_cu2}@{_cs2}" if _cu2 and _cs2 else None
+            if _cs2 == "lid":
+                _sa2 = getattr(_ms2, "SenderAlt", None)
+                _sj2 = getattr(_ms2, "Sender", None)
+                _alt2 = _jid_user(_sa2) or _jid_user(_sj2)
+                if _alt2 and str(_alt2).isdigit():
+                    _cid = f"{_alt2}@s.whatsapp.net"
+            if _cid and message_urls:
+                LAST_URL_BY_CHAT[_cid] = message_urls[0]
+        except Exception:
+            pass
         try:
             import logging as _lg
             _lg.getLogger("mojo").info("URL DETECT %s quoted=%r", message_urls, (quoted_text or "")[:120])
         except Exception:
             pass
-    elif ctx or quoted_text:
-        # Debug: quote present but no URL — helps fix protocol gaps
+    else:
         try:
             import logging as _lg
+            _qm = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None) if ctx else None
+            _sid = getattr(ctx, "stanzaId", None) or getattr(ctx, "StanzaID", None) or getattr(ctx, "stanzaID", None) if ctx else None
             _lg.getLogger("mojo").info(
-                "URL MISS original=%r quoted=%r ctx_type=%s",
+                "URL MISS original=%r quoted=%r has_ctx=%s quotedMessage=%s stanzaId=%s",
                 (original_text or "")[:80],
                 (quoted_text or "")[:120],
-                type(ctx).__name__ if ctx else None,
+                bool(ctx),
+                _qm is not None,
+                _sid,
             )
         except Exception:
             pass
