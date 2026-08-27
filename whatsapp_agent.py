@@ -1958,9 +1958,7 @@ def send_reaction(message, chat_id, emoji):
         print(f"Reaction not sent (safe to ignore): {e}")
 
 
-# 4. WHATSAPP MESSAGE HANDLER (Using Decorators)
-@client.event(MessageEv)
-
+# --- URL extraction helpers (must stay above the event handler) ---
 def extract_urls_from_text(*parts) -> list:
     """Pull http(s) URLs from any message fragments (body, quote, matchedText)."""
     import re as _re
@@ -2004,9 +2002,17 @@ def extract_urls_from_context(ctx, quoted_text, original_text) -> list:
     return out
 
 
+
+# 4. WHATSAPP MESSAGE HANDLER (Using Decorators)
+@client.event(MessageEv)
 def on_message(client: NewClient, message: MessageEv):
     # Instantly hand off the heavy lifting to a background thread — daemon=True so
     # a thread that's still mid-reply when the process is stopped doesn't hang it.
+    try:
+        import logging as _lg
+        _lg.getLogger("mojo").info("incoming MessageEv — dispatching process_message")
+    except Exception:
+        pass
     threading.Thread(target=process_message, args=(client, message), daemon=True).start()
 
 def _jid_user(jid):
@@ -2022,6 +2028,15 @@ def _jid_server(jid):
     return str(getattr(jid, "Server", getattr(jid, "server", "")) or "").strip().lower()
 
 def process_message(client, message):
+    try:
+        _process_message_inner(client, message)
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger("mojo").exception("process_message CRASHED: %s", e)
+        print(f"[PROCESS_MESSAGE CRASH] {e}")
+        traceback.print_exc()
+
+def _process_message_inner(client, message):
     is_from_me = False
     try:
         if hasattr(message.Info, "IsFromMe"): is_from_me = message.Info.IsFromMe
