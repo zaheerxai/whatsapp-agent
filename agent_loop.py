@@ -106,6 +106,11 @@ def _build_system_prompt(
 6. After tools finish, give a natural confirmation or answer. Do not dump raw JSON or tool names.
 7. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts.
 
+=== URL / WEB FACTS (NO HALLUCINATION) ===
+8. If the user sends a URL, or asks to "fetch", "open", "latest repo", "what is on this site", you MUST call browse_url (or web_search) BEFORE answering. Never invent GitHub repo names, descriptions, or website details from memory.
+9. When the user says "fetch latest repo" after sharing a GitHub profile link, call browse_url on that exact github.com/username URL — the tool returns the real public repo list sorted by last push.
+10. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
+
 Agency knowledge is available via the search_knowledge tool.
 Brief agency summary (call tool for details):
 {_BUSINESS_KNOWLEDGE[:1200]}

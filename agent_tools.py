@@ -146,15 +146,25 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "browse_url",
-            "description": "Fetch the main text content of a public URL (article, docs page).",
+            "description": (
+                "Fetch live content of a public URL. "
+                "For github.com/username it returns the REAL public repo list via GitHub API "
+                "(sorted by last push). For github.com/user/repo it returns repo metadata. "
+                "For other sites it returns page title + main text. "
+                "ALWAYS call this when the user pastes a URL or asks to fetch/open/latest repos "
+                "from a previously shared link. NEVER invent repo names or page content."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "Full https URL"},
+                    "url": {
+                        "type": "string",
+                        "description": "Full https URL (GitHub profile, repo, article, etc.)",
+                    },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Max characters to return (default 4000)",
-                        "default": 4000,
+                        "description": "Max characters for non-GitHub pages (default 6000)",
+                        "default": 6000,
                     },
                 },
                 "required": ["url"],
@@ -465,28 +475,178 @@ def _tool_web_search(args: dict, ctx: dict) -> str:
         return f"Web search unavailable right now ({e})."
 
 
+def _github_user_from_url(url: str) -> Optional[str]:
+    """Extract GitHub username from profile or repo URL."""
+    m = re.search(
+        r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})(?:/|$|\?)",
+        url,
+        re.I,
+    )
+    if not m:
+        return None
+    user = m.group(1)
+    # skip reserved path segments
+    if user.lower() in ("settings", "topics", "explore", "marketplace", "orgs", "login", "features", "pricing", "about"):
+        return None
+    return user
+
+
+def _github_repo_from_url(url: str) -> Optional[tuple]:
+    m = re.search(
+        r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/|$|\?)",
+        url,
+        re.I,
+    )
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _fetch_github_user_repos(username: str, limit: int = 12) -> str:
+    """Public GitHub API — real repo list, sorted by recently pushed."""
+    api = f"https://api.github.com/users/{username}/repos"
+    try:
+        r = requests.get(
+            api,
+            params={"sort": "pushed", "direction": "desc", "per_page": min(limit, 30)},
+            timeout=15,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "MojoAgent/1.0",
+            },
+        )
+        if r.status_code == 404:
+            return f"GitHub user '{username}' not found."
+        r.raise_for_status()
+        repos = r.json()
+        if not isinstance(repos, list) or not repos:
+            return f"GitHub user '{username}' has no public repositories."
+        lines = [f"GitHub @{username} — {len(repos)} public repos shown (sorted by last push):"]
+        for repo in repos[:limit]:
+            name = repo.get("full_name") or repo.get("name")
+            desc = (repo.get("description") or "").strip() or "(no description)"
+            stars = repo.get("stargazers_count", 0)
+            lang = repo.get("language") or "?"
+            pushed = (repo.get("pushed_at") or "")[:10]
+            fork = " [fork]" if repo.get("fork") else ""
+            lines.append(
+                f"• {name}{fork}\n"
+                f"  {desc}\n"
+                f"  ★{stars} · {lang} · last push {pushed}\n"
+                f"  {repo.get('html_url', '')}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"GitHub API error for {username}: {e}"
+
+
+def _fetch_github_repo(owner: str, repo: str) -> str:
+    api = f"https://api.github.com/repos/{owner}/{repo}"
+    try:
+        r = requests.get(
+            api,
+            timeout=15,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "MojoAgent/1.0",
+            },
+        )
+        if r.status_code == 404:
+            return f"Repo {owner}/{repo} not found (or private)."
+        r.raise_for_status()
+        data = r.json()
+        return (
+            f"Repo: {data.get('full_name')}\n"
+            f"Description: {data.get('description') or '(none)'}\n"
+            f"Stars: {data.get('stargazers_count', 0)} · Forks: {data.get('forks_count', 0)}\n"
+            f"Language: {data.get('language') or '?'}\n"
+            f"Default branch: {data.get('default_branch')}\n"
+            f"Created: {(data.get('created_at') or '')[:10]} · "
+            f"Last push: {(data.get('pushed_at') or '')[:10]}\n"
+            f"URL: {data.get('html_url')}\n"
+            f"Homepage: {data.get('homepage') or '-'}"
+        )
+    except Exception as e:
+        return f"GitHub repo API error: {e}"
+
+
 def _tool_browse_url(args: dict, ctx: dict) -> str:
     url = (args.get("url") or "").strip()
-    max_chars = min(int(args.get("max_chars") or 4000), 12000)
+    max_chars = min(int(args.get("max_chars") or 6000), 15000)
+    if not url:
+        return "Empty URL."
     if not url.startswith(("http://", "https://")):
-        return "URL must start with http:// or https://"
+        url = "https://" + url
+
+    # --- GitHub special path (reliable JSON API, no JS-render needed) ---
+    if "github.com" in url.lower():
+        repo_pair = _github_repo_from_url(url)
+        if repo_pair and repo_pair[1].lower() not in ("", "repositories", "stars", "followers", "following"):
+            # full repo URL
+            return _fetch_github_repo(repo_pair[0], repo_pair[1])
+        user = _github_user_from_url(url)
+        if user:
+            return _fetch_github_user_repos(user, limit=12)
+        # fall through to HTML if path is unusual
+
+    # --- Generic page fetch ---
     try:
         r = requests.get(
             url,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)"},
+            timeout=18,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
             allow_redirects=True,
         )
         r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ctype:
+            try:
+                return json.dumps(r.json(), indent=2)[:max_chars]
+            except Exception:
+                return r.text[:max_chars]
+
         text = r.text
-        # crude HTML → text
+        # Prefer meta description + title if present
+        title = ""
+        tm = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+        if tm:
+            title = re.sub(r"\s+", " ", tm.group(1)).strip()
+        desc = ""
+        dm = re.search(
+            r'(?is)<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            text,
+        ) or re.search(
+            r'(?is)<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+            text,
+        )
+        if dm:
+            desc = dm.group(1).strip()
+
         text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
         text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+        text = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", text)
+        text = re.sub(r"(?is)<nav[^>]*>.*?</nav>", " ", text)
+        text = re.sub(r"(?is)<footer[^>]*>.*?</footer>", " ", text)
         text = re.sub(r"(?is)<[^>]+>", " ", text)
+        text = re.sub(r"&nbsp;|&amp;|&lt;|&gt;|&quot;", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:max_chars] + ("…" if len(text) > max_chars else "")
+
+        parts = []
+        if title:
+            parts.append(f"Title: {title}")
+        if desc:
+            parts.append(f"Description: {desc}")
+        parts.append(text[:max_chars])
+        out = "\n".join(parts)
+        return out[: max_chars + 200] + ("…" if len(out) > max_chars + 200 else "")
     except Exception as e:
-        return f"Failed to fetch URL: {e}"
+        return f"Failed to fetch URL ({url}): {e}"
 
 
 def _tool_get_memory(args: dict, ctx: dict) -> str:
