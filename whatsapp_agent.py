@@ -6,6 +6,7 @@ import re
 import json
 import threading
 import logging
+import traceback
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -1099,9 +1100,16 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
                 )
                 insert_chat_message(chat_id, "document_text", "user", context_str)
-                if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                    return get_ai_response(
-                        chat_id, sender_id, msg_time=msg_time, history_limit=history_limit
+                if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
+                    from agent_loop import run_agent
+                    is_group = "g.us" in (chat_id or "")
+                    return run_agent(
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        history_limit=history_limit,
+                        is_group=is_group,
+                        msg_time=msg_time,
+                        extra_user_note=context_str,
                     )
                 return (
                     f"📄 Read `{filename}` ({len(body)} chars). "
@@ -1134,9 +1142,20 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 
             insert_chat_message(chat_id, "voice_transcript", "user", context_str)
 
-            # Voice transcript conversion depends on ai_chat flag to reply
-            if admin_commands.is_feature_enabled(chat_id, "ai_chat"):
-                return get_ai_response(chat_id, sender_id, msg_time=msg_time, history_limit=history_limit)
+            # Route voice through the SAME agent loop as text so tools
+            # (set_reminder, cancel, knowledge, …) actually run.
+            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
+                from agent_loop import run_agent
+                is_group = "g.us" in (chat_id or "")
+                return run_agent(
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_num=None,
+                    history_limit=history_limit,
+                    is_group=is_group,
+                    msg_time=msg_time,
+                    extra_user_note=context_str,
+                )
             return None
 
         # B. Visual & Document Media (Gemini)
@@ -1482,32 +1501,44 @@ def compute_next_occurrence(daily_times, days, after_utc, user_tz_str):
 def list_reminders(chat_id, sender_id):
     try:
         response = supabase.table("reminders").select("*") \
-            .eq("chat_id", chat_id).eq("sender_id", sender_id).eq("active", True).execute()
-        if not response.data:
-            return "You don't have any active reminders right now."
+            .eq("chat_id", chat_id).eq("sender_id", str(sender_id)).eq("active", True).execute()
+        rows = response.data or []
+
+        # Fallback: same chat, any sender (handles rare LID/number mismatch)
+        if not rows:
+            response = supabase.table("reminders").select("*") \
+                .eq("chat_id", chat_id).eq("active", True).execute()
+            rows = response.data or []
+            if sender_id and rows:
+                rows = [r for r in rows if str(r.get("sender_id")) == str(sender_id)] or rows
+
+        if not rows:
+            return "Abhi koi active reminder nahi hai."
+
         lines = []
-        for r in response.data:
+        for r in rows:
             tz_val = r.get("timezone", DEFAULT_TIMEZONE)
-            tz = get_tzinfo(tz_val)
-            
-            dt = datetime.fromisoformat(r["remind_at"])
-            
-            # Guarantee UTC awareness so astimezone converts properly
+            try:
+                tz = get_tzinfo(tz_val)
+            except Exception:
+                tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+            dt = datetime.fromisoformat(str(r["remind_at"]).replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-                
             local_time = dt.astimezone(tz)
-            
+
             if r.get("recurring"):
                 schedule = f"every {', '.join(r['days'])}" if r.get("days") else "every day"
                 when = f"{schedule} at {local_time.strftime('%I:%M %p')}"
             else:
                 when = local_time.strftime("%b %d at %I:%M %p")
             lines.append(f'- "{r["message"]}" — {when}')
-        return "Your active reminders:\n" + "\n".join(lines)
+        return "Active reminders:\n" + "\n".join(lines)
     except Exception as e:
         print(f"Error listing reminders: {e}")
-        return "Couldn't pull up your reminders just now."
+        traceback.print_exc()
+        return f"Reminders load nahi ho sake: {e}"
 
 def reminder_scheduler():
     while True:

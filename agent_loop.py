@@ -2,6 +2,7 @@
 agent_loop.py — ReAct-style tool-calling agent for Mojo.
 
 Replaces the old single-shot get_ai_response + keyword reminder routing.
+Hardened for Groq / Gemini tool-call format quirks.
 """
 
 from __future__ import annotations
@@ -90,25 +91,72 @@ def _build_system_prompt(
 
 {memory_block}
 
-=== CORE RULES ===
-1. LANGUAGE MATCHING: If the user writes in Roman Urdu / Hindi / mixed Urdu-English (e.g. "kya haal hai", "paani peena hai", "cancel karo"), you MUST reply in the same natural casual style. Never force formal Urdu or pure English when they mixed.
-2. Keep replies SHORT — WhatsApp friendly (1-3 short paragraphs max). No walls of text.
-3. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
-4. When the user asks about agency services, portfolio, founder, or "what can you do", ALWAYS call search_knowledge first.
-5. For any reminder create / list / cancel intent (including "remind me", "reminder set karo", "cancel karo", "list reminders", "paani wale reminders cancel", "1 min me ..."), you MUST use the set_reminder / list_reminders / cancel_reminders tools. Never pretend you set a reminder without calling the tool.
-6. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when the intent is clear.
-7. After tools finish, give a natural confirmation or answer. Do not dump raw JSON.
-8. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts.
+=== LANGUAGE POLICY (CRITICAL) ===
+- Default reply language for Urdu / Hindi / mixed users = **Roman Urdu** (Latin script), e.g. "Theek hai, 1 minute baad paani peene ka reminder set kar diya."
+- Use full Urdu script (نستعلیق / Arabic letters) **ONLY** if the user explicitly asks for it (e.g. "Urdu mein likho", "اردو میں جواب دو").
+- If the user writes pure English, reply in natural English.
+- Match the user's vibe: casual when they are casual.
 
-Agency knowledge is available via the search_knowledge tool (do not rely only on the short summary below).
+=== CORE RULES ===
+1. Keep replies SHORT — WhatsApp friendly (1–3 short lines max). No walls of text.
+2. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
+3. When the user asks about agency services, portfolio, founder, or "what can you do", ALWAYS call search_knowledge first.
+4. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
+5. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
+6. After tools finish, give a natural confirmation or answer. Do not dump raw JSON or tool names.
+7. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts.
+
+Agency knowledge is available via the search_knowledge tool.
 Brief agency summary (call tool for details):
 {_BUSINESS_KNOWLEDGE[:1200]}
 """
 
 
+def _normalize_tool_calls(msg) -> List[Any]:
+    """Return a list of tool-call-like objects with .id, .function.name, .function.arguments."""
+    raw = getattr(msg, "tool_calls", None)
+    if not raw:
+        # Some providers put function_call (singular, legacy)
+        fc = getattr(msg, "function_call", None)
+        if fc:
+            class _FC:
+                pass
+            o = _FC()
+            o.id = "call_legacy_0"
+            o.function = fc
+            return [o]
+        return []
+
+    normalized = []
+    for i, tc in enumerate(raw):
+        # Already object style
+        if hasattr(tc, "function") and hasattr(tc.function, "name"):
+            if not getattr(tc, "id", None):
+                try:
+                    tc.id = f"call_{i}"
+                except Exception:
+                    pass
+            normalized.append(tc)
+            continue
+        # Dict style
+        if isinstance(tc, dict):
+            class _Fn:
+                pass
+            class _Tc:
+                pass
+            fn = _Fn()
+            fn.name = (tc.get("function") or {}).get("name") or tc.get("name") or ""
+            fn.arguments = (tc.get("function") or {}).get("arguments") or tc.get("arguments") or "{}"
+            o = _Tc()
+            o.id = tc.get("id") or f"call_{i}"
+            o.function = fn
+            normalized.append(o)
+    return normalized
+
+
 def _chat_completion(messages: List[dict], tools: Optional[List] = None, temperature: float = 0.4):
     """Primary Groq, fallback Gemini. Returns the message object."""
-    kwargs = {
+    kwargs: Dict[str, Any] = {
         "model": _MODEL_NAME,
         "messages": messages,
         "temperature": temperature,
@@ -122,10 +170,8 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
         return resp.choices[0].message
     except Exception as primary_err:
         print(f"[AGENT] Primary model failed: {primary_err}. Trying Gemini...")
-        # Gemini OpenAI-compat may not support tools the same way on all models;
-        # try with tools first, then without.
         try:
-            gkwargs = {
+            gkwargs: Dict[str, Any] = {
                 "model": _GEMINI_MODEL,
                 "messages": messages,
                 "temperature": temperature,
@@ -137,7 +183,6 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
             return resp.choices[0].message
         except Exception as e2:
             print(f"[AGENT] Gemini with tools failed: {e2}")
-            # Last resort: no tools
             try:
                 resp = _client_gemini.chat.completions.create(
                     model=_GEMINI_MODEL,
@@ -170,22 +215,34 @@ def run_agent(
         user_tz = _get_user_timezone(sender_id) if _get_user_timezone else None
         if user_tz:
             try:
-                tz = ZoneInfo(user_tz)
-                time_obj = now_utc.astimezone(tz)
-                formatted_time = time_obj.strftime("%A, %I:%M %p")
-                time_context = (
-                    f"CURRENT UTC TIME: {utc_time_str}\n"
-                    f"THIS SENDER'S LOCAL TIME: {formatted_time} ({user_tz}).\n\n"
-                    f"REAL-TIME WORLD CLOCKS:\n{world_clocks_str}\n\n"
-                    "For time queries use the world clocks above — do not invent offsets."
-                )
+                tz = ZoneInfo(str(user_tz)) if not str(user_tz).replace(".", "").replace("-", "").replace("+", "").isdigit() else None
+                if tz is None:
+                    # numeric offset stored historically
+                    from datetime import timedelta
+                    offset = float(user_tz)
+                    time_obj = now_utc + timedelta(hours=offset)
+                    formatted_time = time_obj.strftime("%A, %I:%M %p")
+                    time_context = (
+                        f"CURRENT UTC TIME: {utc_time_str}\n"
+                        f"THIS SENDER'S LOCAL TIME (approx UTC{offset:+g}): {formatted_time}.\n\n"
+                        f"REAL-TIME WORLD CLOCKS:\n{world_clocks_str}"
+                    )
+                else:
+                    time_obj = now_utc.astimezone(tz)
+                    formatted_time = time_obj.strftime("%A, %I:%M %p")
+                    time_context = (
+                        f"CURRENT UTC TIME: {utc_time_str}\n"
+                        f"THIS SENDER'S LOCAL TIME: {formatted_time} ({user_tz}).\n\n"
+                        f"REAL-TIME WORLD CLOCKS:\n{world_clocks_str}\n\n"
+                        "For time queries use the world clocks above — do not invent offsets."
+                    )
             except Exception:
                 time_context = f"CURRENT UTC TIME: {utc_time_str}\n\nWORLD CLOCKS:\n{world_clocks_str}"
         else:
             time_context = (
                 f"CURRENT UTC TIME: {utc_time_str}\n\n"
                 f"WORLD CLOCKS:\n{world_clocks_str}\n"
-                "(Sender timezone unknown — if they set a reminder, ask for city/country once.)"
+                "(Sender timezone unknown — if they set a reminder for the first time, ask for city/country once.)"
             )
 
         raw_history = _fetch_chat_history(chat_id, history_limit) or []
@@ -197,7 +254,6 @@ def run_agent(
                 f"- {n}" for n in memory_notes
             )
 
-        # Tag block (lightweight — full group cache stays in main file)
         tag_block = ""
         if is_group:
             active = {
@@ -219,9 +275,14 @@ def run_agent(
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
 
+        # Only replay clean user/assistant turns (never stale tool messages from DB)
         for msg in raw_history:
-            content = msg.get("content") or ""
             role = msg.get("role") or "user"
+            if role not in ("user", "assistant"):
+                continue
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
             if role == "user":
                 name = contacts_map.get(msg.get("sender_id"), msg.get("sender_id", "?"))
                 content = f"{name}: {content}"
@@ -240,63 +301,94 @@ def run_agent(
 
         # --- Agentic loop ---
         for step in range(MAX_TOOL_STEPS):
-            msg = _chat_completion(messages, tools=TOOL_SCHEMAS, temperature=0.35)
-            # Normalize tool_calls across providers
-            tool_calls = getattr(msg, "tool_calls", None) or []
+            try:
+                msg = _chat_completion(messages, tools=TOOL_SCHEMAS, temperature=0.3)
+            except Exception as e:
+                print(f"[AGENT] completion failed at step {step}: {e}")
+                traceback.print_exc()
+                # If we already have observations, try a no-tool close
+                if step > 0:
+                    try:
+                        final = _chat_completion(messages, tools=None, temperature=0.4)
+                        return (final.content or "").strip() or "Ho gaya."
+                    except Exception:
+                        pass
+                return "Thori si technical issue aa gayi — ek second baad dobara try karo."
 
-            # Append assistant message (with tool_calls if any)
-            assistant_entry: Dict[str, Any] = {
-                "role": "assistant",
-                "content": msg.content or "",
-            }
+            tool_calls = _normalize_tool_calls(msg)
+
+            # Build assistant message carefully (content=None when pure tool call)
+            content = msg.content
+            if content is not None:
+                content = content.strip() or None
+
+            assistant_entry: Dict[str, Any] = {"role": "assistant"}
+            if content:
+                assistant_entry["content"] = content
+            else:
+                assistant_entry["content"] = None
+
             if tool_calls:
-                assistant_entry["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in tool_calls
-                ]
+                assistant_entry["tool_calls"] = []
+                for tc in tool_calls:
+                    fn_name = getattr(getattr(tc, "function", None), "name", None) or ""
+                    fn_args = getattr(getattr(tc, "function", None), "arguments", None) or "{}"
+                    if isinstance(fn_args, dict):
+                        fn_args = json.dumps(fn_args)
+                    assistant_entry["tool_calls"].append(
+                        {
+                            "id": getattr(tc, "id", None) or f"call_{step}",
+                            "type": "function",
+                            "function": {"name": fn_name, "arguments": fn_args},
+                        }
+                    )
             messages.append(assistant_entry)
 
             if not tool_calls:
-                # Final natural answer
-                answer = (msg.content or "").strip()
-                return answer or "Got that 👍"
+                answer = (content or "").strip()
+                return answer or "Theek hai 👍"
 
-            # Execute each tool
+            # Execute tools
             for tc in tool_calls:
-                name = tc.function.name
+                name = getattr(getattr(tc, "function", None), "name", None) or ""
+                raw_args = getattr(getattr(tc, "function", None), "arguments", None) or "{}"
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
+                    if isinstance(raw_args, dict):
+                        args = raw_args
+                    else:
+                        args = json.loads(raw_args or "{}")
                 except json.JSONDecodeError:
                     args = {}
                 print(f"[AGENT TOOL] step={step+1} {name}({args})")
-                observation = execute_tool(name, args, tool_ctx)
-                print(f"[AGENT OBS] {observation[:300]}{'…' if len(observation) > 300 else ''}")
+                try:
+                    observation = execute_tool(name, args, tool_ctx)
+                except Exception as te:
+                    traceback.print_exc()
+                    observation = f"Tool error: {te}"
+                print(f"[AGENT OBS] {str(observation)[:400]}{'…' if len(str(observation)) > 400 else ''}")
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": observation,
+                        "tool_call_id": getattr(tc, "id", None) or f"call_{step}",
+                        "content": str(observation),
                     }
                 )
 
-        # Max steps reached — force a closing answer without tools
+        # Max steps — force close without tools
         messages.append(
             {
-                "role": "system",
-                "content": "You have used the maximum number of tool steps. Give the best final answer now from the observations you already have. No more tools.",
+                "role": "user",
+                "content": "Give the best final short answer now from the tool results above. No more tools.",
             }
         )
-        final = _chat_completion(messages, tools=None, temperature=0.4)
-        return (final.content or "").strip() or "Done."
+        try:
+            final = _chat_completion(messages, tools=None, temperature=0.4)
+            return (final.content or "").strip() or "Ho gaya."
+        except Exception as e:
+            print(f"[AGENT] final close failed: {e}")
+            return "Kaam almost complete ho gaya — list reminders dobara try kar lo."
 
     except Exception as e:
         traceback.print_exc()
         print(f"[AGENT ERROR] {e}")
-        return "I'm having a little trouble right now — try again in a moment."
+        return "Thori si technical issue aa gayi — ek second baad dobara try karo."

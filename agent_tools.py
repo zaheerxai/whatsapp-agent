@@ -211,9 +211,10 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "set_reminder",
             "description": (
-                "Create one or more reminders (one-off or recurring). "
-                "Understands natural language including Roman Urdu / mixed language "
-                "e.g. '1 min me paani peena', 'roz 5 baje', 'remind me in 2 minutes to debug'."
+                "Create one or more real database reminders (one-off or recurring). "
+                "Understands Roman Urdu / mixed language e.g. '1 min me paani peena', "
+                "'remind karna 1min me', 'roz 5 baje', voice transcripts about reminders. "
+                "ALWAYS use this tool — never tell the user to set a phone timer instead."
             ),
             "parameters": {
                 "type": "object",
@@ -231,7 +232,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_reminders",
-            "description": "List all active reminders for the current user in this chat.",
+            "description": (
+                "List all active reminders for the current user in this chat. "
+                "Use for: list reminder, list reminders, my reminders, show reminders, "
+                "kya reminders hain, etc."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
