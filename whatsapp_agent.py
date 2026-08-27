@@ -1972,27 +1972,64 @@ def extract_urls_from_text(*parts) -> list:
             if u not in seen:
                 seen.add(u)
                 found.append(u)
+        # bare domains that WhatsApp sometimes stores without scheme in previews
+        for u in _re.findall(r"(?:^|[\s])((?:www\.)?[a-zA-Z0-9-]+\.(?:com|net|org|io|ai|dev|co|pk|app)(?:/[^\s]*)?)", str(part)):
+            full = u if u.startswith("http") else "https://" + u
+            if full not in seen and " " not in full:
+                seen.add(full)
+                found.append(full)
     return found
 
 
-def extract_urls_from_context(ctx, quoted_text, original_text) -> list:
-    """Also dig WhatsApp link-preview fields that often hold the real URL."""
-    urls = extract_urls_from_text(original_text, quoted_text)
-    if not ctx:
-        return urls
-    for attr in ("matchedText", "MatchedText", "entryPointConversionExternalAdReply", "conversionSource"):
-        val = getattr(ctx, attr, None)
-        if isinstance(val, str):
-            urls.extend(extract_urls_from_text(val))
-    # externalAdReply / link preview
-    for attr in ("externalAdReply", "ExternalAdReply", "quotedMessage"):
-        obj = getattr(ctx, attr, None)
-        if obj is None:
+def _deep_collect_strings(obj, depth=0, out=None):
+    """Walk protobuf-ish objects / dicts / lists and collect all strings."""
+    if out is None:
+        out = []
+    if depth > 6 or obj is None:
+        return out
+    if isinstance(obj, str):
+        if obj.strip():
+            out.append(obj)
+        return out
+    if isinstance(obj, (bytes, bytearray)):
+        return out
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _deep_collect_strings(v, depth + 1, out)
+        return out
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            _deep_collect_strings(v, depth + 1, out)
+        return out
+    # protobuf / neonize message objects
+    for attr in dir(obj):
+        if attr.startswith("_"):
             continue
-        for sub in ("originalURL", "OriginalURL", "sourceURL", "SourceURL", "mediaURL", "MediaURL", "URL", "url"):
-            v = getattr(obj, sub, None)
-            if isinstance(v, str):
-                urls.extend(extract_urls_from_text(v))
+        try:
+            val = getattr(obj, attr)
+        except Exception:
+            continue
+        if callable(val):
+            continue
+        if isinstance(val, str) and val.strip():
+            out.append(val)
+        elif val is not None and not isinstance(val, (int, float, bool, bytes)):
+            try:
+                _deep_collect_strings(val, depth + 1, out)
+            except Exception:
+                pass
+    return out
+
+
+def extract_urls_from_context(ctx, quoted_text, original_text) -> list:
+    """Dig body, quote text, and full contextInfo tree for any URL."""
+    urls = extract_urls_from_text(original_text, quoted_text)
+    if ctx is not None:
+        try:
+            blob = _deep_collect_strings(ctx)
+            urls.extend(extract_urls_from_text(*blob))
+        except Exception as e:
+            print(f"[URL deep extract] {e}")
     # dedupe preserve order
     out, seen = [], set()
     for u in urls:
@@ -2000,6 +2037,26 @@ def extract_urls_from_context(ctx, quoted_text, original_text) -> list:
             seen.add(u)
             out.append(u)
     return out
+
+
+def urls_from_recent_history(chat_id, limit=8) -> list:
+    """Fallback: last user messages in this chat that contained a URL."""
+    try:
+        hist = fetch_chat_history(chat_id, limit) or []
+        found = []
+        for msg in reversed(hist):
+            if msg.get("role") != "user":
+                continue
+            found.extend(extract_urls_from_text(msg.get("content") or ""))
+        out, seen = [], set()
+        for u in found:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+    except Exception as e:
+        print(f"[URL history fallback] {e}")
+        return []
 
 
 
@@ -2169,15 +2226,68 @@ def _process_message_inner(client, message):
         else:
             text_content = f"{text_content}\n\n[Quoted Message]: {quoted_text}"
 
-    # Pull URLs from body + quote + link-preview metadata (quoted links often
-    # only appear in matchedText / externalAdReply, not in the caption).
+    # Pull URLs from body + quote + full contextInfo tree (quoted links often
+    # only live in preview fields, not in the visible caption).
     message_urls = extract_urls_from_context(ctx, quoted_text, original_text)
+
+    # If user said "details/iska/this" while quoting a link but protocol gave us
+    # no URL, fall back to the most recent URL the user posted in this chat.
+    _ref = (original_text or "").strip().lower()
+    _referential = any(
+        w in _ref
+        for w in (
+            "detail", "details", "iska", "is ka", "ye", "this", "uska", "batao",
+            "scene", "tell me", "kya hai", "about this", "about it",
+        )
+    ) or (len(_ref) < 40 and bool(quoted_text or ctx))
+    if not message_urls and _referential:
+        # chat_id not fully resolved yet below — use MessageSource early
+        try:
+            _ms = getattr(message.Info, "MessageSource", None)
+            _cj = getattr(_ms, "Chat", None)
+            _sj = getattr(_ms, "Sender", None)
+            _sa = getattr(_ms, "SenderAlt", None)
+            _cu = _jid_user(_cj)
+            _cs = _jid_server(_cj)
+            # Mirror main chat_id normalization for private LID chats
+            if _cs == "lid":
+                _alt = _jid_user(_sa) or _jid_user(_sj)
+                if _alt and _alt.isdigit():
+                    _early_chat = f"{_alt}@s.whatsapp.net"
+                else:
+                    _early_chat = f"{_cu}@{_cs}" if _cu and _cs else None
+            else:
+                _early_chat = f"{_cu}@{_cs}" if _cu and _cs else None
+        except Exception:
+            _early_chat = None
+        if _early_chat:
+            hist_urls = urls_from_recent_history(_early_chat, limit=10)
+            if hist_urls:
+                message_urls = [hist_urls[0]]  # most recent
+                print(f"[URL HISTORY FALLBACK] {message_urls}")
+
     if message_urls:
-        # Ensure the URL is visible in the text the agent sees
         missing = [u for u in message_urls if u not in (text_content or "")]
         if missing:
             text_content = (text_content or "") + "\n\n[Linked URL]: " + " ".join(missing)
         print(f"[URL DETECT] {message_urls}")
+        try:
+            import logging as _lg
+            _lg.getLogger("mojo").info("URL DETECT %s quoted=%r", message_urls, (quoted_text or "")[:120])
+        except Exception:
+            pass
+    elif ctx or quoted_text:
+        # Debug: quote present but no URL — helps fix protocol gaps
+        try:
+            import logging as _lg
+            _lg.getLogger("mojo").info(
+                "URL MISS original=%r quoted=%r ctx_type=%s",
+                (original_text or "")[:80],
+                (quoted_text or "")[:120],
+                type(ctx).__name__ if ctx else None,
+            )
+        except Exception:
+            pass
 
     if not text_content and not media_kind:
         return
