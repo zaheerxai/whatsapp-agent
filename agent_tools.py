@@ -152,7 +152,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "(sorted by last push). For github.com/user/repo it returns repo metadata. "
                 "For other sites it returns page title + main text. "
                 "ALWAYS call this when the user pastes a URL or asks to fetch/open/latest repos "
-                "from a previously shared link. NEVER invent repo names or page content."
+                "from a previously shared link. NEVER invent repo names or page content. "
+                "If the CURRENT user message contains a URL, that URL has priority over older links in history."
             ),
             "parameters": {
                 "type": "object",
@@ -168,6 +169,27 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": (
+                "Get live weather for a city (temperature, feels-like, humidity, condition). "
+                "Use this for any weather / temperature / mausam question — more accurate than web_search. "
+                "Examples: Islamabad, Karachi, Lahore, London, Dubai."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "City name, e.g. Islamabad, Karachi",
+                    },
+                },
+                "required": ["city"],
             },
         },
     },
@@ -649,6 +671,86 @@ def _tool_browse_url(args: dict, ctx: dict) -> str:
         return f"Failed to fetch URL ({url}): {e}"
 
 
+def _tool_get_weather(args: dict, ctx: dict) -> str:
+    city = (args.get("city") or "").strip()
+    if not city:
+        return "City name required."
+
+    lat = lon = None
+    place = city
+    country = ""
+
+    # Geocode with Open-Meteo (free, accurate city coordinates)
+    try:
+        geo = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1, "language": "en", "format": "json"},
+            timeout=10,
+        )
+        geo.raise_for_status()
+        results = (geo.json() or {}).get("results") or []
+        if results:
+            lat = results[0]["latitude"]
+            lon = results[0]["longitude"]
+            place = results[0].get("name", city)
+            country = results[0].get("country", "") or ""
+    except Exception as e:
+        print(f"[weather geo] {e}")
+
+    # Prefer wttr.in at exact coordinates (avoids bad name resolution e.g. Islamabad→wrong village)
+    try:
+        path = f"{lat},{lon}" if lat is not None else requests.utils.quote(city)
+        r = requests.get(
+            f"https://wttr.in/{path}?format=j1",
+            timeout=12,
+            headers={"User-Agent": "MojoAgent/1.0"},
+        )
+        r.raise_for_status()
+        d = r.json()
+        cur = d["current_condition"][0]
+        if not country:
+            area = (d.get("nearest_area") or [{}])[0]
+            place = place or area.get("areaName", [{}])[0].get("value") or city
+            country = area.get("country", [{}])[0].get("value") or ""
+        return (
+            f"Weather — {place}, {country}\n"
+            f"Temperature: {cur.get('temp_C')}°C (feels like {cur.get('FeelsLikeC')}°C)\n"
+            f"Condition: {(cur.get('weatherDesc') or [{}])[0].get('value') or ''}\n"
+            f"Humidity: {cur.get('humidity')}% · Wind: {cur.get('windspeedKmph')} km/h\n"
+            f"Source: wttr.in (live)"
+        )
+    except Exception as e1:
+        print(f"[weather wttr] {e1}")
+
+    # Fallback: Open-Meteo forecast
+    if lat is not None:
+        try:
+            wx = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+                    "timezone": "auto",
+                },
+                timeout=12,
+            )
+            wx.raise_for_status()
+            cur = (wx.json() or {}).get("current") or {}
+            return (
+                f"Weather — {place}, {country}\n"
+                f"Temperature: {cur.get('temperature_2m')}°C "
+                f"(feels like {cur.get('apparent_temperature')}°C)\n"
+                f"Humidity: {cur.get('relative_humidity_2m')}% · "
+                f"Wind: {cur.get('wind_speed_10m')} km/h\n"
+                f"Source: Open-Meteo (live)"
+            )
+        except Exception as e2:
+            return f"Weather lookup failed for {city}: {e2}"
+
+    return f"Could not resolve weather for '{city}'."
+
+
 def _tool_get_memory(args: dict, ctx: dict) -> str:
     chat_id = args.get("chat_id") or ctx["chat_id"]
     notes = _get_group_memory(chat_id) or []
@@ -862,6 +964,7 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
     "web_search": _tool_web_search,
     "browse_url": _tool_browse_url,
+    "get_weather": _tool_get_weather,
     "get_memory": _tool_get_memory,
     "save_memory": _tool_save_memory,
     "set_reminder": _tool_set_reminder,

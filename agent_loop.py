@@ -107,9 +107,10 @@ def _build_system_prompt(
 7. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts.
 
 === URL / WEB FACTS (NO HALLUCINATION) ===
-8. If the user sends a URL, or asks to "fetch", "open", "latest repo", "what is on this site", you MUST call browse_url (or web_search) BEFORE answering. Never invent GitHub repo names, descriptions, or website details from memory.
-9. When the user says "fetch latest repo" after sharing a GitHub profile link, call browse_url on that exact github.com/username URL — the tool returns the real public repo list sorted by last push.
+8. If the user sends a URL, or asks to "fetch", "open", "latest repo", "detail me kya scene hai", "iska batao" about a link, you MUST call browse_url on the URL from the CURRENT message BEFORE answering. Never invent repo names or reuse an older URL from history when a new URL is present.
+9. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
 10. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
+11. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
 
 Agency knowledge is available via the search_knowledge tool.
 Brief agency summary (call tool for details):
@@ -295,6 +296,26 @@ def run_agent(
 
         if extra_user_note:
             messages.append({"role": "user", "content": extra_user_note})
+
+        # If the latest user text contains a URL, force the model to notice it
+        # (prevents recycling older GitHub context when a new link is sent).
+        import re as _re
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = m.get("content") or ""
+                break
+        urls_in_last = _re.findall(r"https?://[^\s<>\]\)]+", last_user)
+        if urls_in_last:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "PRIORITY: The user's latest message contains this URL(s): "
+                    + ", ".join(urls_in_last)
+                    + ". You MUST call browse_url on this URL before answering. "
+                    "Do not answer about a different/older URL from chat history."
+                ),
+            })
 
         tool_ctx = {
             "chat_id": chat_id,
