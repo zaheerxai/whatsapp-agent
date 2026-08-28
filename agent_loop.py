@@ -98,24 +98,25 @@ def _build_system_prompt(
 - If the user writes pure English, reply in natural English.
 - Match the user's vibe: casual when they are casual.
 
-=== CORE RULES ===
-1. Keep replies SHORT — WhatsApp friendly (1–3 short lines max). No walls of text.
+=== CORE RULES (SPEED + ACCURACY) ===
+1. Keep replies SHORT — WhatsApp friendly (1–2 short lines max). No walls of text. No bio dumps.
 2. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
-3. When the user asks about agency services, portfolio, founder, or "what can you do", ALWAYS call search_knowledge first.
-4. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
-5. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
-6. After tools finish, give a natural confirmation or answer. Do not dump raw JSON or tool names.
-7. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts.
+3. GREETINGS / SMALL TALK ("hi", "hello", "hows it going", "kya haal", "salam") → reply naturally in ONE short line. Do NOT call any tool. Do NOT dump agency stats or founder bio.
+4. Call search_knowledge ONLY when the user actually asks about agency services, portfolio, founder background, pricing, or "what can you do". Never on a plain greeting.
+5. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
+6. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
+7. After tools finish, give a natural confirmation or answer. If the tool observation is already a clean confirmation, you may lightly polish or just relay it — do not call more tools.
+8. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts. Prefer ZERO tools when the answer is pure conversation.
 
 === URL / WEB FACTS (NO HALLUCINATION) ===
-8. If the user sends a URL, or asks to "fetch", "open", "latest repo", "detail me kya scene hai", "iska batao" about a link, you MUST call browse_url on the URL from the CURRENT message BEFORE answering. Never invent repo names or reuse an older URL from history when a new URL is present.
-9. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
-10. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
-11. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
+9. If the CURRENT message has a URL (or force_urls / priority system note lists one), or the user says "details", "iska", "ye", "batao", "fetch", "open", "latest repo" about a link → you MUST call browse_url on THAT URL BEFORE answering. Never invent page content.
+10. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
+11. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
+12. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
 
-Agency knowledge is available via the search_knowledge tool.
-Brief agency summary (call tool for details):
-{_BUSINESS_KNOWLEDGE[:1200]}
+Agency knowledge is available via the search_knowledge tool (only when asked).
+Brief agency summary:
+{_BUSINESS_KNOWLEDGE[:800]}
 """
 
 
@@ -161,8 +162,45 @@ def _normalize_tool_calls(msg) -> List[Any]:
     return normalized
 
 
+def _sanitize_messages_for_gemini(messages: List[dict]) -> List[dict]:
+    """Gemini OpenAI-compat is picky about content=None and long tool histories.
+    Convert pure tool turns into plain text so the fallback can still answer."""
+    out: List[dict] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "tool":
+            # Fold tool observation into a user-visible note
+            out.append({
+                "role": "user",
+                "content": f"[Tool result]\n{content or ''}",
+            })
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            # Keep any text the model already produced; drop raw tool_calls for Gemini
+            text = (content or "").strip()
+            names = []
+            for tc in m.get("tool_calls") or []:
+                try:
+                    names.append((tc.get("function") or {}).get("name") or "tool")
+                except Exception:
+                    names.append("tool")
+            if not text:
+                text = f"(called {', '.join(names)})"
+            out.append({"role": "assistant", "content": text})
+            continue
+        # Ensure content is always a string (never None)
+        out.append({
+            "role": role if role in ("system", "user", "assistant") else "user",
+            "content": content if isinstance(content, str) else (content or ""),
+        })
+    return out
+
+
 def _chat_completion(messages: List[dict], tools: Optional[List] = None, temperature: float = 0.4):
-    """Primary Groq, fallback Gemini. Returns the message object."""
+    """Primary Groq (with 429 retry), fallback Gemini. Returns the message object."""
+    import time as _time
+
     kwargs: Dict[str, Any] = {
         "model": _MODEL_NAME,
         "messages": messages,
@@ -172,34 +210,55 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
 
-    try:
-        resp = _client_ai.chat.completions.create(**kwargs)
-        return resp.choices[0].message
-    except Exception as primary_err:
-        print(f"[AGENT] Primary model failed: {primary_err}. Trying Gemini...")
+    last_err = None
+    for attempt in range(3):
         try:
-            gkwargs: Dict[str, Any] = {
-                "model": _GEMINI_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-            }
-            if tools:
-                gkwargs["tools"] = tools
-                gkwargs["tool_choice"] = "auto"
-            resp = _client_gemini.chat.completions.create(**gkwargs)
+            resp = _client_ai.chat.completions.create(**kwargs)
             return resp.choices[0].message
-        except Exception as e2:
-            print(f"[AGENT] Gemini with tools failed: {e2}")
-            try:
-                resp = _client_gemini.chat.completions.create(
-                    model=_GEMINI_MODEL,
-                    messages=messages,
-                    temperature=temperature,
-                )
-                return resp.choices[0].message
-            except Exception as e3:
-                print(f"[AGENT] All models failed: {e3}")
-                raise
+        except Exception as primary_err:
+            last_err = primary_err
+            err_s = str(primary_err).lower()
+            is_rate = "429" in err_s or "rate" in err_s or "too many" in err_s
+            if is_rate and attempt < 2:
+                sleep_s = 1.2 * (attempt + 1)
+                print(f"[AGENT] Groq 429/rate — retry in {sleep_s:.1f}s (attempt {attempt+1})")
+                _time.sleep(sleep_s)
+                continue
+            print(f"[AGENT] Primary model failed: {primary_err}. Trying Gemini...")
+            break
+
+    # Gemini fallback — sanitize tool messages so we don't get 400s
+    try:
+        clean = _sanitize_messages_for_gemini(messages)
+        gkwargs: Dict[str, Any] = {
+            "model": _GEMINI_MODEL,
+            "messages": clean,
+            "temperature": temperature,
+        }
+        # Prefer no tools on Gemini; we already have observations folded in
+        resp = _client_gemini.chat.completions.create(**gkwargs)
+        return resp.choices[0].message
+    except Exception as e2:
+        print(f"[AGENT] Gemini fallback failed: {e2}")
+        # Last resort: tiny prompt with last user + last tool obs only
+        try:
+            slim = [m for m in messages if m.get("role") == "system"][:1]
+            for m in reversed(messages):
+                if m.get("role") in ("user", "tool", "assistant") and m.get("content"):
+                    slim.append({"role": "user" if m["role"] == "tool" else m["role"], "content": str(m["content"])[:2000]})
+                    if len(slim) >= 4:
+                        break
+            slim = list(reversed(slim[1:])) + slim[:1]  # rough order restore
+            slim = _sanitize_messages_for_gemini(slim)
+            resp = _client_gemini.chat.completions.create(
+                model=_GEMINI_MODEL,
+                messages=slim or [{"role": "user", "content": "Reply briefly that there was a temporary issue."}],
+                temperature=temperature,
+            )
+            return resp.choices[0].message
+        except Exception as e3:
+            print(f"[AGENT] All models failed: {e3}")
+            raise last_err or e3
 
 
 def run_agent(
@@ -320,8 +379,9 @@ def run_agent(
                 "content": (
                     "PRIORITY: The user's LATEST message is about this URL(s): "
                     + ", ".join(urls_in_last)
-                    + ". You MUST call browse_url on THIS URL before answering. "
-                    "Ignore older GitHub or other links from chat history for this turn."
+                    + ". You MUST call browse_url on THIS URL as your FIRST (and usually only) tool. "
+                    "Do NOT call list_reminders, set_reminder, or search_knowledge for this turn. "
+                    "Ignore older links from chat history."
                 ),
             })
             print(f"[AGENT] force browse_url for: {urls_in_last}")

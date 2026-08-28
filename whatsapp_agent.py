@@ -1305,63 +1305,13 @@ def maybe_set_timezone(sender_id, text_content):
     return f"Got it — using UTC{sign_str} for your reminders from now on. 🕒"
 
 def generate_reminder_confirmation(chat_id, sender_id, message_text, schedule_desc, history_limit=20):
-    raw_history = fetch_chat_history(chat_id, history_limit)
-    
-    # Inject UTC time and User time
-    now_utc = datetime.now(timezone.utc)
-    utc_time_str = now_utc.strftime("%A, %Y-%m-%d %I:%M %p UTC")
-
-    user_tz_str = get_user_timezone(sender_id)
-    if user_tz_str is not None:
-        try:
-            tz = ZoneInfo(user_tz_str)
-            user_time = now_utc.astimezone(tz)
-            current_time_str = (
-                f"Current UTC time is {utc_time_str}. "
-                f"The user's current local time is {user_time.strftime('%I:%M %p')} ({user_tz_str})."
-            )
-        except Exception:
-            current_time_str = f"Current UTC time is {utc_time_str}."
-    else:
-        current_time_str = f"Current UTC time is {utc_time_str}."
-
-    # 1. Base System Instructions
-    prompt_messages = [
-        {"role": "system", "content": (
-            "You are Mojo, a friendly WhatsApp assistant. A reminder was just "
-            "successfully set. Your job is to confirm it back in ONE short, natural sentence. "
-            "Use the provided chat history to match the user's tone and language."
-        )}
-    ]
-    
-    # 2. Inject the history context in the middle
-    for msg in raw_history:
-        prompt_messages.append({"role": msg["role"], "content": msg["content"]})
-
-    # 3. FIX: Force the specific reminder details at the very end of the prompt
-    prompt_messages.append({
-        "role": "system", 
-        "content": (
-            f"TASK: Generate the confirmation message NOW.\n\n"
-            f"{current_time_str}\n"
-            f"Reminder Subject: {message_text}\n"
-            f"Schedule: {schedule_desc}"
-        )
-    })
-
-    try:
-        response = client_ai.chat.completions.create(model=MODEL_NAME, messages=prompt_messages, temperature=0.7)
-        return response.choices[0].message.content.strip()
-    except RateLimitError:
-        try:
-            response = client_gemini.chat.completions.create(model=GEMINI_MODEL, messages=prompt_messages, temperature=0.7)
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"Error generating confirmation (Gemini fallback): {e}")
-    except Exception as e:
-        print(f"Error generating confirmation: {e}")
-        
-    return f"Got it ⏰ I'll remind you about \"{message_text}\" {schedule_desc}."
+    """Fast template confirmation — avoids an extra LLM call (was a major rate-limit / latency source).
+    Agent loop will polish the final WhatsApp reply if needed."""
+    subj = (message_text or "your reminder").strip().strip('"').strip()
+    # Keep it short and bilingual-friendly (Roman Urdu / English)
+    if schedule_desc:
+        return f'Reminder set — "{subj}" {schedule_desc} 🚀'
+    return f'Reminder set — "{subj}" 🚀'
 
 
 
@@ -1993,6 +1943,8 @@ def extract_quoted_text_and_urls(ctx) -> tuple:
     """
     Return (quoted_text, urls) from ContextInfo without recursive dir()-walking
     (that was freezing process_message for 60s+ on neonize protobufs).
+    Hardened: also pulls URLs from quoted conversation / extendedText / nested
+    link previews so "Iski details" while quoting a link actually gets the URL.
     """
     if ctx is None:
         return "", []
@@ -2009,8 +1961,11 @@ def extract_quoted_text_and_urls(ctx) -> tuple:
         s = _safe_str_attr(ctx, name)
         if s:
             urls.extend(extract_urls_from_text(s))
+            # matchedText is often the URL itself when user pastes a link
+            if not quoted_text and s.startswith("http"):
+                quoted_text = s
 
-    # 2) externalAdReply / link preview card
+    # 2) externalAdReply / link preview card (current message)
     for reply_name in ("externalAdReply", "ExternalAdReply", "extAdReply", "ExtAdReply"):
         reply = getattr(ctx, reply_name, None)
         if reply is None:
@@ -2028,7 +1983,7 @@ def extract_quoted_text_and_urls(ctx) -> tuple:
                 if not quoted_text and not s.startswith("http"):
                     quoted_text = s
 
-    # 3) quotedMessage payload
+    # 3) quotedMessage payload — dig hard for the URL the user is referring to
     quoted = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
     if quoted is not None:
         # plain conversation
@@ -2041,13 +1996,21 @@ def extract_quoted_text_and_urls(ctx) -> tuple:
             q_ctx = getattr(q_ext, "contextInfo", None) or getattr(q_ext, "ContextInfo", None)
             if q_ctx is not None:
                 for name in ("matchedText", "MatchedText"):
-                    urls.extend(extract_urls_from_text(_safe_str_attr(q_ctx, name)))
-                for reply_name in ("externalAdReply", "ExternalAdReply"):
+                    mt = _safe_str_attr(q_ctx, name)
+                    if mt:
+                        urls.extend(extract_urls_from_text(mt))
+                for reply_name in ("externalAdReply", "ExternalAdReply", "extAdReply", "ExtAdReply"):
                     reply = getattr(q_ctx, reply_name, None)
                     if reply is None:
                         continue
-                    for sub in ("originalURL", "OriginalURL", "sourceURL", "SourceURL", "mediaURL", "MediaURL"):
-                        urls.extend(extract_urls_from_text(_safe_str_attr(reply, sub)))
+                    for sub in (
+                        "originalURL", "OriginalURL", "originalUrl",
+                        "sourceURL", "SourceURL", "sourceUrl",
+                        "mediaURL", "MediaURL", "mediaUrl",
+                    ):
+                        s = _safe_str_attr(reply, sub)
+                        if s:
+                            urls.extend(extract_urls_from_text(s))
         # captions on media quotes
         q_img = getattr(quoted, "imageMessage", None) or getattr(quoted, "ImageMessage", None)
         q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
@@ -2057,8 +2020,16 @@ def extract_quoted_text_and_urls(ctx) -> tuple:
             or _safe_str_attr(q_vid, "caption", "Caption")
             or _safe_str_attr(q_doc, "caption", "Caption", "title", "Title", "fileName", "FileName")
         )
-        quoted_text = q_conv or q_ext_text or q_cap or quoted_text
-        urls.extend(extract_urls_from_text(quoted_text))
+        # Some clients put the URL only in the quoted conversation / extended text
+        piece = q_conv or q_ext_text or q_cap or ""
+        if piece:
+            quoted_text = piece if not quoted_text else quoted_text
+            urls.extend(extract_urls_from_text(piece))
+        # Final fallback: if quoted object has a string-ish canonicalUrl-style attr
+        for attr in ("canonicalUrl", "CanonicalUrl", "url", "URL", "href"):
+            s = _safe_str_attr(quoted, attr)
+            if s:
+                urls.extend(extract_urls_from_text(s))
 
     # dedupe urls
     out, seen = [], set()
@@ -2259,13 +2230,16 @@ def _process_message_inner(client, message):
                 message_urls.append(u)
 
     # History fallback: short/referential captions while quoting something
+    # Also trigger when user is clearly asking about "this/iska/details" even if
+    # quoted extraction returned empty (common with some link-preview clients).
     _ref = (original_text or "").strip().lower()
     _referential = (
         any(w in _ref for w in (
-            "detail", "details", "iska", "is ka", "ye ", "this", "uska", "batao",
-            "scene", "tell me", "kya hai", "about this", "about it", "sunao",
+            "detail", "details", "iska", "is ka", "is ki", "ye ", "this", "uska",
+            "batao", "scene", "tell me", "kya hai", "about this", "about it",
+            "sunao", "open", "fetch", "summary", "summarize",
         ))
-        or (len(_ref) <= 48 and (bool(quoted_text) or bool(ctx)))
+        or (len(_ref) <= 64 and (bool(quoted_text) or bool(ctx)))
     )
     if not message_urls and _referential:
         try:
@@ -2285,6 +2259,14 @@ def _process_message_inner(client, message):
             hist_urls = urls_from_recent_history(_early_chat, limit=15)
             if not hist_urls and _early_chat in LAST_URL_BY_CHAT:
                 hist_urls = [LAST_URL_BY_CHAT[_early_chat]]
+            # Also try the raw chat_id form if LID resolution produced a different key
+            if not hist_urls:
+                try:
+                    _raw = f"{_cu}@{_cs}" if _cu and _cs else None
+                    if _raw and _raw != _early_chat and _raw in LAST_URL_BY_CHAT:
+                        hist_urls = [LAST_URL_BY_CHAT[_raw]]
+                except Exception:
+                    pass
             if hist_urls:
                 message_urls = [hist_urls[0]]
                 print(f"[URL HISTORY FALLBACK] chat={_early_chat} -> {message_urls}")
