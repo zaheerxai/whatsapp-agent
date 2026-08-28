@@ -321,6 +321,7 @@ CONTACTS_CACHE_TTL = 300  # Cache expires after 5 minutes (300 seconds)
 # --- CHAT HISTORY CACHE ---
 CHAT_HISTORY_CACHE = {}
 LAST_URL_BY_CHAT = {}  # chat_id -> most recent URL seen in that chat
+LAST_VOICE_BY_CHAT = {}  # chat_id -> {"transcript": str, "ts": float} for "kya bola" follow-ups
 MAX_HISTORY_CACHE = 150  # Matches the max limit in detect_summary_history_limit
 
 
@@ -699,7 +700,13 @@ def get_media_kind(message):
             if getattr(msg_obj.videoMessage, "gifPlayback", False):
                 return "gif"
             return "video"
-        if msg_obj.audioMessage and (msg_obj.audioMessage.mimetype or msg_obj.audioMessage.URL):
+        if msg_obj.audioMessage and (
+            msg_obj.audioMessage.mimetype
+            or getattr(msg_obj.audioMessage, "URL", None)
+            or getattr(msg_obj.audioMessage, "url", None)
+            or getattr(msg_obj.audioMessage, "directPath", None)
+            or getattr(msg_obj.audioMessage, "mediaKey", None)
+        ):
             return "audio"
         # Documents: mimetype OR fileName/title is enough
         doc = getattr(msg_obj, "documentMessage", None)
@@ -1133,7 +1140,16 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     language="ur"
                 ).text
             print(f"[VOICE NOTE TRANSCRIBED]: {transcript}")
-            
+
+            # Cache so later "ye voice note me kya bola" can answer without re-download
+            try:
+                LAST_VOICE_BY_CHAT[chat_id] = {
+                    "transcript": transcript,
+                    "ts": time.time(),
+                }
+            except Exception:
+                pass
+
             context_str = f"[Voice note transcript]: {transcript}"
             if text_content and text_content.strip():
                 context_str = f"User said: {text_content}\n\n[Quoted Audio Transcript]: {transcript}"
@@ -1157,6 +1173,8 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     is_group=is_group,
                     msg_time=msg_time,
                     extra_user_note=context_str,
+                    force_urls=None,  # never inherit a stale website URL for voice turns
+                    latest_user_text=context_str,
                 )
             return None
 
@@ -2193,25 +2211,35 @@ def _process_message_inner(client, message):
         if q_text:
             quoted_text = q_text
         if quoted is not None and not media_kind:
-            # media-kind detection on quoted payload (same as before, light)
+            # media-kind detection on quoted payload — check mimetype OR url/directPath/mediaKey
+            # (quoted stubs often lack mimetype but still have downloadable media)
+            def _has_media(obj, *extra):
+                if obj is None:
+                    return False
+                for attr in ("mimetype", "URL", "url", "directPath", "mediaKey") + extra:
+                    if getattr(obj, attr, None):
+                        return True
+                return False
+
             q_audio = getattr(quoted, "audioMessage", None) or getattr(quoted, "AudioMessage", None)
             q_img = getattr(quoted, "imageMessage", None) or getattr(quoted, "ImageMessage", None)
             q_sticker = getattr(quoted, "stickerMessage", None) or getattr(quoted, "StickerMessage", None)
             q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
             q_doc = getattr(quoted, "documentMessage", None) or getattr(quoted, "DocumentMessage", None)
-            if q_audio and getattr(q_audio, "mimetype", None):
+            if _has_media(q_audio):
                 media_kind = "audio"
                 target_media_msg = quoted
-            elif q_img and getattr(q_img, "mimetype", None):
+                print("[QUOTE MEDIA] quoted audio/ptt detected — will transcribe")
+            elif _has_media(q_img):
                 media_kind = "image"
                 target_media_msg = quoted
-            elif q_sticker and getattr(q_sticker, "mimetype", None):
+            elif _has_media(q_sticker):
                 media_kind = "sticker"
                 target_media_msg = quoted
-            elif q_vid and getattr(q_vid, "mimetype", None):
+            elif _has_media(q_vid):
                 media_kind = "gif" if getattr(q_vid, "gifPlayback", False) else "video"
                 target_media_msg = quoted
-            elif q_doc and (getattr(q_doc, "mimetype", None) or getattr(q_doc, "fileName", None)):
+            elif _has_media(q_doc, "fileName", "title", "FileName", "Title"):
                 media_kind = "document"
                 target_media_msg = quoted
 
@@ -2231,18 +2259,23 @@ def _process_message_inner(client, message):
                 message_urls.append(u)
 
     # History fallback: ONLY when user is clearly asking about a previously shared link.
-    # Do NOT inject on pure @mentions, short replies, or unrelated questions (weather, etc.).
-    # Broad "batao"/"ye" alone is NOT enough — requires link-referential intent.
+    # Do NOT inject on pure @mentions, voice questions, weather, or vague "batao".
     _ref = (original_text or "").strip().lower()
-    # Strip @mentions so pure tags don't look "short + contextual"
     _ref_clean = re.sub(r"@\S+", " ", _ref).strip()
-    _link_intent = any(w in _ref_clean for w in (
-        "detail", "details", "iska", "is ka", "is ki", "uska", "us ki",
-        "about this", "about it", "about the", "this link", "this site",
-        "this url", "ye link", "ye site", "ye url", "is link", "is site",
-        "open this", "fetch this", "fetch latest", "latest repo",
+    # Explicit opt-out: questions about voice notes / transcripts must never pull a URL
+    _voice_intent = any(w in _ref_clean for w in (
+        "voice", "voice note", "voicenote", "audio", "transcript",
+        "kya bola", "kya kaha", "word to word", "word-to-word",
+        "mene kya", "maine kya", "what did i say", "what i said",
     ))
-    # Also allow when they quote a message that itself contained a URL (quoted_text has http)
+    _link_intent = (not _voice_intent) and any(w in _ref_clean for w in (
+        "detail", "details", "iska", "is ka", "is ki", "uska", "us ki",
+        "about this", "about it", "about the", "this about", "what is this",
+        "this link", "this site", "this url", "ye link", "ye site", "ye url",
+        "is link", "is site", "open this", "fetch this", "fetch latest",
+        "latest repo", "is website", "ye website", "this website",
+        "ziada detail", "more detail", "full detail", "every detail",
+    ))
     _quoted_has_url = bool(quoted_text and re.search(r"https?://", quoted_text))
     _referential = _link_intent or _quoted_has_url
     if not message_urls and _referential:
@@ -2322,7 +2355,27 @@ def _process_message_inner(client, message):
             pass
 
     if not text_content and not media_kind:
+        try:
+            import logging as _lg
+            _lg.getLogger("mojo").info(
+                "SKIP empty message (no text, no media) chat_ctx=%s",
+                bool(ctx),
+            )
+        except Exception:
+            pass
         return
+
+    if media_kind:
+        try:
+            import logging as _lg
+            _lg.getLogger("mojo").info(
+                "MEDIA DETECTED kind=%s target_quoted=%s text=%r",
+                media_kind,
+                target_media_msg is not None,
+                (text_content or "")[:80],
+            )
+        except Exception:
+            pass
 
     # Determine Group vs Private
     is_group = False
@@ -2603,6 +2656,30 @@ def _process_message_inner(client, message):
                     is_reaction_to_bot=is_media_reaction_to_bot,
                 )
         else:
+            # If user asks about a recent voice note but we couldn't pull quoted audio,
+            # inject the cached transcript so the agent can answer "kya bola".
+            _extra_note = None
+            try:
+                _low = (original_text or text_content or "").lower()
+                _asks_voice = any(w in _low for w in (
+                    "voice", "voice note", "voicenote", "kya bola", "kya kaha",
+                    "word to word", "mene kya", "maine kya", "what did i say",
+                    "transcript",
+                ))
+                if _asks_voice and chat_id in LAST_VOICE_BY_CHAT:
+                    _cached = LAST_VOICE_BY_CHAT[chat_id]
+                    # Only use cache from last 30 minutes
+                    if time.time() - float(_cached.get("ts") or 0) < 1800:
+                        _extra_note = (
+                            "[Cached recent voice-note transcript for this chat]: "
+                            + str(_cached.get("transcript") or "")
+                        )
+                        print(f"[VOICE CACHE HIT] chat={chat_id}")
+                        # Do not force a website URL on voice questions
+                        message_urls = []
+            except Exception as _ve:
+                print(f"[VOICE CACHE] {_ve}")
+
             # Agentic path — tools handle reminders, knowledge, web, memory, etc.
             if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
                 with _timed("3. agent loop (tools + LLM)"):
@@ -2621,6 +2698,7 @@ def _process_message_inner(client, message):
                         msg_time=msg_time,
                         force_urls=message_urls or None,
                         latest_user_text=text_content,
+                        extra_user_note=_extra_note,
                     )
             else:
                 print(f"[FEATURE OFF] 'ai_chat'/'reminders' disabled for {chat_id}.")
