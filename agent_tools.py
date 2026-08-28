@@ -164,8 +164,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Max characters for non-GitHub pages (default 6000)",
-                        "default": 6000,
+                        "description": "Max characters for non-GitHub pages (default 2500)",
+                        "default": 2500,
                     },
                 },
                 "required": ["url"],
@@ -594,7 +594,8 @@ def _fetch_github_repo(owner: str, repo: str) -> str:
 
 def _tool_browse_url(args: dict, ctx: dict) -> str:
     url = (args.get("url") or "").strip()
-    max_chars = min(int(args.get("max_chars") or 6000), 15000)
+    # Keep page extracts tight — long HTML dumps caused 413 payloads and long agent essays
+    max_chars = min(int(args.get("max_chars") or 2500), 4000)
     if not url:
         return "Empty URL."
     if not url.startswith(("http://", "https://")):

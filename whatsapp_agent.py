@@ -94,7 +94,8 @@ WHISPER_MODEL = "whisper-large-v3-turbo"  # Groq's fast/cheap dedicated transcri
 # additive, not a replacement.
 client_gemini = OpenAI(
     api_key=os.getenv("GEMINI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    max_retries=1,  # avoid nested retry storms with our own backoff
 )
 GEMINI_MODEL = "gemini-3.6-flash"  # current GA Flash model as of mid-2026
 
@@ -2229,18 +2230,21 @@ def _process_message_inner(client, message):
             if u not in message_urls:
                 message_urls.append(u)
 
-    # History fallback: short/referential captions while quoting something
-    # Also trigger when user is clearly asking about "this/iska/details" even if
-    # quoted extraction returned empty (common with some link-preview clients).
+    # History fallback: ONLY when user is clearly asking about a previously shared link.
+    # Do NOT inject on pure @mentions, short replies, or unrelated questions (weather, etc.).
+    # Broad "batao"/"ye" alone is NOT enough — requires link-referential intent.
     _ref = (original_text or "").strip().lower()
-    _referential = (
-        any(w in _ref for w in (
-            "detail", "details", "iska", "is ka", "is ki", "ye ", "this", "uska",
-            "batao", "scene", "tell me", "kya hai", "about this", "about it",
-            "sunao", "open", "fetch", "summary", "summarize",
-        ))
-        or (len(_ref) <= 64 and (bool(quoted_text) or bool(ctx)))
-    )
+    # Strip @mentions so pure tags don't look "short + contextual"
+    _ref_clean = re.sub(r"@\S+", " ", _ref).strip()
+    _link_intent = any(w in _ref_clean for w in (
+        "detail", "details", "iska", "is ka", "is ki", "uska", "us ki",
+        "about this", "about it", "about the", "this link", "this site",
+        "this url", "ye link", "ye site", "ye url", "is link", "is site",
+        "open this", "fetch this", "fetch latest", "latest repo",
+    ))
+    # Also allow when they quote a message that itself contained a URL (quoted_text has http)
+    _quoted_has_url = bool(quoted_text and re.search(r"https?://", quoted_text))
+    _referential = _link_intent or _quoted_has_url
     if not message_urls and _referential:
         try:
             _ms = getattr(message.Info, "MessageSource", None)
@@ -2259,7 +2263,6 @@ def _process_message_inner(client, message):
             hist_urls = urls_from_recent_history(_early_chat, limit=15)
             if not hist_urls and _early_chat in LAST_URL_BY_CHAT:
                 hist_urls = [LAST_URL_BY_CHAT[_early_chat]]
-            # Also try the raw chat_id form if LID resolution produced a different key
             if not hist_urls:
                 try:
                     _raw = f"{_cu}@{_cs}" if _cu and _cs else None

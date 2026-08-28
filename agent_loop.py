@@ -30,7 +30,11 @@ _get_contacts_maps = None
 _get_group_memory = None
 _get_tzinfo = None
 
-MAX_TOOL_STEPS = 6
+MAX_TOOL_STEPS = 5
+# Keep payloads under Groq limits (413 Payload Too Large was hitting group chats)
+MAX_HISTORY_MSGS = 12
+MAX_MSG_CHARS = 600
+MAX_OBS_CHARS = 3500
 
 
 def init_agent(
@@ -99,14 +103,16 @@ def _build_system_prompt(
 - Match the user's vibe: casual when they are casual.
 
 === CORE RULES (SPEED + ACCURACY) ===
-1. Keep replies SHORT — WhatsApp friendly (1–2 short lines max). No walls of text. No bio dumps.
-2. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
-3. GREETINGS / SMALL TALK ("hi", "hello", "hows it going", "kya haal", "salam") → reply naturally in ONE short line. Do NOT call any tool. Do NOT dump agency stats or founder bio.
-4. Call search_knowledge ONLY when the user actually asks about agency services, portfolio, founder background, pricing, or "what can you do". Never on a plain greeting.
-5. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
-6. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
-7. After tools finish, give a natural confirmation or answer. If the tool observation is already a clean confirmation, you may lightly polish or just relay it — do not call more tools.
-8. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts. Prefer ZERO tools when the answer is pure conversation.
+1. Keep replies SHORT — WhatsApp friendly (1–3 short lines max). No walls of text. No markdown headers (###). No bullet essays. No bio dumps.
+2. Never repeat the same sentence twice in one reply.
+3. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
+4. GREETINGS / SMALL TALK ("hi", "hello", "hows it going", "kya haal", "salam") → reply naturally in ONE short line. Do NOT call any tool. Do NOT dump agency stats or founder bio.
+5. Call search_knowledge ONLY when the user actually asks about agency services, portfolio, founder background, pricing, or "what can you do". Never on a plain greeting.
+6. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
+7. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
+8. After tools finish, give a natural confirmation or answer in 1–3 lines. If the tool observation is already a clean confirmation, lightly polish or relay it — do not call more tools.
+9. You have tools. Use them when they help accuracy. Prefer tools over guessing times, facts, or contacts. Prefer ZERO tools when the answer is pure conversation.
+10. When summarizing a website from browse_url: 2–3 plain lines max (what it is + who it's for). No numbered sections, no markdown.
 
 === URL / WEB FACTS (NO HALLUCINATION) ===
 9. If the CURRENT message has a URL (or force_urls / priority system note lists one), or the user says "details", "iska", "ye", "batao", "fetch", "open", "latest repo" about a link → you MUST call browse_url on THAT URL BEFORE answering. Never invent page content.
@@ -197,13 +203,32 @@ def _sanitize_messages_for_gemini(messages: List[dict]) -> List[dict]:
     return out
 
 
+def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
+    """Drop older turns to recover from 413 Payload Too Large."""
+    if not messages:
+        return messages
+    system = [m for m in messages if m.get("role") == "system"][:1]
+    rest = [m for m in messages if m.get("role") != "system"]
+    # Keep the most recent turns (tools + user + assistant)
+    rest = rest[-keep_last:]
+    # Also hard-cap content length
+    out = []
+    for m in system + rest:
+        c = m.get("content")
+        if isinstance(c, str) and len(c) > 1200:
+            m = {**m, "content": c[:1200] + "…"}
+        out.append(m)
+    return out
+
+
 def _chat_completion(messages: List[dict], tools: Optional[List] = None, temperature: float = 0.4):
-    """Primary Groq (with 429 retry), fallback Gemini. Returns the message object."""
+    """Primary Groq (429 + 413 aware), fallback Gemini. Returns the message object."""
     import time as _time
 
+    working = messages
     kwargs: Dict[str, Any] = {
         "model": _MODEL_NAME,
-        "messages": messages,
+        "messages": working,
         "temperature": temperature,
     }
     if tools:
@@ -211,17 +236,27 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
         kwargs["tool_choice"] = "auto"
 
     last_err = None
-    for attempt in range(3):
+    for attempt in range(2):  # only 2 attempts — avoid retry storms that worsen 429
         try:
+            kwargs["messages"] = working
             resp = _client_ai.chat.completions.create(**kwargs)
             return resp.choices[0].message
         except Exception as primary_err:
             last_err = primary_err
             err_s = str(primary_err).lower()
             is_rate = "429" in err_s or "rate" in err_s or "too many" in err_s
-            if is_rate and attempt < 2:
-                sleep_s = 1.2 * (attempt + 1)
-                print(f"[AGENT] Groq 429/rate — retry in {sleep_s:.1f}s (attempt {attempt+1})")
+            is_payload = "413" in err_s or "payload" in err_s or "too large" in err_s
+            if is_payload:
+                print(f"[AGENT] Groq 413 payload too large — shrinking history (attempt {attempt+1})")
+                working = _shrink_messages(working, keep_last=5 if attempt == 0 else 3)
+                # Drop tools on the second shrink to minimize payload further
+                if attempt >= 1 and "tools" in kwargs:
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                continue
+            if is_rate and attempt < 1:
+                sleep_s = 1.5
+                print(f"[AGENT] Groq 429/rate — retry in {sleep_s:.1f}s")
                 _time.sleep(sleep_s)
                 continue
             print(f"[AGENT] Primary model failed: {primary_err}. Trying Gemini...")
@@ -229,7 +264,7 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
 
     # Gemini fallback — sanitize tool messages so we don't get 400s
     try:
-        clean = _sanitize_messages_for_gemini(messages)
+        clean = _sanitize_messages_for_gemini(working)
         gkwargs: Dict[str, Any] = {
             "model": _GEMINI_MODEL,
             "messages": clean,
@@ -242,13 +277,19 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
         print(f"[AGENT] Gemini fallback failed: {e2}")
         # Last resort: tiny prompt with last user + last tool obs only
         try:
-            slim = [m for m in messages if m.get("role") == "system"][:1]
-            for m in reversed(messages):
+            slim: List[dict] = []
+            sys_m = next((m for m in working if m.get("role") == "system"), None)
+            if sys_m:
+                slim.append({"role": "system", "content": str(sys_m.get("content") or "")[:1500]})
+            for m in reversed(working):
                 if m.get("role") in ("user", "tool", "assistant") and m.get("content"):
-                    slim.append({"role": "user" if m["role"] == "tool" else m["role"], "content": str(m["content"])[:2000]})
+                    role = "user" if m["role"] == "tool" else m["role"]
+                    slim.append({"role": role, "content": str(m["content"])[:1500]})
                     if len(slim) >= 4:
                         break
-            slim = list(reversed(slim[1:])) + slim[:1]  # rough order restore
+            # reverse back to chrono order (system stays first)
+            body = list(reversed(slim[1:])) if slim and slim[0].get("role") == "system" else list(reversed(slim))
+            slim = ([slim[0]] if slim and slim[0].get("role") == "system" else []) + body
             slim = _sanitize_messages_for_gemini(slim)
             resp = _client_gemini.chat.completions.create(
                 model=_GEMINI_MODEL,
@@ -313,13 +354,18 @@ def run_agent(
                 "(Sender timezone unknown — if they set a reminder for the first time, ask for city/country once.)"
             )
 
-        raw_history = _fetch_chat_history(chat_id, history_limit) or []
+        # Cap history to avoid 413 Payload Too Large on Groq (esp. group chats
+        # that accumulated long agent essays about websites).
+        effective_limit = min(history_limit or MAX_HISTORY_MSGS, MAX_HISTORY_MSGS)
+        raw_history = _fetch_chat_history(chat_id, effective_limit) or []
         contacts_map, reverse_map = _get_contacts_maps() if _get_contacts_maps else ({}, {})
         memory_notes = _get_group_memory(chat_id) if _get_group_memory else []
         memory_block = ""
         if memory_notes:
+            # Cap memory block size too
+            clipped = [str(n)[:200] for n in memory_notes[:12]]
             memory_block = "PERMANENT NOTES FOR THIS CHAT:\n" + "\n".join(
-                f"- {n}" for n in memory_notes
+                f"- {n}" for n in clipped
             )
 
         tag_block = ""
@@ -332,7 +378,7 @@ def run_agent(
             if active:
                 tag_block = (
                     "PEOPLE RECENTLY ACTIVE: "
-                    + ", ".join(sorted(str(x) for x in active))
+                    + ", ".join(sorted(str(x) for x in list(active)[:20]))
                     + ".\n"
                     "When tagging, use exact @Name from this list."
                 )
@@ -344,6 +390,7 @@ def run_agent(
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
 
         # Only replay clean user/assistant turns (never stale tool messages from DB)
+        # Truncate each message so one long past essay cannot blow the payload.
         for msg in raw_history:
             role = msg.get("role") or "user"
             if role not in ("user", "assistant"):
@@ -351,6 +398,8 @@ def run_agent(
             content = (msg.get("content") or "").strip()
             if not content:
                 continue
+            if len(content) > MAX_MSG_CHARS:
+                content = content[:MAX_MSG_CHARS] + "…"
             if role == "user":
                 name = contacts_map.get(msg.get("sender_id"), msg.get("sender_id", "?"))
                 content = f"{name}: {content}"
@@ -461,13 +510,16 @@ def run_agent(
                 except Exception as te:
                     traceback.print_exc()
                     observation = f"Tool error: {te}"
-                logging.getLogger("mojo.agent").info("OBS %s", str(observation)[:500])
-                print(f"[AGENT OBS] {str(observation)[:400]}{'…' if len(str(observation)) > 400 else ''}")
+                obs_str = str(observation)
+                if len(obs_str) > MAX_OBS_CHARS:
+                    obs_str = obs_str[:MAX_OBS_CHARS] + "…"
+                logging.getLogger("mojo.agent").info("OBS %s", obs_str[:500])
+                print(f"[AGENT OBS] {obs_str[:400]}{'…' if len(obs_str) > 400 else ''}")
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": getattr(tc, "id", None) or f"call_{step}",
-                        "content": str(observation),
+                        "content": obs_str,
                     }
                 )
 
