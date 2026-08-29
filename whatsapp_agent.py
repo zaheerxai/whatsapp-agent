@@ -2700,7 +2700,7 @@ def _process_message_inner(client, message):
     # -----------------------------------------------
 
     if is_group:
-        if not (is_bot_mentioned or is_media_reaction_to_bot):
+        if not (is_bot_mentioned or is_reply_to_bot or is_media_reaction_to_bot):
             try:
                 import logging as _lg
                 _lg.getLogger("mojo").info(
