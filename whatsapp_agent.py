@@ -321,7 +321,7 @@ CONTACTS_CACHE_TTL = 300  # Cache expires after 5 minutes (300 seconds)
 # --- CHAT HISTORY CACHE ---
 CHAT_HISTORY_CACHE = {}
 LAST_URL_BY_CHAT = {}  # chat_id -> most recent URL seen in that chat
-LAST_VOICE_BY_CHAT = {}  # chat_id -> {"transcript": str, "ts": float} after a successful Whisper run
+LAST_VOICE_BY_CHAT = {}  # chat_id -> {"transcript": str, "ts": float} for "kya bola" follow-ups
 MAX_HISTORY_CACHE = 150  # Matches the max limit in detect_summary_history_limit
 
 
@@ -430,36 +430,29 @@ def learn_bot_lid_from_message(message, bot_pn):
         pass
 
 def is_bot_natively_mentioned(ctx, bot_pn, bot_lid) -> bool:
-    """Native WhatsApp @mention via contextInfo.mentionedJID (PN or LID)."""
+    """ONLY native WhatsApp @mention via contextInfo.mentionedJID."""
     if not ctx:
         return False
-
+        
     mentioned = getattr(ctx, "mentionedJID", None) or getattr(ctx, "MentionedJID", None)
     if not mentioned:
         return False
-
-    bot_ids = {str(x) for x in (bot_pn, bot_lid) if x}
-    # Also accept the live session JID user if available
-    try:
-        me = client.get_me()
-        me_user = _user_of(getattr(me, "JID", None) or getattr(me, "Lid", None))
-        if me_user:
-            bot_ids.add(me_user)
-        lid = getattr(me, "Lid", None) or getattr(me, "LID", None)
-        lu = _user_of(lid)
-        if lu:
-            bot_ids.add(lu)
-    except Exception:
-        pass
-
+        
+    bot_ids = {x for x in (bot_pn, bot_lid) if x}
     for raw in mentioned:
         u = _user_of(raw)
-        s = str(raw)
-        if u and u in bot_ids:
+        if not u:
+            continue
+        if u in bot_ids:
             return True
-        for b in bot_ids:
-            if b and b in s:
+            
+        s = str(raw)
+        if bot_lid and bot_lid in s:
+            return True
+        if bot_pn and bot_pn in s and "@lid" not in s:
+            if s.startswith(bot_pn + "@") or f"/{bot_pn}" in s:
                 return True
+                
     return False
 
 def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
@@ -698,79 +691,76 @@ def get_group_memory(chat_id):
         return []
 
 
-def _media_field_present(obj, *extra_attrs) -> bool:
-    """True if a media sub-message looks downloadable (mimetype OR url/path/key)."""
-    if obj is None:
-        return False
-    for attr in ("mimetype", "URL", "url", "directPath", "mediaKey", "MediaKey") + extra_attrs:
-        try:
-            if getattr(obj, attr, None):
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def detect_media_on_proto(msg_proto) -> tuple:
-    """
-    Detect media on a Message protobuf (current message.Message OR contextInfo.quotedMessage).
-    Returns (kind, proto_for_download) where kind is audio/image/video/gif/document/sticker or None.
-    proto_for_download is the Message-shaped object download_any should receive.
-    """
-    if msg_proto is None:
-        return None, None
-
-    def _pick(*names):
-        for n in names:
-            try:
-                v = getattr(msg_proto, n, None)
-                if v is not None:
-                    return v
-            except Exception:
-                pass
-        return None
-
-    audio = _pick("audioMessage", "AudioMessage", "pttMessage", "PttMessage")
-    if _media_field_present(audio):
-        return "audio", msg_proto
-
-    img = _pick("imageMessage", "ImageMessage")
-    if _media_field_present(img):
-        return "image", msg_proto
-
-    sticker = _pick("stickerMessage", "StickerMessage")
-    if _media_field_present(sticker):
-        return "sticker", msg_proto
-
-    vid = _pick("videoMessage", "VideoMessage")
-    if _media_field_present(vid):
-        kind = "gif" if getattr(vid, "gifPlayback", False) else "video"
-        return kind, msg_proto
-
-    doc = _pick("documentMessage", "DocumentMessage")
-    if _media_field_present(doc, "fileName", "title", "FileName", "Title"):
-        return "document", msg_proto
-
-    return None, None
-
-
 def get_media_kind(message):
     try:
-        kind, _ = detect_media_on_proto(message.Message)
-        return kind
+        msg_obj = message.Message
+        if msg_obj.imageMessage and (msg_obj.imageMessage.mimetype or msg_obj.imageMessage.URL):
+            return "image"
+        if msg_obj.videoMessage and (msg_obj.videoMessage.mimetype or msg_obj.videoMessage.URL):
+            if getattr(msg_obj.videoMessage, "gifPlayback", False):
+                return "gif"
+            return "video"
+        if msg_obj.audioMessage and (
+            msg_obj.audioMessage.mimetype
+            or getattr(msg_obj.audioMessage, "URL", None)
+            or getattr(msg_obj.audioMessage, "url", None)
+            or getattr(msg_obj.audioMessage, "directPath", None)
+            or getattr(msg_obj.audioMessage, "mediaKey", None)
+        ):
+            return "audio"
+        # Documents: mimetype OR fileName/title is enough
+        doc = getattr(msg_obj, "documentMessage", None)
+        if doc and (
+            getattr(doc, "mimetype", None)
+            or getattr(doc, "fileName", None)
+            or getattr(doc, "title", None)
+            or getattr(doc, "URL", None)
+        ):
+            return "document"
+        sticker = getattr(msg_obj, "stickerMessage", None)
+        if sticker and (
+            getattr(sticker, "mimetype", None)
+            or getattr(sticker, "URL", None)
+            or getattr(sticker, "directPath", None)
+            or getattr(sticker, "mediaKey", None)
+        ):
+            return "sticker"
     except AttributeError:
-        return None
+        pass
+    return None
 
 def get_context_info(msg_obj):
+    """Find the real contextInfo on whichever message type is actually populated.
+
+    Two bugs fixed here vs. the previous version:
+    1. Order — stickerMessage was checked FIRST, before extendedTextMessage,
+       even though most real quoted-replies arrive as extendedTextMessage.
+    2. Truthiness — `if sub_msg:` / `if ctx:` treat an UNSET protobuf submessage
+       as truthy (it's still a real object, just with empty fields), so this
+       was very often returning the empty stickerMessage's empty contextInfo
+       and silently ignoring the real one. get_media_kind() already guards
+       against this same gotcha by checking a concrete field
+       (mimetype/URL/etc) instead of the object's truthiness — this does the
+       same thing for contextInfo by requiring an actual populated field
+       (stanzaId, quotedMessage, or mentionedJID) before accepting it.
+    """
     if not msg_obj:
         return None
-    for msg_type in ("stickerMessage", "extendedTextMessage", "imageMessage", "videoMessage", "documentMessage", "audioMessage"):
+    for msg_type in ("extendedTextMessage", "imageMessage", "videoMessage",
+                      "documentMessage", "audioMessage", "stickerMessage"):
         sub_msg = getattr(msg_obj, msg_type, None)
-        if sub_msg:
-            for attr in ("contextInfo", "ContextInfo", "context_info"):
-                ctx = getattr(sub_msg, attr, None)
-                if ctx:
-                    return ctx
+        if not sub_msg:
+            continue
+        for attr in ("contextInfo", "ContextInfo", "context_info"):
+            ctx = getattr(sub_msg, attr, None)
+            if not ctx:
+                continue
+            if (
+                getattr(ctx, "stanzaId", None) or getattr(ctx, "StanzaID", None)
+                or getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
+                or getattr(ctx, "mentionedJID", None) or getattr(ctx, "MentionedJID", None)
+            ):
+                return ctx
     return None
 
 def detect_summary_history_limit(text):
@@ -984,48 +974,8 @@ def name_safe(ext, mime):
     return f"{ext or '?'} ({mime or 'unknown'})"
 
 
-def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
-    if not ctx:
-        return False
-    bot_ids = {x for x in (bot_pn, bot_lid, bot_jid_user) if x}
-    participant = getattr(ctx, "participant", None) or getattr(ctx, "Participant", None)
-    if participant:
-        u = _user_of(participant)
-        if u and u in bot_ids:
-            return True
-        s = str(participant)
-        if any(b and b in s for b in bot_ids):
-            return True
-    return False
-
-
 def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False,):
-    """
-    Handle media messages by routing them through the agentic system.
     
-    This function now delegates to the media_handler module which provides a clean
-    interface for processing all media types and routing them through the agent loop.
-    """
-    # Use the new media_handler for all media processing
-    try:
-        import media_handler
-        return media_handler.process_media_message(
-            message=message,
-            media_kind=media_kind,
-            chat_id=chat_id,
-            sender_id=sender_id,
-            text_content=text_content,
-            target_media_msg=target_media_msg,
-            msg_time=msg_time,
-            history_limit=history_limit,
-            is_reaction_to_bot=is_reaction_to_bot,
-        )
-    except Exception as e:
-        print(f"[MEDIA HANDLER ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
     # --- ADMIN FEATURE FLAG CHECKS (FRIENDLY REJECTION) ---
     chat_has_any_feature = admin_commands.has_any_feature_enabled(chat_id)
 
@@ -1073,38 +1023,9 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
-
-        # Prefer quoted Message proto when user replied to media; else current message body.
-        # download_any expects a Message-shaped object (has .audioMessage / .imageMessage / …).
-        candidates = []
-        if target_media_msg is not None:
-            candidates.append(target_media_msg)
-            # Some neonize builds accept the inner media sub-message directly
-            for sub_name in (
-                "audioMessage", "AudioMessage",
-                "imageMessage", "ImageMessage",
-                "videoMessage", "VideoMessage",
-                "documentMessage", "DocumentMessage",
-                "stickerMessage", "StickerMessage",
-            ):
-                sub = getattr(target_media_msg, sub_name, None)
-                if sub is not None:
-                    candidates.append(sub)
-                    break
-        candidates.append(message.Message)
-
-        dl_err = None
-        for cand in candidates:
-            try:
-                client.download_any(cand, path=tmp_path)
-                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                    dl_err = None
-                    break
-            except Exception as e:
-                dl_err = e
-                continue
-        if dl_err and (not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0):
-            raise dl_err
+        
+        msg_to_download = target_media_msg if target_media_msg else message.Message
+        client.download_any(msg_to_download, path=tmp_path)
 
 
         if media_kind == "document":
@@ -1302,18 +1223,6 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             
     except Exception as e:
         print(f"Error downloading/processing media: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            import logging as _lg
-            _lg.getLogger("mojo").exception("MEDIA PROCESS FAIL kind=%s: %s", media_kind, e)
-        except Exception:
-            pass
-        if media_kind in ("audio", "ptt"):
-            return (
-                "Voice note process nahi ho saki — network/download issue ho sakta hai. "
-                "Dobara bhejo ya thori der baad try karo."
-            )
         return None
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -1725,200 +1634,6 @@ def compute_next_daily_time(daily_times, after):
     return compute_next_occurrence(daily_times, None, after)
 
 
-
-# 2. DEFINE AI LOGIC
-def get_ai_response(chat_id, sender_id, msg_time=None, history_limit=20):
-    try:
-        user_tz = get_user_timezone(sender_id)
-        
-        now_utc = datetime.now(timezone.utc)
-        utc_time_str = now_utc.strftime("%A, %Y-%m-%d %I:%M %p UTC")
-        world_clocks_str = get_world_clocks()
-
-        if user_tz is not None:
-            try:
-                tz = ZoneInfo(user_tz)
-                time_obj = now_utc.astimezone(tz)
-                formatted_time = time_obj.strftime("%A, %I:%M %p")
-                
-                time_context = (
-                    f"CURRENT UTC TIME: {utc_time_str}\n"
-                    f"THIS SENDER'S LOCAL TIME: {formatted_time} ({user_tz}).\n\n"
-                    f"REAL-TIME WORLD CLOCKS (ACCURATE DST CALCULATED):\n{world_clocks_str}\n\n"
-                    "CRITICAL INSTRUCTIONS FOR TIME QUERIES:\n"
-                    "1. Refer to the 'REAL-TIME WORLD CLOCKS' above for exact current times in major cities.\n"
-                    "2. Do NOT confuse the sender's local timezone with the target city being asked about.\n"
-                    "3. Do NOT invent or estimate offsets manually."
-                )
-            except Exception:
-                pass # Fallback to default block below if tz fails
-
-        else:
-            time_context = (
-                f"CURRENT UTC TIME: {utc_time_str}\n\n"
-                f"REAL-TIME WORLD CLOCKS (ACCURATE DST CALCULATED):\n{world_clocks_str}\n\n"
-                "(Note: The sender's specific local timezone offset is currently unknown)."
-            )
-        
-        # Fetch chat history from cache
-        raw_history = fetch_chat_history(chat_id, history_limit)
-
-        # Fetch contacts and memory
-        contacts_map, reverse_map = get_contacts_maps()
-        memory_notes = get_group_memory(chat_id)
-        
-        # NEW: Fetch all timezones in one go to provide group context
-        tz_map = {}
-        try:
-            tz_res = supabase.table("contacts").select("sender_id, timezone").execute()
-            for row in tz_res.data:
-                if row.get("timezone"):
-                    tz_map[row["sender_id"]] = row["timezone"]
-        except Exception as e:
-            print(f"Error fetching timezone map: {e}")
-        
-        memory_block = ""
-        if memory_notes:
-            memory_block = "PERMANENT NOTES FOR THIS CHAT:\n" + "\n".join(f"- {note}" for note in memory_notes)
-
-        # --- DYNAMIC GROUP METADATA FETCH (WITH ASYNC CACHE) ---
-        tag_block = ""
-        try:
-            active_names = set()
-            
-            # 1. If it's a group, use the asynchronous cache system
-            if "g.us" in chat_id:
-                c_user, c_server = chat_id.split("@", 1)
-                group_jid = build_jid(c_user, server=c_server)
-                
-                now = time.time()
-                cache_entry = GROUP_METADATA_CACHE.get(chat_id)
-                
-                # Trigger background fetch if cache is empty or older than TTL
-                if not cache_entry or (now - cache_entry["timestamp"] > GROUP_CACHE_TTL):
-                    threading.Thread(
-                        target=async_update_group_cache, 
-                        args=(chat_id, group_jid, contacts_map),
-                        daemon=True
-                    ).start()
-                
-                # If we have valid cached data, use it instantly
-                if cache_entry:
-                    active_names = cache_entry["names"]
-                    
-            else:
-                # 2. If it's a private chat, just list the user
-                sender_name = contacts_map.get(sender_id, sender_id)
-                active_names.add(sender_name)
-
-            # 3. Format the names into the prompt
-            if active_names:
-                tag_block = (
-                    "PEOPLE CURRENTLY IN THIS CHAT: " + ", ".join(sorted(active_names)) + ".\n"
-                    "CRITICAL TAGGING RULE: If asked to tag everyone or specific people, you MUST generate a list using the EXACT items from the list above, preceded by '@' (e.g., @Zaheer, @73109738680505). Do NOT ask the user for proper names; if you see numbers, those numbers ARE their official handles."
-                )
-            elif "g.us" in chat_id:
-                # FALLBACK: If cache is empty (e.g., first message ever), fallback to recent history instantly 
-                # so the LLM doesn't wait for the background thread to finish.
-                active_senders = {msg["sender_id"] for msg in raw_history if msg["sender_id"] != "mojo_agent"}
-                active_names_fallback = {contacts_map.get(sid, sid) for sid in active_senders}
-                if active_names_fallback:
-                    tag_block = (
-                        "PEOPLE RECENTLY ACTIVE IN THIS CHAT: " + ", ".join(sorted(active_names_fallback)) + ".\n"
-                        "CRITICAL TAGGING RULE: If asked to tag everyone or specific people, you MUST generate a list using the EXACT items from the list above, preceded by '@' (e.g., @Zaheer, @73109738680505). Do NOT ask the user for proper names; if you see numbers, those numbers ARE their official handles."
-                    )
-                    
-        except Exception as e:
-            print(f"Error checking group metadata cache: {e}")
-            # FALLBACK (Safety net)
-            active_senders = {msg["sender_id"] for msg in raw_history if msg["sender_id"] != "mojo_agent"}
-            active_names = {contacts_map.get(sid, sid) for sid in active_senders}
-            if active_names:
-                tag_block = (
-                    "PEOPLE RECENTLY ACTIVE IN THIS CHAT: " + ", ".join(sorted(active_names)) + ".\n"
-                    "CRITICAL TAGGING RULE: If asked to tag everyone or specific people, you MUST generate a list using the EXACT items from the list above, preceded by '@' (e.g., @Zaheer, @73109738680505). Do NOT ask the user for proper names; if you see numbers, those numbers ARE their official handles."
-                )
-        # -------------------------------------
-
-        if "g.us" in chat_id:
-            chat_context = (
-                "ENVIRONMENT: GROUP CHAT.\n"
-                "BEHAVIOR: Be informal, intelligent, friendly, and natural. Do NOT act like a rigid sales bot."
-            )
-        else:
-            chat_context = (
-                "ENVIRONMENT: PRIVATE CHAT (DIRECT MESSAGE).\n"
-                "BEHAVIOR: Be professional, welcoming, and helpful."
-            )
-
-        messages = [
-            {"role": "system", "content": f"You are Mojo, official AI Assistant for Mojo AI Agency (Founder: Muhammad Zaheer). Knowledge: {BUSINESS_KNOWLEDGE}\n\n{chat_context}\n\n{time_context}\n\n{tag_block}\n\n{memory_block}\n\nIMPORTANT RULES:\n1. History messages contain timestamps and sender names. Do NOT include timestamps or brackets around names in your replies.\n2. LANGUAGE MATCHING: If the user speaks Roman Urdu or Hindi (e.g. 'kya haal hai', 'batao'), you MUST reply in natural, casual Roman Urdu. Do not use overly formal words.\n3. CONTEXT: If you see [Quoted Message] in the prompt, the user is directly referring to that text or media. Address it specifically."}
-        ]
-
-        for msg in raw_history:
-            content = msg["content"]
-            
-            # --- NEW FIX: Replace raw bot IDs with its name so the LLM understands ---
-            if BOT_PN:
-                content = content.replace(f"@{BOT_PN}", "@mojo")
-            if BOT_LID:
-                content = content.replace(f"@{BOT_LID}", "@mojo")
-            # -------------------------------------------------------------------------
-            
-            time_str = ""
-            if "created_at" in msg:
-                try:
-                    dt_str = msg["created_at"].replace('Z', '+00:00')
-                    msg_dt = datetime.fromisoformat(dt_str)
-                    time_str = f"[{msg_dt.strftime('%Y-%m-%d %I:%M %p')}] "
-                except Exception:
-                    pass
-
-            if msg["role"] == "user":
-                sender_name = contacts_map.get(msg["sender_id"], msg["sender_id"])
-                
-                # NEW: Inject this specific user's current local time natively into the history
-                local_time_tag = ""
-                s_tz = tz_map.get(msg["sender_id"])
-                if s_tz:
-                    try:
-                        user_tz_obj = get_tzinfo(s_tz)
-                        current_local = now_utc.astimezone(user_tz_obj).strftime('%I:%M %p')
-                        local_time_tag = f" (Local Time: {current_local})"
-                    except Exception:
-                        pass
-                
-                content = f"{time_str}{sender_name}{local_time_tag}: {content}"
-                
-            messages.append({"role": msg["role"], "content": content})
-
-        # --- CATCH-ALL FAILOVER TO GEMINI ---
-        try:
-            ai_response = client_ai.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.7
-            )
-            answer = ai_response.choices[0].message.content
-        except Exception as primary_err:
-            print(f"[PRIMARY AI FAILED] ({primary_err}). Falling back to Gemini ({GEMINI_MODEL})...")
-            try:
-                ai_response = client_gemini.chat.completions.create(
-                    model=GEMINI_MODEL,
-                    messages=messages,
-                    temperature=0.7
-                )
-                answer = ai_response.choices[0].message.content
-            except Exception as gemini_err:
-                print(f"[GEMINI FALLBACK FAILED]: {gemini_err}")
-                return "I'm having a little trouble connecting right now. Please try again in a moment."
-
-        return answer or "Got that — thinking it over 🤔"
-
-    except Exception as e:
-        print(f"Error in get_ai_response: {e}")
-        return "I'm having a little trouble connecting right now. Please try again in a moment."
-
 # 3. INITIALIZE WHATSAPP CLIENT
 print("--- AIMOJO WHATSAPP AI AGENT ---")
 print("Connecting... PLEASE WAIT FOR THE QR CODE.")
@@ -1952,9 +1667,7 @@ import agent_loop
 agent_tools.init_tools(
     supabase=supabase,
     client_ai=client_ai,
-    client_gemini=client_gemini,
     model_name=MODEL_NAME,
-    gemini_model=GEMINI_MODEL,
     business_knowledge=BUSINESS_KNOWLEDGE,
     default_timezone=DEFAULT_TIMEZONE,
     owner_sender_id=os.getenv("OWNER_SENDER_ID") or "",
@@ -1971,7 +1684,6 @@ agent_tools.init_tools(
     compute_next_occurrence=compute_next_occurrence,
     extract_reminder_data_via_ai=extract_reminder_data_via_ai,
     generate_reminder_confirmation=generate_reminder_confirmation,
-    download_media_file=None,
 )
 
 agent_loop.init_agent(
@@ -1987,32 +1699,6 @@ agent_loop.init_agent(
     get_contacts_maps=get_contacts_maps,
     get_group_memory=get_group_memory,
     get_tzinfo=get_tzinfo,
-)
-
-# Initialize media handler
-import media_handler
-media_handler.init_media_handler(
-    client=client,
-    supabase=supabase,
-    client_ai=client_ai,
-    client_gemini=client_gemini,
-    model_name=MODEL_NAME,
-    gemini_model=GEMINI_MODEL,
-    business_knowledge=BUSINESS_KNOWLEDGE,
-    default_timezone=DEFAULT_TIMEZONE,
-    admin_commands=admin_commands,
-    get_contacts_maps=get_contacts_maps,
-    get_user_timezone=get_user_timezone,
-    set_user_timezone=set_user_timezone,
-    get_tzinfo=get_tzinfo,
-    get_group_memory=get_group_memory,
-    send_proactive_message=send_proactive_message,
-    fetch_chat_history=fetch_chat_history,
-    insert_chat_message=insert_chat_message,
-    detect_media_on_proto=detect_media_on_proto,
-    file_magic_kind=_file_magic_kind,
-    guess_doc_meta=_guess_doc_meta,
-    extract_document_text=extract_document_text,
 )
 
 # Start health endpoint + session uploader + optional self-ping
@@ -2302,25 +1988,10 @@ def _process_message_inner(client, message):
     except Exception:
         bot_jid = ""
 
-    ctx = None
-    try:
-        # WhatsApp buries contextInfo inside whatever message type is currently being sent
-        if message.Message.extendedTextMessage and message.Message.extendedTextMessage.contextInfo:
-            ctx = message.Message.extendedTextMessage.contextInfo
-        elif message.Message.imageMessage and message.Message.imageMessage.contextInfo:
-            ctx = message.Message.imageMessage.contextInfo
-        elif message.Message.videoMessage and message.Message.videoMessage.contextInfo:
-            ctx = message.Message.videoMessage.contextInfo
-        elif message.Message.documentMessage and message.Message.documentMessage.contextInfo:
-            ctx = message.Message.documentMessage.contextInfo
-        elif message.Message.audioMessage and message.Message.audioMessage.contextInfo:
-            ctx = message.Message.audioMessage.contextInfo
-        elif getattr(message.Message, "stickerMessage", None) and message.Message.stickerMessage.contextInfo:
-            ctx = message.Message.stickerMessage.contextInfo
-    except AttributeError:
-        pass
-
-    # Use robust context extraction helper
+    # contextInfo lives on whichever message type is currently populated
+    # (extendedTextMessage, imageMessage, quoted sticker, etc) — get_context_info()
+    # checks them in the right order and validates the field isn't an empty
+    # protobuf default before returning it. See its docstring for why that matters.
     ctx = get_context_info(message.Message)
 
     if ctx:
@@ -2338,36 +2009,37 @@ def _process_message_inner(client, message):
         if q_text:
             quoted_text = q_text
         if quoted is not None and not media_kind:
-            # Same detector as live messages — works on contextInfo.quotedMessage
-            q_kind, q_proto = detect_media_on_proto(quoted)
-            if q_kind:
-                media_kind = q_kind
-                target_media_msg = q_proto  # Message-shaped proto for download_any
-                print(f"[QUOTE MEDIA] quoted {q_kind} detected — will process")
-                try:
-                    import logging as _lg
-                    _lg.getLogger("mojo").info(
-                        "QUOTE MEDIA kind=%s (reply text=%r)",
-                        q_kind, (original_text or "")[:80],
-                    )
-                except Exception:
-                    pass
-            else:
-                try:
-                    present = []
-                    for n in (
-                        "audioMessage", "AudioMessage", "imageMessage", "ImageMessage",
-                        "videoMessage", "VideoMessage", "documentMessage", "DocumentMessage",
-                        "stickerMessage", "StickerMessage", "conversation", "Conversation",
-                        "extendedTextMessage", "ExtendedTextMessage", "pttMessage", "PttMessage",
-                    ):
-                        if getattr(quoted, n, None) is not None:
-                            present.append(n)
-                    print(f"[QUOTE MEDIA] no media extracted; quoted fields present={present}")
-                    import logging as _lg
-                    _lg.getLogger("mojo").info("QUOTE MEDIA MISS present=%s", present)
-                except Exception as _qe:
-                    print(f"[QUOTE MEDIA] probe failed: {_qe}")
+            # media-kind detection on quoted payload — check mimetype OR url/directPath/mediaKey
+            # (quoted stubs often lack mimetype but still have downloadable media)
+            def _has_media(obj, *extra):
+                if obj is None:
+                    return False
+                for attr in ("mimetype", "URL", "url", "directPath", "mediaKey") + extra:
+                    if getattr(obj, attr, None):
+                        return True
+                return False
+
+            q_audio = getattr(quoted, "audioMessage", None) or getattr(quoted, "AudioMessage", None)
+            q_img = getattr(quoted, "imageMessage", None) or getattr(quoted, "ImageMessage", None)
+            q_sticker = getattr(quoted, "stickerMessage", None) or getattr(quoted, "StickerMessage", None)
+            q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
+            q_doc = getattr(quoted, "documentMessage", None) or getattr(quoted, "DocumentMessage", None)
+            if _has_media(q_audio):
+                media_kind = "audio"
+                target_media_msg = quoted
+                print("[QUOTE MEDIA] quoted audio/ptt detected — will transcribe")
+            elif _has_media(q_img):
+                media_kind = "image"
+                target_media_msg = quoted
+            elif _has_media(q_sticker):
+                media_kind = "sticker"
+                target_media_msg = quoted
+            elif _has_media(q_vid):
+                media_kind = "gif" if getattr(q_vid, "gifPlayback", False) else "video"
+                target_media_msg = quoted
+            elif _has_media(q_doc, "fileName", "title", "FileName", "Title"):
+                media_kind = "document"
+                target_media_msg = quoted
 
     # Append quoted text for AI context
     if quoted_text:
@@ -2677,9 +2349,6 @@ def _process_message_inner(client, message):
 
     is_bot_mentioned = native or text_hit
 
-    REACTION_MEDIA = {"sticker", "image", "gif"}
-    has_quote = bool(ctx and getattr(ctx, "quotedMessage", None))
-
     # Groups: must be a reply to the bot.
     # Private: any sticker/image/GIF that quotes *something* counts as a reaction
     # (DMs often have no participant on the quote).
@@ -2704,14 +2373,6 @@ def _process_message_inner(client, message):
 
     if is_group:
         if not (is_bot_mentioned or is_media_reaction_to_bot):
-            try:
-                import logging as _lg
-                _lg.getLogger("mojo").info(
-                    "GROUP SKIP no-mention kind=%s text=%r",
-                    media_kind, (original_text or "")[:60],
-                )
-            except Exception:
-                pass
             return
         if is_media_reaction_to_bot and not is_bot_mentioned:
             print(f"\n[GROUP MEDIA REACTION TO BOT] {media_kind} from {sender_number}")
@@ -2790,13 +2451,32 @@ def _process_message_inner(client, message):
                     is_reaction_to_bot=is_media_reaction_to_bot,
                 )
         else:
+            # If user asks about a recent voice note but we couldn't pull quoted audio,
+            # inject the cached transcript so the agent can answer "kya bola".
+            _extra_note = None
+            try:
+                _low = (original_text or text_content or "").lower()
+                _asks_voice = any(w in _low for w in (
+                    "voice", "voice note", "voicenote", "kya bola", "kya kaha",
+                    "word to word", "mene kya", "maine kya", "what did i say",
+                    "transcript",
+                ))
+                if _asks_voice and chat_id in LAST_VOICE_BY_CHAT:
+                    _cached = LAST_VOICE_BY_CHAT[chat_id]
+                    # Only use cache from last 30 minutes
+                    if time.time() - float(_cached.get("ts") or 0) < 1800:
+                        _extra_note = (
+                            "[Cached recent voice-note transcript for this chat]: "
+                            + str(_cached.get("transcript") or "")
+                        )
+                        print(f"[VOICE CACHE HIT] chat={chat_id}")
+                        # Do not force a website URL on voice questions
+                        message_urls = []
+            except Exception as _ve:
+                print(f"[VOICE CACHE] {_ve}")
+
             # Agentic path — tools handle reminders, knowledge, web, memory, etc.
-            # Quoted voice/image/docs already set media_kind above and go through
-            # handle_media_message (download quoted proto → Whisper/Gemini).
-            if (
-                admin_commands.is_feature_enabled(chat_id, "ai_chat")
-                or admin_commands.is_feature_enabled(chat_id, "reminders")
-            ):
+            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
                 with _timed("3. agent loop (tools + LLM)"):
                     from agent_loop import run_agent
                     import logging as _logging
@@ -2813,6 +2493,7 @@ def _process_message_inner(client, message):
                         msg_time=msg_time,
                         force_urls=message_urls or None,
                         latest_user_text=text_content,
+                        extra_user_note=_extra_note,
                     )
             else:
                 print(f"[FEATURE OFF] 'ai_chat'/'reminders' disabled for {chat_id}.")

@@ -313,17 +313,9 @@ def run_agent(
     extra_user_note: Optional[str] = None,
     force_urls: Optional[List[str]] = None,
     latest_user_text: Optional[str] = None,
-    media_context: Optional[dict] = None,
 ) -> str:
     """
     Full agentic turn. Returns final natural-language reply for WhatsApp.
-    
-    media_context: Optional dict with media info for processing:
-        - type: 'audio', 'image', 'video', 'gif', 'sticker', 'document'
-        - base64_data: base64-encoded media content
-        - mime_type: MIME type of the media
-        - filename: (for documents) original filename
-        - user_prompt: user's question/comment about the media
     """
     try:
         now_utc = datetime.now(timezone.utc)
@@ -417,6 +409,14 @@ def run_agent(
         if extra_user_note:
             messages.append({"role": "user", "content": extra_user_note})
 
+        tool_ctx = {
+            "chat_id": chat_id,
+            "sender_id": sender_id,
+            "sender_num": sender_num,
+            "msg_time": msg_time,
+            "is_group": is_group,
+        }
+
         # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
         import re as _re
         urls_in_last = list(force_urls or [])
@@ -432,53 +432,49 @@ def run_agent(
         _seen = set()
         urls_in_last = [u for u in urls_in_last if not (u in _seen or _seen.add(u))]
         if urls_in_last:
+            # Deterministic pre-fetch instead of asking the model to call browse_url:
+            # tool_choice="auto" means a "You MUST call X" system prompt is a request,
+            # not a guarantee — the model can skip it, call something else first, or
+            # retype the URL wrong. We already know the exact URL, so fetch it
+            # ourselves and inject a synthetic assistant tool_call + tool result.
+            # The model then answers from real data on this turn, no dice roll.
+            primary_url = urls_in_last[0]
+            print(f"[AGENT] force browse_url for: {urls_in_last}")
+            try:
+                _forced_observation = execute_tool("browse_url", {"url": primary_url}, tool_ctx)
+            except Exception as _fe:
+                _forced_observation = f"Tool error: {_fe}"
+            _forced_obs_str = str(_forced_observation)
+            if len(_forced_obs_str) > MAX_OBS_CHARS:
+                _forced_obs_str = _forced_obs_str[:MAX_OBS_CHARS] + "…"
+
+            _forced_call_id = "call_forced_browse_0"
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": _forced_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "browse_url",
+                        "arguments": json.dumps({"url": primary_url}),
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": _forced_call_id,
+                "content": _forced_obs_str,
+            })
             messages.append({
                 "role": "system",
                 "content": (
-                    "PRIORITY: The user's LATEST message is about this URL(s): "
-                    + ", ".join(urls_in_last)
-                    + ". You MUST call browse_url on THIS URL as your FIRST (and usually only) tool. "
-                    "Do NOT call list_reminders, set_reminder, or search_knowledge for this turn. "
-                    "Ignore older links from chat history."
+                    f"You already fetched {primary_url} above via browse_url — that IS the "
+                    "user's latest link. Answer from that tool result only. Do NOT call "
+                    "browse_url again this turn, and ignore any older/different links from "
+                    "chat history."
                 ),
             })
-            print(f"[AGENT] force browse_url for: {urls_in_last}")
-
-        tool_ctx = {
-            "chat_id": chat_id,
-            "sender_id": sender_id,
-            "sender_num": sender_num,
-            "msg_time": msg_time,
-            "is_group": is_group,
-            "media_context": media_context,
-        }
-        
-        # Handle media context by adding it to the messages
-        if media_context:
-            media_type = media_context.get("type")
-            base64_data = media_context.get("base64_data", "")
-            mime_type = media_context.get("mime_type", "")
-            filename = media_context.get("filename", "")
-            user_prompt = media_context.get("user_prompt", "")
-            
-            if media_type == "audio":
-                # For audio, we'll let the agent decide to use transcribe_audio tool
-                messages.append({
-                    "role": "user",
-                    "content": f"[Audio message attached - {len(base64_data)} bytes. User said: {user_prompt}"
-                })
-            elif media_type == "document":
-                # For documents, provide info about the file
-                messages.append({
-                    "role": "user",
-                    "content": f"[Document attached: {filename} ({mime_type}), {len(base64_data)} bytes. User said: {user_prompt}"
-                })
-            else:
-                # For visual media, provide image data
-                messages.append({
-                    "role": "user",
-                    "content": f"[Media attached: {media_type} ({mime_type}), {len(base64_data)} bytes. User said: {user_prompt}"
-                })
 
         # --- Agentic loop ---
         for step in range(MAX_TOOL_STEPS):

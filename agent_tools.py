@@ -20,9 +20,7 @@ import requests
 # These are injected by whatsapp_agent after import to avoid circular deps
 _supabase = None
 _client_ai = None
-_client_gemini = None
 _MODEL_NAME = None
-_GEMINI_MODEL = None
 _BUSINESS_KNOWLEDGE = ""
 _DEFAULT_TIMEZONE = "Asia/Karachi"
 _OWNER_SENDER_ID = ""
@@ -39,15 +37,12 @@ _file_ops = None
 _compute_next_occurrence = None
 _extract_reminder_data_via_ai = None
 _generate_reminder_confirmation = None
-_download_media_file = None  # Function to download media from WhatsApp
 
 
 def init_tools(
     supabase,
     client_ai,
-    client_gemini,
     model_name,
-    gemini_model,
     business_knowledge,
     default_timezone,
     owner_sender_id,
@@ -64,21 +59,17 @@ def init_tools(
     compute_next_occurrence=None,
     extract_reminder_data_via_ai=None,
     generate_reminder_confirmation=None,
-    download_media_file=None,
 ):
-    global _supabase, _client_ai, _client_gemini, _MODEL_NAME, _GEMINI_MODEL
-    global _BUSINESS_KNOWLEDGE, _DEFAULT_TIMEZONE, _OWNER_SENDER_ID
+    global _supabase, _client_ai, _MODEL_NAME, _BUSINESS_KNOWLEDGE
+    global _DEFAULT_TIMEZONE, _OWNER_SENDER_ID
     global _get_contacts_maps, _get_user_timezone, _set_user_timezone, _get_tzinfo
     global _handle_reminder_request, _list_reminders, _cancel_reminders
     global _get_group_memory, _send_proactive_message, _file_ops
     global _compute_next_occurrence, _extract_reminder_data_via_ai, _generate_reminder_confirmation
-    global _download_media_file
 
     _supabase = supabase
     _client_ai = client_ai
-    _client_gemini = client_gemini
     _MODEL_NAME = model_name
-    _GEMINI_MODEL = gemini_model
     _BUSINESS_KNOWLEDGE = business_knowledge or ""
     _DEFAULT_TIMEZONE = default_timezone
     _OWNER_SENDER_ID = (owner_sender_id or "").strip()
@@ -95,7 +86,6 @@ def init_tools(
     _compute_next_occurrence = compute_next_occurrence
     _extract_reminder_data_via_ai = extract_reminder_data_via_ai
     _generate_reminder_confirmation = generate_reminder_confirmation
-    _download_media_file = download_media_file
 
 
 # ---------------------------------------------------------------------------
@@ -385,98 +375,6 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "code": {"type": "string", "description": "Python code (max ~20 lines)"},
                 },
                 "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_media",
-            "description": (
-                "Analyze an image, video, GIF, sticker, or document that was sent or quoted. "
-                "Uses Gemini Vision to describe, extract text from, or answer questions about visual media. "
-                "ALWAYS call this when the user sends or replies to an image/video/GIF/sticker/document "
-                "with a question or comment. Do NOT describe media yourself without this tool."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "media_type": {
-                        "type": "string",
-                        "description": "Type of media: 'image', 'video', 'gif', 'sticker', 'document'",
-                        "enum": ["image", "video", "gif", "sticker", "document"],
-                    },
-                    "base64_data": {
-                        "type": "string",
-                        "description": "Base64-encoded media content",
-                    },
-                    "mime_type": {
-                        "type": "string",
-                        "description": "MIME type of the media (e.g., 'image/jpeg', 'video/mp4')",
-                        "default": "image/jpeg",
-                    },
-                    "user_prompt": {
-                        "type": "string",
-                        "description": "User's question or comment about the media",
-                        "default": "Describe what is in this media.",
-                    },
-                },
-                "required": ["media_type", "base64_data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "transcribe_audio",
-            "description": (
-                "Transcribe a voice note or audio message. Uses Whisper for accurate transcription. "
-                "ALWAYS call this when the user sends or replies to a voice note with a question. "
-                "Returns the transcript text which you can then use to answer the user's question."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "base64_data": {
-                        "type": "string",
-                        "description": "Base64-encoded audio content",
-                    },
-                    "language": {
-                        "type": "string",
-                        "description": "Language hint for transcription (e.g., 'ur', 'en')",
-                        "default": "ur",
-                    },
-                },
-                "required": ["base64_data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "extract_document_text",
-            "description": (
-                "Extract plain text from a document (PDF, DOCX, XLSX, PPTX, TXT, etc.). "
-                "ALWAYS call this when the user sends or replies to a document with a question. "
-                "For PDFs, uses OCR if needed. Returns extracted text for further analysis."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the downloaded document file",
-                    },
-                    "mime_type": {
-                        "type": "string",
-                        "description": "MIME type of the document",
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "Original filename of the document",
-                    },
-                },
-                "required": ["file_path", "filename"],
             },
         },
     },
@@ -1000,11 +898,14 @@ def _tool_lookup_user(args: dict, ctx: dict) -> str:
 
 
 def _tool_send_message_to(args: dict, ctx: dict) -> str:
-    if not _OWNER_SENDER_ID or str(ctx.get("sender_id")) != str(_OWNER_SENDER_ID):
-        # also allow if sender_num matches owner
-        owner = _OWNER_SENDER_ID
-        if owner and str(ctx.get("sender_num") or "") != str(owner):
-            return "Permission denied: only the bot owner can send proactive messages."
+    # Fail CLOSED: if OWNER_SENDER_ID isn't configured, nobody is the owner —
+    # never treat an unset owner as "check disabled". Allow either sender_id
+    # (LID) or sender_num (phone) to match, since callers may pass either.
+    if not _OWNER_SENDER_ID or (
+        str(ctx.get("sender_id")) != str(_OWNER_SENDER_ID)
+        and str(ctx.get("sender_num") or "") != str(_OWNER_SENDER_ID)
+    ):
+        return "Permission denied: only the bot owner can send proactive messages."
     chat_id = (args.get("chat_id") or "").strip()
     text = (args.get("text") or "").strip()
     if not chat_id or not text:
@@ -1063,168 +964,6 @@ def _tool_python_exec(args: dict, ctx: dict) -> str:
         return f"Error: {e}"
 
 
-def _tool_analyze_media(args: dict, ctx: dict) -> str:
-    """Analyze visual media using Gemini Vision."""
-    media_type = (args.get("media_type") or "").strip().lower()
-    base64_data = (args.get("base64_data") or "").strip()
-    mime_type = (args.get("mime_type") or "image/jpeg").strip()
-    user_prompt = (args.get("user_prompt") or "Describe what is in this media.").strip()
-
-    if not media_type or not base64_data:
-        return "media_type and base64_data are required."
-
-    if media_type not in ("image", "video", "gif", "sticker", "document"):
-        return f"Invalid media_type: {media_type}. Must be one of: image, video, gif, sticker, document."
-
-    try:
-        if not _client_gemini:
-            return "Gemini client not initialized for media analysis."
-
-        response = _client_gemini.chat.completions.create(
-            model=_GEMINI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Mojo, the AI assistant for Mojo AI Agency. "
-                        "Someone sent or replied to visual media. Extract details, describe it, "
-                        "or react naturally based on the user's prompt. Keep it WhatsApp-short."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_data}"}},
-                    ],
-                },
-            ],
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Media analysis failed: {e}"
-
-
-def _tool_transcribe_audio(args: dict, ctx: dict) -> str:
-    """Transcribe audio using Whisper."""
-    base64_data = (args.get("base64_data") or "").strip()
-    language = (args.get("language") or "ur").strip()
-
-    if not base64_data:
-        return "base64_data is required."
-
-    try:
-        import base64
-        import tempfile
-        import os
-
-        # Decode and save to temp file
-        audio_data = base64.b64decode(base64_data)
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp_path = tmp.name
-            tmp.write(audio_data)
-
-        try:
-            with open(tmp_path, "rb") as f:
-                transcript = _client_ai.audio.transcriptions.create(
-                    model="whisper-large-v3-turbo",
-                    file=f,
-                    language=language,
-                ).text
-            return transcript
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-    except Exception as e:
-        return f"Transcription failed: {e}"
-
-
-def _tool_extract_document_text(args: dict, ctx: dict) -> str:
-    """Extract text from documents."""
-    file_path = (args.get("file_path") or "").strip()
-    mime_type = (args.get("mime_type") or "").strip()
-    filename = (args.get("filename") or "file").strip()
-
-    if not file_path or not filename:
-        return "file_path and filename are required."
-
-    try:
-        import os
-        if not os.path.exists(file_path):
-            return f"File not found: {file_path}"
-
-        # Use the same extraction logic as whatsapp_agent.py
-        ext = os.path.splitext(filename)[1].lower()
-
-        # PDF: return empty to signal caller should use vision
-        if ext == ".pdf" or mime_type == "application/pdf":
-            return ""
-
-        # Text-based formats
-        if (
-            mime_type.startswith("text/")
-            or mime_type in ("application/json", "application/xml")
-            or ext in (".txt", ".md", ".csv", ".json", ".log")
-        ):
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-
-        # DOCX
-        if ext == ".docx" or "wordprocessingml" in mime_type:
-            try:
-                from docx import Document
-                doc = Document(file_path)
-                parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-                for table in doc.tables:
-                    for row in table.rows:
-                        cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                        if cells:
-                            parts.append(" | ".join(cells))
-                return "\n".join(parts)
-            except Exception as e:
-                return f"DOCX extraction failed: {e}"
-
-        # XLSX
-        if ext == ".xlsx" or "spreadsheetml" in mime_type:
-            try:
-                from openpyxl import load_workbook
-                wb = load_workbook(file_path, read_only=True, data_only=True)
-                chunks = []
-                for sheet in wb.worksheets:
-                    chunks.append(f"## Sheet: {sheet.title}")
-                    for i, row in enumerate(sheet.iter_rows(values_only=True)):
-                        if i > 200:
-                            chunks.append("\u2026[more rows truncated]\u2026")
-                            break
-                        vals = ["" if v is None else str(v) for v in row]
-                        if any(v.strip() for v in vals):
-                            chunks.append("\t".join(vals))
-                wb.close()
-                return "\n".join(chunks)
-            except Exception as e:
-                return f"XLSX extraction failed: {e}"
-
-        # PPTX
-        if ext == ".pptx" or "presentationml" in mime_type:
-            try:
-                from pptx import Presentation
-                prs = Presentation(file_path)
-                parts = []
-                for i, slide in enumerate(prs.slides, 1):
-                    parts.append(f"## Slide {i}")
-                    for shape in slide.shapes:
-                        if hasattr(shape, "text") and shape.text and shape.text.strip():
-                            parts.append(shape.text.strip())
-                return "\n".join(parts)
-            except Exception as e:
-                return f"PPTX extraction failed: {e}"
-
-        return f"Unsupported document type: {ext} ({mime_type})"
-
-    except Exception as e:
-        return f"Document extraction failed: {e}"
-
-
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
     "web_search": _tool_web_search,
@@ -1240,9 +979,6 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "send_message_to": _tool_send_message_to,
     "file_list_onedrive": _tool_file_list_onedrive,
     "python_exec": _tool_python_exec,
-    "analyze_media": _tool_analyze_media,
-    "transcribe_audio": _tool_transcribe_audio,
-    "extract_document_text": _tool_extract_document_text,
 }
 
 
