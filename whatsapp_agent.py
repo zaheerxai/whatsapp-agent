@@ -699,16 +699,13 @@ def get_group_memory(chat_id):
 
 
 def _media_field_present(obj, *extra_attrs) -> bool:
-    """True if a media sub-message looks downloadable (mimetype OR url/path/key)."""
+    """True if a media sub-message looks downloadable (mimetype OR url/path/key).
+    For quoted messages, the object existing is enough.
+    """
     if obj is None:
         return False
-    for attr in ("mimetype", "URL", "url", "directPath", "mediaKey", "MediaKey") + extra_attrs:
-        try:
-            if getattr(obj, attr, None):
-                return True
-        except Exception:
-            pass
-    return False
+    # Just check if object exists - download_any will fail if not actually downloadable
+    return True
 
 
 def detect_media_on_proto(msg_proto) -> tuple:
@@ -731,24 +728,24 @@ def detect_media_on_proto(msg_proto) -> tuple:
         return None
 
     audio = _pick("audioMessage", "AudioMessage", "pttMessage", "PttMessage")
-    if _media_field_present(audio):
+    if audio is not None:
         return "audio", msg_proto
 
     img = _pick("imageMessage", "ImageMessage")
-    if _media_field_present(img):
+    if img is not None:
         return "image", msg_proto
 
     sticker = _pick("stickerMessage", "StickerMessage")
-    if _media_field_present(sticker):
+    if sticker is not None:
         return "sticker", msg_proto
 
     vid = _pick("videoMessage", "VideoMessage")
-    if _media_field_present(vid):
+    if vid is not None:
         kind = "gif" if getattr(vid, "gifPlayback", False) else "video"
         return kind, msg_proto
 
     doc = _pick("documentMessage", "DocumentMessage")
-    if _media_field_present(doc, "fileName", "title", "FileName", "Title"):
+    if doc is not None:
         return "document", msg_proto
 
     return None, None
