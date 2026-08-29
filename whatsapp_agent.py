@@ -321,7 +321,7 @@ CONTACTS_CACHE_TTL = 300  # Cache expires after 5 minutes (300 seconds)
 # --- CHAT HISTORY CACHE ---
 CHAT_HISTORY_CACHE = {}
 LAST_URL_BY_CHAT = {}  # chat_id -> most recent URL seen in that chat
-LAST_VOICE_BY_CHAT = {}  # chat_id -> {"transcript": str, "ts": float} for "kya bola" follow-ups
+LAST_VOICE_BY_CHAT = {}  # chat_id -> {"transcript": str, "ts": float} after a successful Whisper run
 MAX_HISTORY_CACHE = 150  # Matches the max limit in detect_summary_history_limit
 
 
@@ -430,29 +430,36 @@ def learn_bot_lid_from_message(message, bot_pn):
         pass
 
 def is_bot_natively_mentioned(ctx, bot_pn, bot_lid) -> bool:
-    """ONLY native WhatsApp @mention via contextInfo.mentionedJID."""
+    """Native WhatsApp @mention via contextInfo.mentionedJID (PN or LID)."""
     if not ctx:
         return False
-        
+
     mentioned = getattr(ctx, "mentionedJID", None) or getattr(ctx, "MentionedJID", None)
     if not mentioned:
         return False
-        
-    bot_ids = {x for x in (bot_pn, bot_lid) if x}
+
+    bot_ids = {str(x) for x in (bot_pn, bot_lid) if x}
+    # Also accept the live session JID user if available
+    try:
+        me = client.get_me()
+        me_user = _user_of(getattr(me, "JID", None) or getattr(me, "Lid", None))
+        if me_user:
+            bot_ids.add(me_user)
+        lid = getattr(me, "Lid", None) or getattr(me, "LID", None)
+        lu = _user_of(lid)
+        if lu:
+            bot_ids.add(lu)
+    except Exception:
+        pass
+
     for raw in mentioned:
         u = _user_of(raw)
-        if not u:
-            continue
-        if u in bot_ids:
-            return True
-            
         s = str(raw)
-        if bot_lid and bot_lid in s:
+        if u and u in bot_ids:
             return True
-        if bot_pn and bot_pn in s and "@lid" not in s:
-            if s.startswith(bot_pn + "@") or f"/{bot_pn}" in s:
+        for b in bot_ids:
+            if b and b in s:
                 return True
-                
     return False
 
 def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
@@ -691,43 +698,68 @@ def get_group_memory(chat_id):
         return []
 
 
+def _media_field_present(obj, *extra_attrs) -> bool:
+    """True if a media sub-message looks downloadable (mimetype OR url/path/key)."""
+    if obj is None:
+        return False
+    for attr in ("mimetype", "URL", "url", "directPath", "mediaKey", "MediaKey") + extra_attrs:
+        try:
+            if getattr(obj, attr, None):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def detect_media_on_proto(msg_proto) -> tuple:
+    """
+    Detect media on a Message protobuf (current message.Message OR contextInfo.quotedMessage).
+    Returns (kind, proto_for_download) where kind is audio/image/video/gif/document/sticker or None.
+    proto_for_download is the Message-shaped object download_any should receive.
+    """
+    if msg_proto is None:
+        return None, None
+
+    def _pick(*names):
+        for n in names:
+            try:
+                v = getattr(msg_proto, n, None)
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return None
+
+    audio = _pick("audioMessage", "AudioMessage", "pttMessage", "PttMessage")
+    if _media_field_present(audio):
+        return "audio", msg_proto
+
+    img = _pick("imageMessage", "ImageMessage")
+    if _media_field_present(img):
+        return "image", msg_proto
+
+    sticker = _pick("stickerMessage", "StickerMessage")
+    if _media_field_present(sticker):
+        return "sticker", msg_proto
+
+    vid = _pick("videoMessage", "VideoMessage")
+    if _media_field_present(vid):
+        kind = "gif" if getattr(vid, "gifPlayback", False) else "video"
+        return kind, msg_proto
+
+    doc = _pick("documentMessage", "DocumentMessage")
+    if _media_field_present(doc, "fileName", "title", "FileName", "Title"):
+        return "document", msg_proto
+
+    return None, None
+
+
 def get_media_kind(message):
     try:
-        msg_obj = message.Message
-        if msg_obj.imageMessage and (msg_obj.imageMessage.mimetype or msg_obj.imageMessage.URL):
-            return "image"
-        if msg_obj.videoMessage and (msg_obj.videoMessage.mimetype or msg_obj.videoMessage.URL):
-            if getattr(msg_obj.videoMessage, "gifPlayback", False):
-                return "gif"
-            return "video"
-        if msg_obj.audioMessage and (
-            msg_obj.audioMessage.mimetype
-            or getattr(msg_obj.audioMessage, "URL", None)
-            or getattr(msg_obj.audioMessage, "url", None)
-            or getattr(msg_obj.audioMessage, "directPath", None)
-            or getattr(msg_obj.audioMessage, "mediaKey", None)
-        ):
-            return "audio"
-        # Documents: mimetype OR fileName/title is enough
-        doc = getattr(msg_obj, "documentMessage", None)
-        if doc and (
-            getattr(doc, "mimetype", None)
-            or getattr(doc, "fileName", None)
-            or getattr(doc, "title", None)
-            or getattr(doc, "URL", None)
-        ):
-            return "document"
-        sticker = getattr(msg_obj, "stickerMessage", None)
-        if sticker and (
-            getattr(sticker, "mimetype", None)
-            or getattr(sticker, "URL", None)
-            or getattr(sticker, "directPath", None)
-            or getattr(sticker, "mediaKey", None)
-        ):
-            return "sticker"
+        kind, _ = detect_media_on_proto(message.Message)
+        return kind
     except AttributeError:
-        pass
-    return None
+        return None
 
 def get_context_info(msg_obj):
     if not msg_obj:
@@ -1016,9 +1048,38 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
-        
-        msg_to_download = target_media_msg if target_media_msg else message.Message
-        client.download_any(msg_to_download, path=tmp_path)
+
+        # Prefer quoted Message proto when user replied to media; else current message body.
+        # download_any expects a Message-shaped object (has .audioMessage / .imageMessage / …).
+        candidates = []
+        if target_media_msg is not None:
+            candidates.append(target_media_msg)
+            # Some neonize builds accept the inner media sub-message directly
+            for sub_name in (
+                "audioMessage", "AudioMessage",
+                "imageMessage", "ImageMessage",
+                "videoMessage", "VideoMessage",
+                "documentMessage", "DocumentMessage",
+                "stickerMessage", "StickerMessage",
+            ):
+                sub = getattr(target_media_msg, sub_name, None)
+                if sub is not None:
+                    candidates.append(sub)
+                    break
+        candidates.append(message.Message)
+
+        dl_err = None
+        for cand in candidates:
+            try:
+                client.download_any(cand, path=tmp_path)
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    dl_err = None
+                    break
+            except Exception as e:
+                dl_err = e
+                continue
+        if dl_err and (not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0):
+            raise dl_err
 
 
         if media_kind == "document":
@@ -1216,6 +1277,18 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             
     except Exception as e:
         print(f"Error downloading/processing media: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            import logging as _lg
+            _lg.getLogger("mojo").exception("MEDIA PROCESS FAIL kind=%s: %s", media_kind, e)
+        except Exception:
+            pass
+        if media_kind in ("audio", "ptt"):
+            return (
+                "Voice note process nahi ho saki — network/download issue ho sakta hai. "
+                "Dobara bhejo ya thori der baad try karo."
+            )
         return None
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -2211,37 +2284,36 @@ def _process_message_inner(client, message):
         if q_text:
             quoted_text = q_text
         if quoted is not None and not media_kind:
-            # media-kind detection on quoted payload — check mimetype OR url/directPath/mediaKey
-            # (quoted stubs often lack mimetype but still have downloadable media)
-            def _has_media(obj, *extra):
-                if obj is None:
-                    return False
-                for attr in ("mimetype", "URL", "url", "directPath", "mediaKey") + extra:
-                    if getattr(obj, attr, None):
-                        return True
-                return False
-
-            q_audio = getattr(quoted, "audioMessage", None) or getattr(quoted, "AudioMessage", None)
-            q_img = getattr(quoted, "imageMessage", None) or getattr(quoted, "ImageMessage", None)
-            q_sticker = getattr(quoted, "stickerMessage", None) or getattr(quoted, "StickerMessage", None)
-            q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
-            q_doc = getattr(quoted, "documentMessage", None) or getattr(quoted, "DocumentMessage", None)
-            if _has_media(q_audio):
-                media_kind = "audio"
-                target_media_msg = quoted
-                print("[QUOTE MEDIA] quoted audio/ptt detected — will transcribe")
-            elif _has_media(q_img):
-                media_kind = "image"
-                target_media_msg = quoted
-            elif _has_media(q_sticker):
-                media_kind = "sticker"
-                target_media_msg = quoted
-            elif _has_media(q_vid):
-                media_kind = "gif" if getattr(q_vid, "gifPlayback", False) else "video"
-                target_media_msg = quoted
-            elif _has_media(q_doc, "fileName", "title", "FileName", "Title"):
-                media_kind = "document"
-                target_media_msg = quoted
+            # Same detector as live messages — works on contextInfo.quotedMessage
+            q_kind, q_proto = detect_media_on_proto(quoted)
+            if q_kind:
+                media_kind = q_kind
+                target_media_msg = q_proto  # Message-shaped proto for download_any
+                print(f"[QUOTE MEDIA] quoted {q_kind} detected — will process")
+                try:
+                    import logging as _lg
+                    _lg.getLogger("mojo").info(
+                        "QUOTE MEDIA kind=%s (reply text=%r)",
+                        q_kind, (original_text or "")[:80],
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    present = []
+                    for n in (
+                        "audioMessage", "AudioMessage", "imageMessage", "ImageMessage",
+                        "videoMessage", "VideoMessage", "documentMessage", "DocumentMessage",
+                        "stickerMessage", "StickerMessage", "conversation", "Conversation",
+                        "extendedTextMessage", "ExtendedTextMessage", "pttMessage", "PttMessage",
+                    ):
+                        if getattr(quoted, n, None) is not None:
+                            present.append(n)
+                    print(f"[QUOTE MEDIA] no media extracted; quoted fields present={present}")
+                    import logging as _lg
+                    _lg.getLogger("mojo").info("QUOTE MEDIA MISS present=%s", present)
+                except Exception as _qe:
+                    print(f"[QUOTE MEDIA] probe failed: {_qe}")
 
     # Append quoted text for AI context
     if quoted_text:
@@ -2578,6 +2650,14 @@ def _process_message_inner(client, message):
 
     if is_group:
         if not (is_bot_mentioned or is_media_reaction_to_bot):
+            try:
+                import logging as _lg
+                _lg.getLogger("mojo").info(
+                    "GROUP SKIP no-mention kind=%s text=%r",
+                    media_kind, (original_text or "")[:60],
+                )
+            except Exception:
+                pass
             return
         if is_media_reaction_to_bot and not is_bot_mentioned:
             print(f"\n[GROUP MEDIA REACTION TO BOT] {media_kind} from {sender_number}")
@@ -2656,32 +2736,13 @@ def _process_message_inner(client, message):
                     is_reaction_to_bot=is_media_reaction_to_bot,
                 )
         else:
-            # If user asks about a recent voice note but we couldn't pull quoted audio,
-            # inject the cached transcript so the agent can answer "kya bola".
-            _extra_note = None
-            try:
-                _low = (original_text or text_content or "").lower()
-                _asks_voice = any(w in _low for w in (
-                    "voice", "voice note", "voicenote", "kya bola", "kya kaha",
-                    "word to word", "mene kya", "maine kya", "what did i say",
-                    "transcript",
-                ))
-                if _asks_voice and chat_id in LAST_VOICE_BY_CHAT:
-                    _cached = LAST_VOICE_BY_CHAT[chat_id]
-                    # Only use cache from last 30 minutes
-                    if time.time() - float(_cached.get("ts") or 0) < 1800:
-                        _extra_note = (
-                            "[Cached recent voice-note transcript for this chat]: "
-                            + str(_cached.get("transcript") or "")
-                        )
-                        print(f"[VOICE CACHE HIT] chat={chat_id}")
-                        # Do not force a website URL on voice questions
-                        message_urls = []
-            except Exception as _ve:
-                print(f"[VOICE CACHE] {_ve}")
-
             # Agentic path — tools handle reminders, knowledge, web, memory, etc.
-            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
+            # Quoted voice/image/docs already set media_kind above and go through
+            # handle_media_message (download quoted proto → Whisper/Gemini).
+            if (
+                admin_commands.is_feature_enabled(chat_id, "ai_chat")
+                or admin_commands.is_feature_enabled(chat_id, "reminders")
+            ):
                 with _timed("3. agent loop (tools + LLM)"):
                     from agent_loop import run_agent
                     import logging as _logging
@@ -2698,7 +2759,6 @@ def _process_message_inner(client, message):
                         msg_time=msg_time,
                         force_urls=message_urls or None,
                         latest_user_text=text_content,
-                        extra_user_note=_extra_note,
                     )
             else:
                 print(f"[FEATURE OFF] 'ai_chat'/'reminders' disabled for {chat_id}.")
