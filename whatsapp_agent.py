@@ -2334,7 +2334,7 @@ def _process_message_inner(client, message):
         q_text, q_urls = extract_quoted_text_and_urls(ctx)
         if q_text:
             quoted_text = q_text
-        if quoted is not None and not media_kind:
+        if quoted is not None:
             # Same detector as live messages — works on contextInfo.quotedMessage
             q_kind, q_proto = detect_media_on_proto(quoted)
             if q_kind:
