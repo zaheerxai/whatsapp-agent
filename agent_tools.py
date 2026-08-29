@@ -708,10 +708,17 @@ def _tool_browse_url(args: dict, ctx: dict) -> str:
         repo_pair = _github_repo_from_url(url)
         if repo_pair and repo_pair[1].lower() not in ("", "repositories", "stars", "followers", "following"):
             # full repo URL
-            return _fetch_github_repo(repo_pair[0], repo_pair[1])
+            result = _fetch_github_repo(repo_pair[0], repo_pair[1])
+            if result and "rate limit" in result.lower():
+                # Add helpful guidance
+                result += "\n\nTip: Set GITHUB_TOKEN environment variable to avoid rate limits (increases limit from 60 to 5000 requests/hour)."
+            return result
         user = _github_user_from_url(url)
         if user:
-            return _fetch_github_user_repos(user, limit=12)
+            result = _fetch_github_user_repos(user, limit=12)
+            if result and "rate limit" in result.lower():
+                result += "\n\nTip: Set GITHUB_TOKEN environment variable to avoid rate limits."
+            return result
         # fall through to HTML if path is unusual
 
     # --- Generic page fetch ---
