@@ -313,9 +313,17 @@ def run_agent(
     extra_user_note: Optional[str] = None,
     force_urls: Optional[List[str]] = None,
     latest_user_text: Optional[str] = None,
+    media_context: Optional[dict] = None,
 ) -> str:
     """
     Full agentic turn. Returns final natural-language reply for WhatsApp.
+    
+    media_context: Optional dict with media info for processing:
+        - type: 'audio', 'image', 'video', 'gif', 'sticker', 'document'
+        - base64_data: base64-encoded media content
+        - mime_type: MIME type of the media
+        - filename: (for documents) original filename
+        - user_prompt: user's question/comment about the media
     """
     try:
         now_utc = datetime.now(timezone.utc)
@@ -442,7 +450,35 @@ def run_agent(
             "sender_num": sender_num,
             "msg_time": msg_time,
             "is_group": is_group,
+            "media_context": media_context,
         }
+        
+        # Handle media context by adding it to the messages
+        if media_context:
+            media_type = media_context.get("type")
+            base64_data = media_context.get("base64_data", "")
+            mime_type = media_context.get("mime_type", "")
+            filename = media_context.get("filename", "")
+            user_prompt = media_context.get("user_prompt", "")
+            
+            if media_type == "audio":
+                # For audio, we'll let the agent decide to use transcribe_audio tool
+                messages.append({
+                    "role": "user",
+                    "content": f"[Audio message attached - {len(base64_data)} bytes. User said: {user_prompt}"
+                })
+            elif media_type == "document":
+                # For documents, provide info about the file
+                messages.append({
+                    "role": "user",
+                    "content": f"[Document attached: {filename} ({mime_type}), {len(base64_data)} bytes. User said: {user_prompt}"
+                })
+            else:
+                # For visual media, provide image data
+                messages.append({
+                    "role": "user",
+                    "content": f"[Media attached: {media_type} ({mime_type}), {len(base64_data)} bytes. User said: {user_prompt}"
+                })
 
         # --- Agentic loop ---
         for step in range(MAX_TOOL_STEPS):

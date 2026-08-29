@@ -1000,7 +1000,32 @@ def is_quote_of_bot(ctx, bot_pn, bot_lid, bot_jid_user) -> bool:
 
 
 def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False,):
+    """
+    Handle media messages by routing them through the agentic system.
     
+    This function now delegates to the media_handler module which provides a clean
+    interface for processing all media types and routing them through the agent loop.
+    """
+    # Use the new media_handler for all media processing
+    try:
+        import media_handler
+        return media_handler.process_media_message(
+            message=message,
+            media_kind=media_kind,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            text_content=text_content,
+            target_media_msg=target_media_msg,
+            msg_time=msg_time,
+            history_limit=history_limit,
+            is_reaction_to_bot=is_reaction_to_bot,
+        )
+    except Exception as e:
+        print(f"[MEDIA HANDLER ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
     # --- ADMIN FEATURE FLAG CHECKS (FRIENDLY REJECTION) ---
     chat_has_any_feature = admin_commands.has_any_feature_enabled(chat_id)
 
@@ -1927,7 +1952,9 @@ import agent_loop
 agent_tools.init_tools(
     supabase=supabase,
     client_ai=client_ai,
+    client_gemini=client_gemini,
     model_name=MODEL_NAME,
+    gemini_model=GEMINI_MODEL,
     business_knowledge=BUSINESS_KNOWLEDGE,
     default_timezone=DEFAULT_TIMEZONE,
     owner_sender_id=os.getenv("OWNER_SENDER_ID") or "",
@@ -1944,6 +1971,7 @@ agent_tools.init_tools(
     compute_next_occurrence=compute_next_occurrence,
     extract_reminder_data_via_ai=extract_reminder_data_via_ai,
     generate_reminder_confirmation=generate_reminder_confirmation,
+    download_media_file=None,
 )
 
 agent_loop.init_agent(
@@ -1959,6 +1987,32 @@ agent_loop.init_agent(
     get_contacts_maps=get_contacts_maps,
     get_group_memory=get_group_memory,
     get_tzinfo=get_tzinfo,
+)
+
+# Initialize media handler
+import media_handler
+media_handler.init_media_handler(
+    client=client,
+    supabase=supabase,
+    client_ai=client_ai,
+    client_gemini=client_gemini,
+    model_name=MODEL_NAME,
+    gemini_model=GEMINI_MODEL,
+    business_knowledge=BUSINESS_KNOWLEDGE,
+    default_timezone=DEFAULT_TIMEZONE,
+    admin_commands=admin_commands,
+    get_contacts_maps=get_contacts_maps,
+    get_user_timezone=get_user_timezone,
+    set_user_timezone=set_user_timezone,
+    get_tzinfo=get_tzinfo,
+    get_group_memory=get_group_memory,
+    send_proactive_message=send_proactive_message,
+    fetch_chat_history=fetch_chat_history,
+    insert_chat_message=insert_chat_message,
+    detect_media_on_proto=detect_media_on_proto,
+    file_magic_kind=_file_magic_kind,
+    guess_doc_meta=_guess_doc_meta,
+    extract_document_text=extract_document_text,
 )
 
 # Start health endpoint + session uploader + optional self-ping
