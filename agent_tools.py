@@ -527,13 +527,38 @@ def _tool_web_search(args: dict, ctx: dict) -> str:
                 "Content-Type": "application/x-www-form-urlencoded"
             },
         )
-        # crude extract of result snippets
-        texts = re.findall(r"<a rel=\"nofollow\"[^>]*>([^<]+)</a>", r.text)
+        # Prefer anchors that carry an href so the model can return real links
+        # (title-only matches were why "iSeeWaves LinkedIn" searches never
+        # produced a usable linkedin.com URL in the reply).
+        pairs = re.findall(
+            r'<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
+            r.text,
+            flags=re.I,
+        )
+        if not pairs:
+            pairs = [
+                ("", t) for t in re.findall(r'<a rel="nofollow"[^>]*>([^<]+)</a>', r.text)
+            ]
         snippets = re.findall(r'class="result-snippet"[^>]*>([^<]+)', r.text)
         lines = []
-        for i, t in enumerate(texts[:num]):
+        for i, (href, title) in enumerate(pairs[:num]):
             sn = snippets[i] if i < len(snippets) else ""
-            lines.append(f"• {t.strip()}\n  {sn.strip()}")
+            href = (href or "").strip()
+            # DDG lite often wraps targets as //duckduckgo.com/l/?uddg=<url>
+            if "uddg=" in href:
+                try:
+                    from urllib.parse import parse_qs, urlparse, unquote
+                    qs = parse_qs(urlparse(href).query)
+                    if qs.get("uddg"):
+                        href = unquote(qs["uddg"][0])
+                except Exception:
+                    pass
+            block = f"• {title.strip()}"
+            if sn.strip():
+                block += f"\n  {sn.strip()}"
+            if href.startswith("http"):
+                block += f"\n  {href}"
+            lines.append(block)
         return "\n\n".join(lines) if lines else "No results found."
     except Exception as e:
         return f"Web search unavailable right now ({e})."

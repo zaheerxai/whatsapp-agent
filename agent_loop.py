@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,22 @@ MAX_TOOL_STEPS = 5
 MAX_HISTORY_MSGS = 12
 MAX_MSG_CHARS = 600
 MAX_OBS_CHARS = 3500
+
+_VAGUE_ACK_RE = re.compile(
+    r"^(theek hai|ok|okay|done|ho gaya|sure|haan|ji|alright|got it)"
+    r"(\s*[.!.👍✅🙏]*)?$",
+    re.I,
+)
+
+
+def _is_vague_ack(text: str) -> bool:
+    """True for empty / pure acknowledgement replies that discard tool results."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    if len(t) <= 14 and _VAGUE_ACK_RE.match(t):
+        return True
+    return False
 
 
 def init_agent(
@@ -171,14 +188,16 @@ def _sanitize_messages_for_gemini(messages: List[dict]) -> List[dict]:
     """Gemini OpenAI-compat is picky about content=None and long tool histories.
     Convert pure tool turns into plain text so the fallback can still answer."""
     out: List[dict] = []
+    had_tool_result = False
     for m in messages:
         role = m.get("role")
         content = m.get("content")
         if role == "tool":
+            had_tool_result = True
             # Fold tool observation into a user-visible note
             out.append({
                 "role": "user",
-                "content": f"[Tool result]\n{content or ''}",
+                "content": f"[Tool result — use this to answer the user]\n{content or ''}",
             })
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -198,6 +217,17 @@ def _sanitize_messages_for_gemini(messages: List[dict]) -> List[dict]:
         out.append({
             "role": role if role in ("system", "user", "assistant") else "user",
             "content": content if isinstance(content, str) else (content or ""),
+        })
+    # After tools ran, Gemini often replies with a vague ack ("Theek hai") unless
+    # told explicitly to synthesize facts/links from the tool results.
+    if had_tool_result:
+        out.append({
+            "role": "user",
+            "content": (
+                "Using ONLY the tool results above, give the user a short direct answer "
+                "with any concrete facts and full URLs/links found. Do NOT reply with only "
+                "'Theek hai' or a vague acknowledgement — include the useful information."
+            ),
         })
     return out
 
@@ -521,6 +551,38 @@ def run_agent(
 
             if not tool_calls:
                 answer = (content or "").strip()
+                # After tools ran, reject empty / pure-ack replies and force a
+                # short synthesis from the tool observations (Groq 429 → Gemini
+                # was answering only "Theek hai 👍" despite good search results).
+                if step > 0 and _is_vague_ack(answer):
+                    logging.getLogger("mojo.agent").info(
+                        "VAGUE_AFTER_TOOLS answer=%r — forcing synthesis", answer
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Tool results are already above. Give the user a short direct "
+                            "answer with concrete facts and any full URLs from those results. "
+                            "Do not reply with only 'Theek hai' or a vague acknowledgement."
+                        ),
+                    })
+                    try:
+                        final = _chat_completion(messages, tools=None, temperature=0.3)
+                        forced = (final.content or "").strip()
+                        if forced and not _is_vague_ack(forced):
+                            return forced
+                        if forced:
+                            return forced
+                    except Exception as fe:
+                        print(f"[AGENT] forced synthesis failed: {fe}")
+                    # Last resort: surface the last tool observation so the user
+                    # at least gets something useful instead of a bare ack.
+                    for m in reversed(messages):
+                        if m.get("role") == "tool" and (m.get("content") or "").strip():
+                            obs = str(m["content"]).strip()
+                            if len(obs) > 900:
+                                obs = obs[:900] + "…"
+                            return obs
                 return answer or "Theek hai 👍"
 
             # Execute tools
