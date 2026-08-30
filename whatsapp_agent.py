@@ -1121,7 +1121,7 @@ def name_safe(ext, mime):
     return f"{ext or '?'} ({mime or 'unknown'})"
 
 
-def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False,):
+def handle_media_message(message, media_kind, chat_id, sender_id, text_content="", target_media_msg=None, msg_time=None, history_limit=20, is_reaction_to_bot=False, sender_num=None):
     
     # --- ADMIN FEATURE FLAG CHECKS (FRIENDLY REJECTION) ---
     chat_has_any_feature = admin_commands.has_any_feature_enabled(chat_id)
@@ -1269,6 +1269,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     return run_agent(
                         chat_id=chat_id,
                         sender_id=sender_id,
+                        sender_num=sender_num,
                         history_limit=history_limit,
                         is_group=is_group,
                         msg_time=msg_time,
@@ -1331,7 +1332,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 return run_agent(
                     chat_id=chat_id,
                     sender_id=sender_id,
-                    sender_num=None,
+                    sender_num=sender_num,
                     history_limit=history_limit,
                     is_group=is_group,
                     msg_time=msg_time,
@@ -2618,6 +2619,7 @@ def _process_message_inner(client, message):
                     message, media_kind, chat_id, db_sender_id, text_content,
                     target_media_msg, msg_time, history_limit,
                     is_reaction_to_bot=is_media_reaction_to_bot,
+                    sender_num=db_sender_num,
                 )
         else:
             # If user asks about a recent voice note but we couldn't pull quoted audio,
