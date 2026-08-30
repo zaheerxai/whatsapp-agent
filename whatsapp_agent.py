@@ -1275,11 +1275,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             return None
             
     except Exception as e:
-<<<<<<< HEAD
         log.exception(f"Error downloading/processing media: {e}")
-=======
-        print(f"Error downloading/processing media: {e}")
->>>>>>> 02387180d1a8b857c6884a30749e4bee088aaffc
         return None
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -2083,11 +2079,7 @@ def _process_message_inner(client, message):
             if _has_media(q_audio):
                 media_kind = "audio"
                 target_media_msg = quoted
-<<<<<<< HEAD
                 log.info("QUOTE_MEDIA quoted audio/ptt detected — will transcribe")
-=======
-                print("[QUOTE MEDIA] quoted audio/ptt detected — will transcribe")
->>>>>>> 02387180d1a8b857c6884a30749e4bee088aaffc
             elif _has_media(q_img):
                 media_kind = "image"
                 target_media_msg = quoted
@@ -2532,19 +2524,11 @@ def _process_message_inner(client, message):
                             "[Cached recent voice-note transcript for this chat]: "
                             + str(_cached.get("transcript") or "")
                         )
-<<<<<<< HEAD
                         log.info(f"VOICE_CACHE_HIT chat={chat_id}")
                         # Do not force a website URL on voice questions
                         message_urls = []
             except Exception as _ve:
                 log.warning(f"VOICE_CACHE error: {_ve}")
-=======
-                        print(f"[VOICE CACHE HIT] chat={chat_id}")
-                        # Do not force a website URL on voice questions
-                        message_urls = []
-            except Exception as _ve:
-                print(f"[VOICE CACHE] {_ve}")
->>>>>>> 02387180d1a8b857c6884a30749e4bee088aaffc
 
             # Agentic path — tools handle reminders, knowledge, web, memory, etc.
             if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
@@ -2605,8 +2589,4 @@ if __name__ == "__main__":
         # Persist the session as soon as we are connected (covers first QR scan too)
         _upload_session_to_bucket()
     except Exception as e:
-<<<<<<< HEAD
         log.critical(f"CRITICAL ERROR on startup: {e}")
-=======
-        print(f"CRITICAL ERROR: {e}")
->>>>>>> 02387180d1a8b857c6884a30749e4bee088aaffc
