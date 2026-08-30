@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from agent_tools import TOOL_SCHEMAS, execute_tool
+from agent_tools import TOOL_SCHEMAS, execute_tool, LANGUAGE_POLICY
 
 # Injected
 _client_ai = None
@@ -97,10 +97,7 @@ def _build_system_prompt(
 {memory_block}
 
 === LANGUAGE POLICY (CRITICAL) ===
-- Default reply language for Urdu / Hindi / mixed users = **Roman Urdu** (Latin script), e.g. "Theek hai, 1 minute baad paani peene ka reminder set kar diya."
-- Use full Urdu script (نستعلیق / Arabic letters) **ONLY** if the user explicitly asks for it (e.g. "Urdu mein likho", "اردو میں جواب دو").
-- If the user writes pure English, reply in natural English.
-- Match the user's vibe: casual when they are casual.
+{LANGUAGE_POLICY.strip()}
 
 === CORE RULES (SPEED + ACCURACY) ===
 1. Keep replies SHORT — WhatsApp friendly (1–3 short lines max). No walls of text. No markdown headers (###). No bullet essays. No bio dumps.

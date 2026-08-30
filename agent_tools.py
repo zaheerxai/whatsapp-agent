@@ -17,6 +17,22 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+# ---------------------------------------------------------------------------
+# Single source of truth for script/language matching, shared by agent_loop.py
+# (final-answer system prompt) and whatsapp_agent.py's reminder_scheduler()
+# (scheduled reminder delivery). Previously each maintained its own copy of
+# this rule with different wording — this is the one place to edit it.
+# ---------------------------------------------------------------------------
+LANGUAGE_POLICY = """- Mirror the SCRIPT the person actually used in THIS message — not the topic, not the vibe, just what script they typed.
+  - They wrote in English -> reply in English.
+  - They wrote in Roman Urdu/Hindi (Latin letters — e.g. "kya haal hai", "paani peene ka reminder set kar do") -> reply in Roman Urdu/Hindi, same script.
+  - They wrote in native Urdu script (نستعلیق / Arabic letters) -> reply in Urdu script.
+  - They explicitly asked for Urdu script (e.g. "Urdu mein likho", "اردو میں جواب دو") -> reply in Urdu script even if their own message was typed in Roman.
+- Default for Urdu/Hindi speakers who haven't specified a script = Roman Urdu (Latin letters). Never switch to native Urdu script just because a topic or reminder subject feels "more Urdu" — only the person's own explicit script or request decides this, never your own judgment call.
+- Voice notes have no script the person "chose" — a voice transcript is treated as Roman Urdu by default unless the person has explicitly asked for Urdu script elsewhere in the conversation.
+"""
+
+
 # These are injected by whatsapp_agent after import to avoid circular deps
 _supabase = None
 _client_ai = None

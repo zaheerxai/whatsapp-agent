@@ -27,6 +27,8 @@ class _SuppressReminderPolling(logging.Filter):
 
 logging.getLogger("httpx").addFilter(_SuppressReminderPolling())
 
+log = logging.getLogger("mojo")
+
 from openai import OpenAI, RateLimitError
 from neonize.client import NewClient
 from neonize.events import MessageEv
@@ -402,9 +404,9 @@ def refresh_bot_identities(client):
                             break
                 except Exception:
                     pass
-        print(f"[IDENTITY] BOT_PN={BOT_PN} BOT_LID={BOT_LID}")
+        log.info("IDENTITY BOT_PN=%s BOT_LID=%s", BOT_PN, BOT_LID)
     except Exception as e:
-        print(f"[IDENTITY] refresh failed: {e}")
+        log.warning("IDENTITY refresh failed: %s", e)
 
 def learn_bot_lid_from_message(message, bot_pn):
     """Fallback: Learn LID from outbound traffic."""
@@ -419,13 +421,13 @@ def learn_bot_lid_from_message(message, bot_pn):
             sender = getattr(src, "Sender", None)
             if _server_of(sender) == "lid":
                 BOT_LID = _user_of(sender)
-                print(f"[IDENTITY] Learned BOT_LID from own message: {BOT_LID}")
+                log.info("IDENTITY learned BOT_LID from own message: %s", BOT_LID)
                 return
                 
             alt = getattr(src, "SenderAlt", None)
             if _server_of(alt) == "lid":
                 BOT_LID = _user_of(alt)
-                print(f"[IDENTITY] Learned BOT_LID from SenderAlt: {BOT_LID}")
+                log.info("IDENTITY learned BOT_LID from SenderAlt: %s", BOT_LID)
     except Exception:
         pass
 
@@ -543,6 +545,52 @@ def get_world_clocks():
     return "\n".join(clocks)
 
 
+# Arabic-script block (covers Urdu's Nastaliq letters, which are a superset of
+# standard Arabic + a few extra codepoints in the Arabic Presentation Forms range).
+_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+
+
+def transliterate_to_roman_if_needed(text: str) -> str:
+    """Normalize Urdu-script text to Roman Urdu (Latin letters).
+
+    Used specifically for voice transcripts: Whisper writes Urdu speech in its
+    native Nastaliq/Arabic script, but our default policy — mirrored from how
+    typed messages are handled — is Roman Urdu unless the person explicitly
+    writes in Urdu script. Voice has no script the speaker "chose", so this
+    normalizes to the default right after transcription, before the text is
+    ever stored in chat_history or used as a reminder's `message` field.
+    Skipped entirely (near-zero cost) for English/Roman-Urdu transcripts, which
+    contain no Arabic-script characters at all.
+    """
+    if not text or not _ARABIC_SCRIPT_RE.search(text):
+        return text
+    try:
+        resp = client_ai.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Transliterate the following Urdu-script text into Roman Urdu "
+                        "(Latin letters), the way a Pakistani WhatsApp user would "
+                        "naturally type it. Keep English loanwords (GitHub, WhatsApp, "
+                        "link, reminder, alarm, etc.) spelled normally in Latin, not "
+                        "phonetically mangled. Preserve meaning exactly — this is "
+                        "transliteration, not translation. Reply with ONLY the "
+                        "transliterated text, nothing else."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+        )
+        result = (resp.choices[0].message.content or "").strip()
+        return result or text
+    except Exception as e:
+        log.warning(f"Transliteration failed, keeping original script: {e}")
+        return text
+
+
 def upsert_contact(sender_id, push_name, sender_num=None):
     if not push_name:
         return
@@ -560,7 +608,7 @@ def upsert_contact(sender_id, push_name, sender_num=None):
             CONTACTS_CACHE["contacts_map"][sender_id] = push_name
             CONTACTS_CACHE["reverse_map"][push_name.lower()] = sender_id
     except Exception as e:
-        print(f"Error upserting contact: {e}")
+        log.error(f"Error upserting contact: {e}")
 
 
 def get_contacts_maps():
@@ -595,7 +643,7 @@ def get_contacts_maps():
         return contacts_map, reverse_map
 
     except Exception as e:
-        print(f"Error fetching contacts maps: {e}")
+        log.error(f"Error fetching contacts maps: {e}")
         # Graceful fallback: Use stale cache if the DB read fails
         if CONTACTS_CACHE["contacts_map"]:
             print("[CACHE] Returning stale contacts due to fetch error.")
@@ -622,7 +670,7 @@ def resolve_mentions(text, reverse_map_or_tuple):
             pattern = re.compile(re.escape("@" + name), re.IGNORECASE)
             text = pattern.sub(f"@{reverse_map[name]}", text)
     except Exception as e:
-        print(f"Error resolving mentions: {e}")
+        log.error(f"Error resolving mentions: {e}")
 
     return text
 
@@ -644,9 +692,9 @@ def maybe_save_memory(chat_id, sender_id, text_content):
             "sender_id": sender_id,
             "note": text_content,
         }).execute()
-        print(f"[MEMORY SAVED] {text_content}")
+        log.info("MEMORY_SAVED %r", text_content)
     except Exception as e:
-        print(f"Error saving memory: {e}")
+        log.error(f"Error saving memory: {e}")
 
 
 def maybe_save_memory_smart(chat_id, sender_id, text_content):
@@ -675,9 +723,9 @@ def maybe_save_memory_smart(chat_id, sender_id, text_content):
                 "sender_id": sender_id,
                 "note": classification
             }).execute()
-            print(f"[MEMORY SAVED - SMART] {classification}")
+            log.info("MEMORY_SAVED_SMART %r", classification)
     except Exception as e:
-        print(f"Error in smart memory save: {e}")
+        log.error(f"Error in smart memory save: {e}")
 
 
 def get_group_memory(chat_id):
@@ -687,7 +735,7 @@ def get_group_memory(chat_id):
         response = supabase.table("group_memory").select("note").eq("chat_id", chat_id).execute()
         return [row["note"] for row in response.data]
     except Exception as e:
-        print(f"Error fetching group memory: {e}")
+        log.error(f"Error fetching group memory: {e}")
         return []
 
 
@@ -801,7 +849,7 @@ def fetch_chat_history(chat_id, history_limit):
             CHAT_HISTORY_CACHE[chat_id] = response.data[::-1] 
             print(f"[CACHE] Warmed chat history for {chat_id} ({len(response.data)} msgs)")
         except Exception as e:
-            print(f"Error fetching history for cache: {e}")
+            log.error(f"Error fetching history for cache: {e}")
             return []
             
     # 2. Return exactly what the AI asked for from the end of the list
@@ -839,7 +887,7 @@ def insert_chat_message(chat_id, sender_id, role, content, sender_num=None):
                 CHAT_HISTORY_CACHE[chat_id].pop(0)
                 
     except Exception as e:
-        print(f"Error saving message: {e}")
+        log.error(f"Error saving message: {e}")
 
 
 def _guess_doc_meta(doc_msg, tmp_path):
@@ -980,19 +1028,19 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
     chat_has_any_feature = admin_commands.has_any_feature_enabled(chat_id)
 
     if media_kind == "document" and not admin_commands.is_feature_enabled(chat_id, "documents"):
-        print(f"[FEATURE OFF] 'documents' disabled for {chat_id}.")
+        log.info(f"FEATURE_OFF documents disabled for {chat_id}")
         return "📄 Document reading is currently turned off for this chat." if chat_has_any_feature else None
             
     if media_kind in ("video", "gif") and not admin_commands.is_feature_enabled(chat_id, "videos"):
-        print(f"[FEATURE OFF] 'videos' disabled for {chat_id}.")
+        log.info(f"FEATURE_OFF videos disabled for {chat_id}")
         return "🎥 Video processing is currently turned off for this chat." if chat_has_any_feature else None
 
     if media_kind in ("image", "sticker", "user_created_sticker") and not admin_commands.is_feature_enabled(chat_id, "images"):
-        print(f"[FEATURE OFF] 'images' disabled for {chat_id}.")
+        log.info(f"FEATURE_OFF images disabled for {chat_id}")
         return "🖼️ Image processing is currently turned off for this chat." if chat_has_any_feature else None
 
     if media_kind in ("audio", "ptt") and not admin_commands.is_feature_enabled(chat_id, "audio"):
-        print(f"[FEATURE OFF] 'audio' disabled for {chat_id}.")
+        log.info(f"FEATURE_OFF audio disabled for {chat_id}")
         return "🎤 Voice notes are currently turned off for this chat." if chat_has_any_feature else None
 
 
@@ -1030,7 +1078,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 
         if media_kind == "document":
             if not admin_commands.is_feature_enabled(chat_id, "documents"):
-                print(f"[FEATURE OFF] 'documents' disabled for {chat_id}.")
+                log.info(f"FEATURE_OFF documents disabled for {chat_id}")
                 return (
                     "📄 Document reading is currently turned off for this chat."
                     if admin_commands.has_any_feature_enabled(chat_id)
@@ -1045,7 +1093,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 
             mime, filename, ext = _guess_doc_meta(doc_src, tmp_path)
             magic = _file_magic_kind(tmp_path)
-            print(f"[DOC] name={filename!r} ext={ext!r} mime={mime!r} magic={magic}")
+            log.info("DOC name=%r ext=%r mime=%r magic=%s", filename, ext, mime, magic)
 
             # Filename/extension lied — content is actually PDF
             if magic == "pdf":
@@ -1088,7 +1136,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     )
                     return gemini_response.choices[0].message.content
                 except Exception as e:
-                    print(f"[PDF GEMINI ERROR] {e}")
+                    log.error("PDF_GEMINI_ERROR %s", e)
                     return "📄 Couldn't read that PDF right now. Try again or paste the text."
 
             # Named like Office but bytes are not OOXML/text
@@ -1103,7 +1151,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             try:
                 body = extract_document_text(tmp_path, mime, ext)
             except Exception as e:
-                print(f"[DOC EXTRACT ERROR] {filename}: {e}")
+                log.error("DOC_EXTRACT_ERROR %s: %s", filename, e)
                 return (
                     f"📄 Got `{filename}`, but couldn't read it ({e}). "
                     "Try PDF, DOCX, XLSX, PPTX, or TXT."
@@ -1144,9 +1192,14 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 transcript = client_ai.audio.transcriptions.create(
                     model=WHISPER_MODEL,
                     file=f,
-                    language="ur"
+                    # No forced `language="ur"` — auto-detect per utterance so
+                    # code-switched English words (GitHub, reminder, alarm, link)
+                    # aren't forced through Urdu decoding, which was mangling them.
                 ).text
-            print(f"[VOICE NOTE TRANSCRIBED]: {transcript}")
+            log.info("VOICE_TRANSCRIBED raw=%r", transcript)
+
+            transcript = transliterate_to_roman_if_needed(transcript)
+            log.info("VOICE_TRANSCRIBED normalized=%r", transcript)
 
             # Cache so later "ye voice note me kya bola" can answer without re-download
             try:
@@ -1222,7 +1275,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             return None
             
     except Exception as e:
-        print(f"Error downloading/processing media: {e}")
+        log.exception(f"Error downloading/processing media: {e}")
         return None
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -1238,7 +1291,7 @@ def send_proactive_message(chat_id, text):
         jid = build_jid(user, server=server)
         client.send_message(jid, text, mentions_are_lids=True)
     except Exception as e:
-        print(f"Error sending proactive message to {chat_id}: {e}")
+        log.error(f"Error sending proactive message to {chat_id}: {e}")
 
 
 def extract_reminder_data_via_ai(text_content, user_tz_str):
@@ -1292,7 +1345,7 @@ If you cannot parse any concrete time, still return valid JSON with empty arrays
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"Error in AI JSON reminder parsing: {e}")
+        log.error(f"Error in AI JSON reminder parsing: {e}")
         return None
 
 def get_user_timezone(sender_id):
@@ -1301,14 +1354,14 @@ def get_user_timezone(sender_id):
         if response.data and response.data[0].get("timezone"):
             return response.data[0]["timezone"]
     except Exception as e:
-        print(f"Error fetching timezone for {sender_id}: {e}")
+        log.error(f"Error fetching timezone for {sender_id}: {e}")
     return None
 
 def set_user_timezone(sender_id, tz_string):
     try:
         supabase.table("contacts").update({"timezone": tz_string}).eq("sender_id", sender_id).execute()
     except Exception as e:
-        print(f"Error saving timezone for {sender_id}: {e}")
+        log.error(f"Error saving timezone for {sender_id}: {e}")
 
 def maybe_set_timezone(sender_id, text_content):
     match = TZ_OFFSET_RE.search(text_content)
@@ -1346,7 +1399,7 @@ def handle_reminder_request(chat_id, sender_id, text_content, msg_time):
 
     # --- AI Timezone Detection for First-Time Users ---
     if user_tz is None:
-        print(f"[TIMEZONE] First-time reminder for {sender_id}, checking for location cues...")
+        log.info("TIMEZONE first-time reminder for %s, checking for location cues...", sender_id)
         current_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
         
         ai_tz_prompt = (
@@ -1365,11 +1418,11 @@ def handle_reminder_request(chat_id, sender_id, text_content, msg_time):
             if ai_tz != "NONE" and "/" in ai_tz:
                 user_tz = ai_tz
                 set_user_timezone(sender_id, user_tz)
-                print(f"[TIMEZONE SET] Automatically set {sender_id} to {user_tz}")
+                log.info("TIMEZONE_SET automatically set %s to %s", sender_id, user_tz)
             else:
                 return "I can definitely set that up! Since this is your first time, please let me know your city or country so I get the timing exactly right."
         except Exception as e:
-            print(f"Error checking AI timezone: {e}")
+            log.warning("Error checking AI timezone: %s", e)
             user_tz = DEFAULT_TIMEZONE
     # --- END TIMEZONE ---
 
@@ -1446,7 +1499,7 @@ def handle_reminder_request(chat_id, sender_id, text_content, msg_time):
             schedule_desc = f"at {', '.join(local_formatted_times)}"
 
     except Exception as e:
-        print(f"Error saving reminder to database: {e}")
+        log.error("Error saving reminder to database: %s", e)
         return "Something went wrong saving those times — mind trying again?"
 
     return generate_reminder_confirmation(chat_id, sender_id, message_text, schedule_desc)
@@ -1513,8 +1566,7 @@ def list_reminders(chat_id, sender_id):
             lines.append(f'- "{r["message"]}" — {when}')
         return "Active reminders:\n" + "\n".join(lines)
     except Exception as e:
-        print(f"Error listing reminders: {e}")
-        traceback.print_exc()
+        log.exception("Error listing reminders: %s", e)
         return f"Reminders load nahi ho sake: {e}"
 
 def reminder_scheduler():
@@ -1539,7 +1591,7 @@ def reminder_scheduler():
                         "Your job is to deliver a quick scheduled reminder to the user.\n\n"
                         "STRICT RULES:\n"
                         "1. Keep it to ONE short, warm, and completely natural sentence.\n"
-                        "2. MATCH THE LANGUAGE: If the reminder subject is in Roman Urdu/Hindi (e.g., 'kapre dhone hain', 'dawai leni hai'), you MUST reply in natural Roman Urdu/Hindi.\n"
+                        f"2. LANGUAGE POLICY — mirror the script of the reminder subject text below:\n{agent_tools.LANGUAGE_POLICY.strip()}\n"
                         "3. NEVER use forced slang (e.g., avoid awkward 'heads up', 'after yaar', or rigid templates).\n"
                         "4. Naturally tag the user at the start."
                     )
@@ -1564,7 +1616,7 @@ def reminder_scheduler():
                         ).choices[0].message.content.strip()
                         final_msg = f"⏰ {ai_msg}"
                     except Exception as e:
-                        print(f"Dynamic reminder generation failed: {e}")
+                        log.warning(f"Dynamic reminder generation failed, using canned message: {e}")
                         final_msg = f"⏰ {tag_name} Reminder: {reminder['message']}"
 
                     send_proactive_message(reminder["chat_id"], final_msg)
@@ -1580,9 +1632,9 @@ def reminder_scheduler():
                     else:
                         supabase.table("reminders").update({"active": False}).eq("id", reminder["id"]).execute()
                 except Exception as e:
-                    print(f"Error sending reminder {reminder.get('id')}: {e}")
+                    log.exception("Error sending reminder %s: %s", reminder.get('id'), e)
         except Exception as e:
-            print(f"Error checking reminders: {e}")
+            log.exception("Error checking reminders: %s", e)
         time.sleep(30)
 
 
@@ -1625,7 +1677,7 @@ def cancel_reminders(chat_id, sender_id, text_content):
             supabase.table("reminders").update({"active": False}).eq("id", r["id"]).execute()
         return "Cancelled: " + ", ".join(f'"{r["message"]}"' for r in matched)
     except Exception as e:
-        print(f"Error cancelling reminder: {e}")
+        log.exception("Error cancelling reminder: %s", e)
         return "Couldn't cancel that just now — try again?"
 
 
@@ -1889,7 +1941,7 @@ def urls_from_recent_history(chat_id, limit=12) -> list:
                 out.append(u)
         return out
     except Exception as e:
-        print(f"[URL history fallback] {e}")
+        log.warning(f"URL history fallback failed: {e}")
         return []
 
 
@@ -1936,7 +1988,7 @@ def _process_message_inner(client, message):
     
     # Learn bot LID from our own outbound traffic, then ignore the message
     if is_from_me:
-        if not BOT_PN:
+        if not BOT_PN or not BOT_LID:
             refresh_bot_identities(client)
         learn_bot_lid_from_message(message, BOT_PN)
         return
@@ -2027,7 +2079,7 @@ def _process_message_inner(client, message):
             if _has_media(q_audio):
                 media_kind = "audio"
                 target_media_msg = quoted
-                print("[QUOTE MEDIA] quoted audio/ptt detected — will transcribe")
+                log.info("QUOTE_MEDIA quoted audio/ptt detected — will transcribe")
             elif _has_media(q_img):
                 media_kind = "image"
                 target_media_msg = quoted
@@ -2278,7 +2330,7 @@ def _process_message_inner(client, message):
                     f"{result.get('webUrl') or ''}"
                 )
             except Exception as e:
-                print(f"[UPLOADIMG] {e}")
+                log.exception("UPLOADIMG failed: %s", e)
                 admin_reply = f"❌ Upload failed: {e}"
             finally:
                 if tmp_path and os.path.exists(tmp_path):
@@ -2290,7 +2342,7 @@ def _process_message_inner(client, message):
         # normal text admin commands
         admin_reply = admin_commands.handle_admin_command(text_content)
         if admin_reply is not None:
-            print(f"[ADMIN COMMAND] {text_content}")
+            log.info("ADMIN_COMMAND %r", text_content)
             client.reply_message(admin_reply, message)
             return
 
@@ -2313,7 +2365,7 @@ def _process_message_inner(client, message):
     if "@mojo" in original_text.lower():
         is_bot_mentioned = True
 
-    if not BOT_PN:
+    if not BOT_PN or not BOT_LID:
         refresh_bot_identities(client)
     
     learn_bot_lid_from_message(message, BOT_PN)
@@ -2334,7 +2386,7 @@ def _process_message_inner(client, message):
     ):
         if quoted_matches_recent_bot_reply(chat_id, quoted_text):
             is_reply_to_bot = True
-            print("[REACTION] Quote matched recent bot reply via chat_history")
+            log.info("REACTION quote matched recent bot reply via chat_history")
 
     native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
     text_hit = False
@@ -2360,26 +2412,29 @@ def _process_message_inner(client, message):
         )
     )
 
-    # --- temporary debug (remove after it works) ---
-    print(
-        f"[DEBUG REACTION] media_kind={media_kind!r} "
-        f"ctx={bool(ctx)} is_reply_to_bot={is_reply_to_bot} "
-        f"is_media_reaction_to_bot={is_media_reaction_to_bot} "
-        f"is_group={is_group} has_quote={has_quote} "
-        f"BOT_PN={BOT_PN} BOT_LID={BOT_LID} "
-        f"participant={getattr(ctx, 'participant', None) if ctx else None}"
+    # Persisted (not print-only) so this is diagnosable from the synced log file,
+    # not just a live console tail. This is exactly the signal needed to tell
+    # apart "ctx wasn't found" vs "ctx was found but participant didn't match
+    # BOT_PN/BOT_LID" vs "media_kind/is_group gating excluded it".
+    log.info(
+        "REACTION_CHECK media_kind=%r ctx=%s is_reply_to_bot=%s "
+        "is_media_reaction_to_bot=%s is_group=%s has_quote=%s "
+        "BOT_PN=%s BOT_LID=%s participant=%r",
+        media_kind, bool(ctx), is_reply_to_bot,
+        is_media_reaction_to_bot, is_group, has_quote,
+        BOT_PN, BOT_LID,
+        getattr(ctx, "participant", None) if ctx else None,
     )
-    # -----------------------------------------------
 
     if is_group:
         if not (is_bot_mentioned or is_media_reaction_to_bot):
             return
         if is_media_reaction_to_bot and not is_bot_mentioned:
-            print(f"\n[GROUP MEDIA REACTION TO BOT] {media_kind} from {sender_number}")
+            log.info("GROUP_MEDIA_REACTION_TO_BOT kind=%s from=%s", media_kind, sender_number)
         else:
-            print(f"\n[GROUP WAKE WORD DETECTED] from {sender_number}")
+            log.info("GROUP_WAKE_WORD_DETECTED from=%s", sender_number)
     else:
-        print(f"\n[PRIVATE MESSAGE] from {sender_number}")
+        log.info("PRIVATE_MESSAGE from=%s", sender_number)
 
     if is_media_reaction_to_bot:
         q = (quoted_text or "").strip()
@@ -2415,7 +2470,7 @@ def _process_message_inner(client, message):
 
     # If the message is older than 5 minutes (300 seconds), skip replying.
     if time.time() - msg_time > 300:
-        print(f"[STALE MESSAGE SKIPPED] from {sender_number} (Age: {int(time.time() - msg_time)}s)")
+        log.info(f"STALE_MESSAGE_SKIPPED from={sender_number} age={int(time.time() - msg_time)}s")
         return
 
     with _timed("1. feature flags + memory + timezone"):
@@ -2469,11 +2524,11 @@ def _process_message_inner(client, message):
                             "[Cached recent voice-note transcript for this chat]: "
                             + str(_cached.get("transcript") or "")
                         )
-                        print(f"[VOICE CACHE HIT] chat={chat_id}")
+                        log.info(f"VOICE_CACHE_HIT chat={chat_id}")
                         # Do not force a website URL on voice questions
                         message_urls = []
             except Exception as _ve:
-                print(f"[VOICE CACHE] {_ve}")
+                log.warning(f"VOICE_CACHE error: {_ve}")
 
             # Agentic path — tools handle reminders, knowledge, web, memory, etc.
             if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
@@ -2496,7 +2551,7 @@ def _process_message_inner(client, message):
                         extra_user_note=_extra_note,
                     )
             else:
-                print(f"[FEATURE OFF] 'ai_chat'/'reminders' disabled for {chat_id}.")
+                log.info("FEATURE_OFF ai_chat/reminders disabled for %s", chat_id)
                 if admin_commands.has_any_feature_enabled(chat_id):
                     ai_answer = "💬 AI text chat is currently turned off for this chat."
                 else:
@@ -2505,8 +2560,11 @@ def _process_message_inner(client, message):
     if not ai_answer:
         return
 
-    print(f"[{(push_name or sender_number).upper()}]: {lowered_text}")
-    print(f"[AI RESPONSE]: {ai_answer}")
+    log.info(
+        "USER_QUERY chat=%s sender=%s name=%s text=%r",
+        chat_id, db_sender_id, push_name or sender_number, text_content,
+    )
+    log.info("AI_REPLY chat=%s text=%r", chat_id, ai_answer)
 
     _, reverse_map = get_contacts_maps()
     ai_answer = resolve_mentions(ai_answer, reverse_map)
@@ -2531,4 +2589,4 @@ if __name__ == "__main__":
         # Persist the session as soon as we are connected (covers first QR scan too)
         _upload_session_to_bucket()
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+        log.critical(f"CRITICAL ERROR on startup: {e}")
