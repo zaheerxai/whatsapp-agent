@@ -777,37 +777,136 @@ def get_media_kind(message):
         pass
     return None
 
+def _submsg_has_content(sub_msg, msg_type: str) -> bool:
+    """True only if this protobuf sub-message is the one that was actually sent.
+
+    Neonize leaves empty default objects on every Message field (truthy in Python).
+    Without this guard, empty extendedTextMessage.contextInfo shadows the real
+    contextInfo on audioMessage — which is exactly why voice-note replies logged
+    quotedMessage=True but quoted='' / stanzaId=''.
+    """
+    if sub_msg is None:
+        return False
+    if msg_type == "extendedTextMessage":
+        return bool(
+            getattr(sub_msg, "text", None)
+            or getattr(sub_msg, "Text", None)
+        )
+    if msg_type in ("imageMessage", "videoMessage", "documentMessage"):
+        return bool(
+            getattr(sub_msg, "mimetype", None)
+            or getattr(sub_msg, "URL", None)
+            or getattr(sub_msg, "url", None)
+            or getattr(sub_msg, "directPath", None)
+            or getattr(sub_msg, "mediaKey", None)
+            or getattr(sub_msg, "caption", None)
+            or getattr(sub_msg, "Caption", None)
+            or getattr(sub_msg, "fileName", None)
+            or getattr(sub_msg, "title", None)
+        )
+    if msg_type == "audioMessage":
+        return bool(
+            getattr(sub_msg, "mimetype", None)
+            or getattr(sub_msg, "URL", None)
+            or getattr(sub_msg, "url", None)
+            or getattr(sub_msg, "directPath", None)
+            or getattr(sub_msg, "mediaKey", None)
+        )
+    if msg_type == "stickerMessage":
+        return bool(
+            getattr(sub_msg, "mimetype", None)
+            or getattr(sub_msg, "URL", None)
+            or getattr(sub_msg, "url", None)
+            or getattr(sub_msg, "directPath", None)
+            or getattr(sub_msg, "mediaKey", None)
+        )
+    return False
+
+
+def _ctx_has_real_quote_or_mention(ctx) -> bool:
+    """Reject empty protobuf stubs: require a real stanzaId, mention list, or
+    quoted payload that actually carries text/media fields."""
+    if ctx is None:
+        return False
+    sid = (
+        getattr(ctx, "stanzaId", None)
+        or getattr(ctx, "StanzaID", None)
+        or getattr(ctx, "stanzaID", None)
+    )
+    if isinstance(sid, (bytes, bytearray)):
+        sid = sid.decode("utf-8", errors="ignore")
+    if isinstance(sid, str) and sid.strip():
+        return True
+    mj = getattr(ctx, "mentionedJID", None) or getattr(ctx, "MentionedJID", None)
+    if mj:
+        try:
+            if len(mj) > 0:
+                return True
+        except Exception:
+            pass
+    quoted = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
+    if quoted is None:
+        return False
+    # quotedMessage object alone is not enough — it must have content
+    if _safe_str_attr(quoted, "conversation", "Conversation"):
+        return True
+    q_ext = getattr(quoted, "extendedTextMessage", None) or getattr(quoted, "ExtendedTextMessage", None)
+    if q_ext and _safe_str_attr(q_ext, "text", "Text"):
+        return True
+    for kind in (
+        "imageMessage", "ImageMessage",
+        "videoMessage", "VideoMessage",
+        "documentMessage", "DocumentMessage",
+        "audioMessage", "AudioMessage",
+        "stickerMessage", "StickerMessage",
+    ):
+        q_media = getattr(quoted, kind, None)
+        if q_media is None:
+            continue
+        if (
+            getattr(q_media, "mimetype", None)
+            or getattr(q_media, "URL", None)
+            or getattr(q_media, "url", None)
+            or getattr(q_media, "directPath", None)
+            or getattr(q_media, "mediaKey", None)
+            or getattr(q_media, "caption", None)
+            or getattr(q_media, "Caption", None)
+        ):
+            return True
+    return False
+
+
 def get_context_info(msg_obj):
     """Find the real contextInfo on whichever message type is actually populated.
 
-    Two bugs fixed here vs. the previous version:
-    1. Order — stickerMessage was checked FIRST, before extendedTextMessage,
-       even though most real quoted-replies arrive as extendedTextMessage.
-    2. Truthiness — `if sub_msg:` / `if ctx:` treat an UNSET protobuf submessage
-       as truthy (it's still a real object, just with empty fields), so this
-       was very often returning the empty stickerMessage's empty contextInfo
-       and silently ignoring the real one. get_media_kind() already guards
-       against this same gotcha by checking a concrete field
-       (mimetype/URL/etc) instead of the object's truthiness — this does the
-       same thing for contextInfo by requiring an actual populated field
-       (stanzaId, quotedMessage, or mentionedJID) before accepting it.
+    Critical: neonize leaves empty default protobuf objects on every Message
+    field. Those objects are truthy in Python, so we must gate on concrete
+    content (text/mimetype/URL/…) before reading contextInfo — otherwise an
+    empty extendedTextMessage.contextInfo shadows the real quote on
+    audioMessage (voice-note replies looked like has_quote but quoted='').
     """
     if not msg_obj:
         return None
-    for msg_type in ("extendedTextMessage", "imageMessage", "videoMessage",
-                      "documentMessage", "audioMessage", "stickerMessage"):
+    for msg_type in (
+        "extendedTextMessage",
+        "imageMessage",
+        "videoMessage",
+        "documentMessage",
+        "audioMessage",
+        "stickerMessage",
+    ):
         sub_msg = getattr(msg_obj, msg_type, None)
-        if not sub_msg:
+        if not _submsg_has_content(sub_msg, msg_type):
             continue
         for attr in ("contextInfo", "ContextInfo", "context_info"):
             ctx = getattr(sub_msg, attr, None)
             if not ctx:
                 continue
-            if (
-                getattr(ctx, "stanzaId", None) or getattr(ctx, "StanzaID", None)
-                or getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
-                or getattr(ctx, "mentionedJID", None) or getattr(ctx, "MentionedJID", None)
-            ):
+            if _ctx_has_real_quote_or_mention(ctx):
+                try:
+                    log.info("CONTEXT_INFO source=%s", msg_type)
+                except Exception:
+                    pass
                 return ctx
     return None
 
@@ -1820,6 +1919,8 @@ def _safe_str_attr(obj, *names):
     for n in names:
         try:
             v = getattr(obj, n, None)
+            if isinstance(v, (bytes, bytearray)):
+                v = v.decode("utf-8", errors="ignore")
             if isinstance(v, str) and v.strip():
                 return v.strip()
         except Exception:
