@@ -11,6 +11,7 @@ import json
 import os
 import re
 import traceback
+import tempfile
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -391,6 +392,28 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "code": {"type": "string", "description": "Python code (max ~20 lines)"},
                 },
                 "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "note_down",
+            "description": (
+                "Save or append a note to the owner's OneDrive journal. "
+                "Use whenever the user says 'note down'. If they ask for specific formatting "
+                "(e.g., 'concise', 'bullets', 'Urdu'), format the text exactly as requested "
+                "BEFORE calling this tool. Only the owner can use this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The finalized, perfectly formatted text to save."
+                    },
+                },
+                "required": ["content"],
             },
         },
     },
@@ -982,6 +1005,49 @@ def _tool_python_exec(args: dict, ctx: dict) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+def _tool_note_down(args: dict, ctx: dict) -> str:
+    # 1. Strict Owner Check
+    if not _OWNER_SENDER_ID or (
+        str(ctx.get("sender_id")) != str(_OWNER_SENDER_ID)
+        and str(ctx.get("sender_num") or "") != str(_OWNER_SENDER_ID)
+    ):
+        return "Permission denied: Only the bot owner can use the note down feature."
+
+    content = (args.get("content") or "").strip()
+    if not content:
+        return "Empty note. Nothing was saved."
+
+    try:
+        # 2. Format with Date, Time, and 3-line gap
+        # Assuming we use the UTC time context or we can adapt to PKT
+        now_str = datetime.now(timezone.utc).strftime("%A, %Y-%m-%d %I:%M %p UTC")
+        formatted_entry = f"{now_str}\n{content}\n\n\n"
+
+        remote_folder = "MojoAgent"
+        file_name = "Mojo_Notes.txt"
+        remote_path = f"{remote_folder}/{file_name}"
+        local_temp = os.path.join(tempfile.gettempdir(), file_name)
+
+        # 3. Try downloading existing file to append (file_ops.py)
+        existing_content = ""
+        try:
+            if _file_ops.onedrive_configured():
+                dl_path = _file_ops.download_from_onedrive(remote_path, local_temp)
+                with open(dl_path, "r", encoding="utf-8") as f:
+                    existing_content = f.read()
+        except Exception:
+            pass # File likely doesn't exist yet, we will create a new one
+
+        # 4. Append and write back locally
+        new_content = existing_content + formatted_entry
+        _file_ops.write_text_file(new_content, file_name, tempfile.gettempdir())
+
+        # 5. Upload back to OneDrive
+        _file_ops.upload_to_onedrive(local_temp, remote_folder=remote_folder, remote_name=file_name)
+        
+        return "Successfully saved to OneDrive folder MojoAgent."
+    except Exception as e:
+        return f"Failed to save note: {e}"
 
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
@@ -998,6 +1064,7 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "send_message_to": _tool_send_message_to,
     "file_list_onedrive": _tool_file_list_onedrive,
     "python_exec": _tool_python_exec,
+    "note_down": _tool_note_down,
 }
 
 
