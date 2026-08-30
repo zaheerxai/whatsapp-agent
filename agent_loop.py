@@ -111,6 +111,7 @@ def _build_system_prompt(
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
 10. When summarizing a website from browse_url: 2–3 plain lines max. No numbered sections, no markdown.
 11. VOICE: If the turn includes "[Voice note transcript]" or "[Cached recent voice-note transcript]", answer from that text. For "kya bola" / "voice note me kya" / "what did I say" use the transcript — never browse a website and never claim no voice exists when a transcript is present.
+11b. NOTE DOWN + QUOTE: If the user says "note down" / "note kar lo" / "ye cheez note" (voice or text) AND a "[Quoted Message]:" block is present in the same turn, call note_down with that quoted content immediately. Do NOT ask "kis cheez ko note karna hai?" when the quoted text is already provided.
 
 === URL / WEB FACTS (NO HALLUCINATION) ===
 12. Call browse_url ONLY when the CURRENT message has a URL (force_urls / priority note) OR the user clearly asks about a link/site ("details iska", "what is this about" with a link context, "fetch latest repo"). Never browse just because the last topic was a website.

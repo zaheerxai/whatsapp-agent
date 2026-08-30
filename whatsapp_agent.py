@@ -547,8 +547,8 @@ def get_world_clocks():
 
 # Arabic-script block (covers Urdu's Nastaliq letters, which are a superset of
 # standard Arabic + a few extra codepoints in the Arabic Presentation Forms range).
-_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
-
+# Now covers both Arabic/Urdu and Devanagari (Hindi) scripts
+_NON_LATIN_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\u0900-\u097F]")
 
 def transliterate_to_roman_if_needed(text: str) -> str:
     """Normalize Urdu-script text to Roman Urdu (Latin letters).
@@ -562,7 +562,7 @@ def transliterate_to_roman_if_needed(text: str) -> str:
     Skipped entirely (near-zero cost) for English/Roman-Urdu transcripts, which
     contain no Arabic-script characters at all.
     """
-    if not text or not _ARABIC_SCRIPT_RE.search(text):
+    if not text or not _NON_LATIN_SCRIPT_RE.search(text):
         return text
     try:
         resp = client_ai.chat.completions.create(
@@ -1210,9 +1210,13 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             except Exception:
                 pass
 
+            # text_content may already hold [Quoted Message]: ... when the user
+            # replied-to a previous msg with this voice note (e.g. "note down ye
+            # cheez"). Put quote first so the agent can act on the referent
+            # without asking "kis cheez ko?".
             context_str = f"[Voice note transcript]: {transcript}"
             if text_content and text_content.strip():
-                context_str = f"User said: {text_content}\n\n[Quoted Audio Transcript]: {transcript}"
+                context_str = f"{text_content.strip()}\n\n[Voice note transcript]: {transcript}"
 
             transcript_limit = detect_summary_history_limit(transcript)
             if transcript_limit is not None:
@@ -2387,7 +2391,7 @@ def _process_message_inner(client, message):
             is_reply_to_bot = True
             log.info("REACTION quote matched recent bot reply via chat_history")
         elif not quoted_text:
-            # WhatsApp media reactions often drop quote text and participant. 
+            # WhatsApp media reactions often drop quote text and participant.
             # If the quote is opaque, check if the bot was the last to speak.
             # (hist[-1] is the user's current media message since insert_chat_message ran above)
             recent = fetch_chat_history(chat_id, 3)
