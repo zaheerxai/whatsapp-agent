@@ -2374,19 +2374,28 @@ def _process_message_inner(client, message):
 
     REACTION_MEDIA = {"sticker", "image", "gif"}  # optional: add "video" if you want
 
-    has_quote = bool(ctx and getattr(ctx, "quotedMessage", None))
+    has_quote = bool(ctx and (getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)))
 
     # Group: participant is often bot LID — if LID unknown, match quoted text to our last replies
     if (
         not is_reply_to_bot
         and is_group
         and has_quote
-        and quoted_text
-        and media_kind in ("sticker", "image", "gif")
+        and media_kind in REACTION_MEDIA
     ):
-        if quoted_matches_recent_bot_reply(chat_id, quoted_text):
+        if quoted_text and quoted_matches_recent_bot_reply(chat_id, quoted_text):
             is_reply_to_bot = True
             log.info("REACTION quote matched recent bot reply via chat_history")
+        elif not quoted_text:
+            # WhatsApp media reactions often drop quote text and participant. 
+            # If the quote is opaque, check if the bot was the last to speak.
+            # (hist[-1] is the user's current media message since insert_chat_message ran above)
+            recent = fetch_chat_history(chat_id, 3)
+            if len(recent) >= 2 and recent[-2].get("role") == "assistant":
+                is_reply_to_bot = True
+                # Inject the bot's text back in so the LLM knows what they are reacting to!
+                quoted_text = recent[-2].get("content", "")
+                log.info("REACTION inferred from immediate previous bot message due to empty quote payload")
 
     native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
     text_hit = False

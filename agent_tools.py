@@ -495,11 +495,14 @@ def _tool_web_search(args: dict, ctx: dict) -> str:
 
     # Last resort: very light HTML scrape of DDG lite
     try:
-        r = requests.get(
+        r = requests.post(
             "https://lite.duckduckgo.com/lite/",
-            params={"q": query},
+            data={"q": query},
             timeout=12,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
         )
         # crude extract of result snippets
         texts = re.findall(r"<a rel=\"nofollow\"[^>]*>([^<]+)</a>", r.text)
