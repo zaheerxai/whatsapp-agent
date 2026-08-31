@@ -461,14 +461,56 @@ def _tool_search_knowledge(args: dict, ctx: dict) -> str:
     return "\n---\n".join(chunks[: top_k + 3])
 
 
+def _format_search_lines(items: list, num: int) -> str:
+    """Normalize heterogeneous search hits into title / snippet / url lines."""
+    lines = []
+    for item in items[:num]:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or item.get("name") or "").strip()
+        snippet = (
+            item.get("snippet")
+            or item.get("body")
+            or item.get("description")
+            or ""
+        ).strip()
+        link = (
+            item.get("link")
+            or item.get("href")
+            or item.get("url")
+            or ""
+        ).strip()
+        if not (title or snippet or link):
+            continue
+        block = f"• {title}" if title else "•"
+        if snippet:
+            block += f"\n  {snippet[:280]}"
+        if link.startswith("http"):
+            block += f"\n  {link}"
+        lines.append(block)
+    return "\n\n".join(lines)
+
+
 def _tool_web_search(args: dict, ctx: dict) -> str:
+    """Multi-backend web search. Order:
+    1) Serper (if SERPER_API_KEY) — Google-quality, paid free-tier
+    2) ddgs library — multi-engine (bing/brave/ddg/…), no API key
+    3) DuckDuckGo Instant Answer JSON — weak for company/LinkedIn queries
+    4) html.duckduckgo.com / lite.duckduckgo.com — last-resort HTML
+
+    Previous failure mode (logs 2026-08-31): no Serper key → Instant Answer
+    empty for "iSeeWaves LinkedIn" → lite.duckduckgo.com ConnectTimeout from
+    the host. Never fall through was also a bug when Serper raised.
+    """
     query = (args.get("query") or "").strip()
     num = min(max(int(args.get("num_results") or 5), 1), 8)
     if not query:
         return "Empty query."
 
-    # Prefer Serper if key present, else DuckDuckGo Instant Answer + HTML fallback
-    serper_key = os.getenv("SERPER_API_KEY")
+    errors: list = []
+
+    # 1) Serper — only if configured; on failure CONTINUE (do not return)
+    serper_key = (os.getenv("SERPER_API_KEY") or "").strip()
     if serper_key:
         try:
             r = requests.post(
@@ -484,15 +526,65 @@ def _tool_web_search(args: dict, ctx: dict) -> str:
                 title = item.get("title", "")
                 snippet = item.get("snippet", "")
                 link = item.get("link", "")
-                lines.append(f"• {title}\n  {snippet}\n  {link}")
+                lines.append(f"• {title}\n  {snippet}\n  {link}".rstrip())
             if data.get("answerBox"):
                 ab = data["answerBox"]
-                lines.insert(0, f"Answer box: {ab.get('answer') or ab.get('snippet') or ''}")
-            return "\n\n".join(lines) if lines else "No results."
+                lines.insert(
+                    0,
+                    f"Answer box: {ab.get('answer') or ab.get('snippet') or ''}",
+                )
+            if lines:
+                return "\n\n".join(lines)
+            errors.append("serper: empty organic")
         except Exception as e:
-            return f"Serper search failed: {e}"
+            errors.append(f"serper: {e}")
+            print(f"[web_search serper] {e}")
 
-    # DuckDuckGo Instant Answer API (no key)
+    # 2) ddgs (pip install ddgs) — robust multi-backend, no key
+    #    Verified: returns real linkedin.com URLs for company queries.
+    try:
+        from ddgs import DDGS  # type: ignore
+
+        results = []
+        weak_candidate = None
+        # Prefer google — auto/bing often return unrelated hits for brand queries.
+        # Fall through backends on empty or exception (rate limits / blocks).
+        q_tokens = [t.lower() for t in query.split() if len(t) > 2]
+        for backend in ("google", "bing,brave", "duckduckgo", "auto"):
+            try:
+                results = list(
+                    DDGS().text(query, max_results=num, backend=backend)
+                ) or []
+            except TypeError:
+                try:
+                    with DDGS() as ddgs:
+                        results = list(
+                            ddgs.text(query, max_results=num, backend=backend)
+                        ) or []
+                except TypeError:
+                    results = list(DDGS().text(query, max_results=num)) or []
+            except Exception as be:
+                print(f"[web_search ddgs backend={backend}] {be}")
+                results = []
+            formatted = _format_search_lines(results, num)
+            if not formatted:
+                continue
+            low = formatted.lower()
+            if not q_tokens or any(t in low for t in q_tokens):
+                return formatted
+            # Unrelated SERP noise — keep as last resort, try next backend
+            weak_candidate = formatted
+            errors.append(f"ddgs:{backend}: weak match")
+        if weak_candidate:
+            return weak_candidate
+        errors.append("ddgs: empty results on all backends")
+    except ImportError:
+        errors.append("ddgs: not installed (pip install ddgs)")
+    except Exception as e:
+        errors.append(f"ddgs: {e}")
+        print(f"[web_search ddgs] {e}")
+
+    # 3) DuckDuckGo Instant Answer — often empty for company/LinkedIn queries
     try:
         r = requests.get(
             "https://api.duckduckgo.com/",
@@ -503,65 +595,118 @@ def _tool_web_search(args: dict, ctx: dict) -> str:
         data = r.json()
         parts = []
         if data.get("AbstractText"):
-            parts.append(f"Abstract: {data['AbstractText']}\nSource: {data.get('AbstractURL', '')}")
+            parts.append(
+                f"Abstract: {data['AbstractText']}\nSource: {data.get('AbstractURL', '')}"
+            )
         for topic in (data.get("RelatedTopics") or [])[:num]:
             if isinstance(topic, dict) and topic.get("Text"):
-                parts.append(f"• {topic['Text']}")
+                url = ""
+                if topic.get("FirstURL"):
+                    url = f"\n  {topic['FirstURL']}"
+                parts.append(f"• {topic['Text']}{url}")
             elif isinstance(topic, dict) and "Topics" in topic:
                 for t in topic["Topics"][:2]:
                     if t.get("Text"):
                         parts.append(f"• {t['Text']}")
         if parts:
             return "\n".join(parts)
+        errors.append("ddg-ia: empty")
     except Exception as e:
-        print(f"[web_search DDG] {e}")
+        errors.append(f"ddg-ia: {e}")
+        print(f"[web_search DDG-IA] {e}")
 
-    # Last resort: very light HTML scrape of DDG lite
-    try:
-        r = requests.post(
-            "https://lite.duckduckgo.com/lite/",
-            data={"q": query},
-            timeout=12,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-        )
-        # Prefer anchors that carry an href so the model can return real links
-        # (title-only matches were why "iSeeWaves LinkedIn" searches never
-        # produced a usable linkedin.com URL in the reply).
-        pairs = re.findall(
-            r'<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
-            r.text,
-            flags=re.I,
-        )
-        if not pairs:
-            pairs = [
-                ("", t) for t in re.findall(r'<a rel="nofollow"[^>]*>([^<]+)</a>', r.text)
-            ]
-        snippets = re.findall(r'class="result-snippet"[^>]*>([^<]+)', r.text)
-        lines = []
-        for i, (href, title) in enumerate(pairs[:num]):
-            sn = snippets[i] if i < len(snippets) else ""
-            href = (href or "").strip()
-            # DDG lite often wraps targets as //duckduckgo.com/l/?uddg=<url>
-            if "uddg=" in href:
-                try:
-                    from urllib.parse import parse_qs, urlparse, unquote
-                    qs = parse_qs(urlparse(href).query)
-                    if qs.get("uddg"):
-                        href = unquote(qs["uddg"][0])
-                except Exception:
-                    pass
-            block = f"• {title.strip()}"
-            if sn.strip():
-                block += f"\n  {sn.strip()}"
-            if href.startswith("http"):
-                block += f"\n  {href}"
-            lines.append(block)
-        return "\n\n".join(lines) if lines else "No results found."
-    except Exception as e:
-        return f"Web search unavailable right now ({e})."
+    # 4) HTML endpoints last (often blocked / slow from datacenter hosts)
+    from urllib.parse import parse_qs, urlparse, unquote
+
+    def _unwrap_ddg_href(href: str) -> str:
+        href = (href or "").strip()
+        if "uddg=" in href:
+            try:
+                qs = parse_qs(urlparse(href).query)
+                if qs.get("uddg"):
+                    return unquote(qs["uddg"][0])
+            except Exception:
+                pass
+        return href
+
+    for endpoint, method in (
+        ("https://html.duckduckgo.com/html/", "POST"),
+        ("https://lite.duckduckgo.com/lite/", "POST"),
+    ):
+        try:
+            if method == "POST":
+                r = requests.post(
+                    endpoint,
+                    data={"q": query},
+                    timeout=12,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                )
+            else:
+                r = requests.get(
+                    endpoint,
+                    params={"q": query},
+                    timeout=12,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                    },
+                )
+            r.raise_for_status()
+            pairs = re.findall(
+                r'<a[^>]+href="([^"]+)"[^>]*rel="nofollow"[^>]*>([^<]+)</a>',
+                r.text,
+                flags=re.I,
+            )
+            if not pairs:
+                pairs = re.findall(
+                    r'<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
+                    r.text,
+                    flags=re.I,
+                )
+            if not pairs:
+                pairs = re.findall(
+                    r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                    r.text,
+                    flags=re.I | re.S,
+                )
+            snippets = re.findall(
+                r'class="result(?:__|-)?snippet"[^>]*>([^<]+)', r.text, flags=re.I
+            )
+            lines = []
+            for i, (href, title) in enumerate(pairs[:num]):
+                title = re.sub(r"<[^>]+>", "", title).strip()
+                sn = snippets[i] if i < len(snippets) else ""
+                href = _unwrap_ddg_href(href)
+                if not title and not href:
+                    continue
+                block = f"• {title}" if title else "•"
+                if sn.strip():
+                    block += f"\n  {sn.strip()}"
+                if href.startswith("http"):
+                    block += f"\n  {href}"
+                lines.append(block)
+            if lines:
+                return "\n\n".join(lines)
+            errors.append(f"{endpoint}: no parseable results")
+        except Exception as e:
+            errors.append(f"{endpoint}: {e}")
+            print(f"[web_search html] {endpoint} {e}")
+
+    err_summary = "; ".join(errors[:4]) if errors else "unknown"
+    return (
+        "Web search unavailable right now "
+        f"({err_summary}). Tip: set SERPER_API_KEY or ensure `ddgs` is installed."
+    )
 
 
 def _github_user_from_url(url: str) -> Optional[str]:

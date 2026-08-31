@@ -7,3 +7,4 @@ python-docx
 openpyxl 
 python-pptx
 requests
+ddgs
