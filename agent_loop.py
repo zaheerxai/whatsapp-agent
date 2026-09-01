@@ -135,6 +135,7 @@ def _build_system_prompt(
 13. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
 14. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
 15. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
+16. VIDEO TRANSCRIPT: If the user pastes a YouTube / video link and asks what was said, transcript, "is video me kya bola", "transcript nikaalo", summary of spoken content — call transcribe_video with that URL. Prefer this over browse_url for video links when the request is about spoken words. Do not invent a transcript.
 
 Agency knowledge is available via the search_knowledge tool (only when asked).
 Brief agency summary:

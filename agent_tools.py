@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import traceback
 import tempfile
 from datetime import datetime, timezone, timedelta
@@ -414,6 +415,43 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transcribe_video",
+            "description": (
+                "Get the spoken transcript of a public video from a link (YouTube, Vimeo, "
+                "TikTok, direct video URL, etc.). First tries existing captions (YouTube) for "
+                "speed; if none exist, downloads audio and runs speech-to-text. "
+                "Use when the user pastes a video link and asks what was said, transcript, "
+                "summary of spoken content, 'is video me kya bola', 'transcript nikaalo', etc. "
+                "Do NOT use for voice notes already transcribed in the chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full public video URL (YouTube, youtu.be, Vimeo, etc.)",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": (
+                            "Preferred language code e.g. en, ur, hi, auto. "
+                            "Default auto / best available."
+                        ),
+                        "default": "auto",
+                    },
+                    "timestamps": {
+                        "type": "boolean",
+                        "description": "If true, include [MM:SS] timestamps per segment",
+                        "default": False,
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
@@ -1219,6 +1257,343 @@ def _tool_note_down(args: dict, ctx: dict) -> str:
     except Exception as e:
         return f"Failed to save note: {e}"
 
+
+# ---------------------------------------------------------------------------
+# Video transcription (YouTube captions → yt-dlp + Groq Whisper fallback)
+# ---------------------------------------------------------------------------
+
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})"
+)
+# Soft in-process cache: url+lang+ts → (text, expiry_ts). Keeps repeated asks cheap.
+_TRANSCRIPT_CACHE: Dict[str, tuple] = {}
+_TRANSCRIPT_CACHE_TTL = 3600  # 1 hour
+_TRANSCRIPT_CACHE_MAX = 24
+# Safety caps for cloud (Render) — avoid huge downloads / Groq 25 MB limit
+_MAX_ASR_SECONDS = 45 * 60  # 45 min hard cap
+_TARGET_AUDIO_BITRATE = "48k"  # mono speech is fine at 48 kbps
+_GROQ_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    m = _YT_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _cache_key(url: str, language: str, timestamps: bool) -> str:
+    return f"{url.strip().lower()}|{language or 'auto'}|{int(bool(timestamps))}"
+
+
+def _cache_get(key: str) -> Optional[str]:
+    entry = _TRANSCRIPT_CACHE.get(key)
+    if not entry:
+        return None
+    text, exp = entry
+    if time.time() > exp:
+        _TRANSCRIPT_CACHE.pop(key, None)
+        return None
+    return text
+
+
+def _cache_set(key: str, text: str) -> None:
+    if len(_TRANSCRIPT_CACHE) >= _TRANSCRIPT_CACHE_MAX:
+        # Drop oldest by expiry
+        oldest = min(_TRANSCRIPT_CACHE.items(), key=lambda kv: kv[1][1])
+        _TRANSCRIPT_CACHE.pop(oldest[0], None)
+    _TRANSCRIPT_CACHE[key] = (text, time.time() + _TRANSCRIPT_CACHE_TTL)
+
+
+def _format_segments(segments: List[dict], with_timestamps: bool) -> str:
+    """segments: list of {text, start?, duration?}"""
+    lines = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        if with_timestamps and seg.get("start") is not None:
+            s = float(seg["start"])
+            mm, ss = divmod(int(s), 60)
+            hh, mm = divmod(mm, 60)
+            if hh:
+                ts = f"[{hh:02d}:{mm:02d}:{ss:02d}]"
+            else:
+                ts = f"[{mm:02d}:{ss:02d}]"
+            lines.append(f"{ts} {text}")
+        else:
+            lines.append(text)
+    if with_timestamps:
+        return "\n".join(lines)
+    # collapse whitespace for plain transcript
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def _try_youtube_captions(
+    video_id: str, language: str, with_timestamps: bool
+) -> Optional[str]:
+    """Return formatted transcript or None if captions unavailable / blocked."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api._errors import (
+            TranscriptsDisabled,
+            NoTranscriptFound,
+            VideoUnavailable,
+        )
+    except ImportError:
+        return None
+
+    # Language priority: requested → Urdu/Hindi/English → any
+    lang = (language or "auto").strip().lower()
+    if lang in ("", "auto"):
+        preferred = ["en", "ur", "hi", "en-US", "en-GB"]
+    else:
+        preferred = [lang, "en", "ur", "hi"]
+
+    try:
+        # New-style API (v1.x+)
+        ytt = YouTubeTranscriptApi()
+        try:
+            fetched = ytt.fetch(video_id, languages=preferred)
+            segs = [
+                {"text": sn.text, "start": sn.start, "duration": sn.duration}
+                for sn in fetched
+            ]
+            return _format_segments(segs, with_timestamps)
+        except Exception:
+            # Older static API fallback
+            if hasattr(YouTubeTranscriptApi, "get_transcript"):
+                raw = YouTubeTranscriptApi.get_transcript(video_id, languages=preferred)
+                return _format_segments(raw, with_timestamps)
+            raise
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
+        return None
+    except Exception as e:
+        # IP blocks / transient — fall through to ASR
+        print(f"[transcribe_video] youtube-transcript-api failed: {e}")
+        return None
+
+
+def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
+    """
+    Download best audio, convert to mono 48k mp3.
+    Returns (path_to_mp3, duration_seconds).
+    Raises on hard failure.
+    """
+    try:
+        import yt_dlp
+    except ImportError as e:
+        raise RuntimeError(
+            "yt-dlp is not installed. Add 'yt-dlp' to requirements and redeploy."
+        ) from e
+
+    outtmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        # Prefer shorter extract when possible
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "48",
+            }
+        ],
+        # Soft duration filter (skip if known longer than hard cap + buffer)
+        "match_filter": lambda info, *, incomplete: (
+            "Video too long for transcription "
+            f"(>{_MAX_ASR_SECONDS // 60} min)"
+            if (info.get("duration") or 0) > _MAX_ASR_SECONDS + 30
+            else None
+        ),
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if not info:
+            raise RuntimeError("yt-dlp returned no info for this URL.")
+        duration = float(info.get("duration") or 0)
+        vid = info.get("id") or "audio"
+        # After FFmpegExtractAudio the file is .mp3
+        mp3_path = os.path.join(out_dir, f"{vid}.mp3")
+        if not os.path.isfile(mp3_path):
+            # Fallback: find any audio-like file yt-dlp wrote
+            candidates = [
+                os.path.join(out_dir, f)
+                for f in os.listdir(out_dir)
+                if f.startswith(vid)
+            ]
+            if not candidates:
+                raise RuntimeError("Audio download finished but no file found.")
+            mp3_path = candidates[0]
+        return mp3_path, duration
+
+
+def _reencode_if_needed(src_path: str, work_dir: str) -> str:
+    """Ensure mono low-bitrate mp3 under Groq size limit. Returns path to use."""
+    size = os.path.getsize(src_path)
+    if size <= _GROQ_MAX_UPLOAD_BYTES and src_path.lower().endswith(".mp3"):
+        return src_path
+
+    out = os.path.join(work_dir, "audio_48k_mono.mp3")
+    # ffmpeg already confirmed present in environment at install time
+    import subprocess
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        src_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        _TARGET_AUDIO_BITRATE,
+        "-t",
+        str(_MAX_ASR_SECONDS),
+        out,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not os.path.isfile(out):
+        raise RuntimeError(f"ffmpeg re-encode failed: {proc.stderr[-400:]}")
+    return out
+
+
+def _transcribe_with_groq(audio_path: str, language: str) -> str:
+    """Use the same Groq Whisper client already used for voice notes."""
+    if _client_ai is None:
+        raise RuntimeError("AI client not initialised — cannot run Whisper.")
+
+    # Model matches whatsapp_agent.WHISPER_MODEL
+    model = os.getenv("WHISPER_MODEL", "whisper-large-v3-turbo")
+    lang = (language or "").strip().lower()
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "response_format": "verbose_json",  # segments with timestamps
+    }
+    if lang and lang not in ("auto", ""):
+        kwargs["language"] = lang
+
+    with open(audio_path, "rb") as f:
+        result = _client_ai.audio.transcriptions.create(file=f, **kwargs)
+
+    # verbose_json → object with .text and .segments
+    if hasattr(result, "segments") and result.segments:
+        segs = []
+        for s in result.segments:
+            segs.append(
+                {
+                    "text": getattr(s, "text", "") or "",
+                    "start": getattr(s, "start", 0.0),
+                    "duration": (getattr(s, "end", 0.0) or 0) - (getattr(s, "start", 0.0) or 0),
+                }
+            )
+        return _format_segments(segs, with_timestamps=True)  # always keep ts internally; caller decides
+    return (getattr(result, "text", None) or str(result) or "").strip()
+
+
+def _tool_transcribe_video(args: dict, ctx: dict) -> str:
+    url = (args.get("url") or "").strip()
+    language = (args.get("language") or "auto").strip().lower() or "auto"
+    with_ts = bool(args.get("timestamps"))
+
+    if not url:
+        return "URL required. Example: https://www.youtube.com/watch?v=..."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    cache_k = _cache_key(url, language, with_ts)
+    cached = _cache_get(cache_k)
+    if cached:
+        return cached
+
+    # --- 1. YouTube captions (fast path) ---
+    yt_id = _extract_youtube_id(url)
+    if yt_id:
+        text = _try_youtube_captions(yt_id, language, with_ts)
+        if text:
+            # Soft length guard for WhatsApp / LLM context
+            if len(text) > 12000:
+                text = text[:12000] + "\n… [transcript truncated]"
+            header = f"Source: YouTube captions (video {yt_id})\n\n"
+            out = header + text
+            _cache_set(cache_k, out)
+            return out
+
+    # --- 2. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
+    try:
+        with tempfile.TemporaryDirectory(prefix="mojo_vid_") as tmp:
+            try:
+                audio_path, duration = _download_audio_ytdlp(url, tmp)
+            except Exception as e:
+                msg = str(e)
+                if "too long" in msg.lower():
+                    return (
+                        f"Video is longer than {_MAX_ASR_SECONDS // 60} minutes — "
+                        "transcription limit for safety/cost. Try a shorter clip or "
+                        "ask for a specific section."
+                    )
+                return (
+                    f"Could not download audio from this link ({msg}). "
+                    "Is the video public and supported by yt-dlp?"
+                )
+
+            if duration and duration > _MAX_ASR_SECONDS + 5:
+                return (
+                    f"Video is ~{int(duration // 60)} min long. "
+                    f"Max supported is {_MAX_ASR_SECONDS // 60} min."
+                )
+
+            try:
+                audio_path = _reencode_if_needed(audio_path, tmp)
+            except Exception as e:
+                return f"Audio prepare failed (ffmpeg): {e}"
+
+            size = os.path.getsize(audio_path)
+            if size > _GROQ_MAX_UPLOAD_BYTES:
+                return (
+                    f"Audio still too large after compression ({size // (1024*1024)} MB). "
+                    "Try a shorter video."
+                )
+
+            try:
+                raw = _transcribe_with_groq(audio_path, language)
+            except Exception as e:
+                return f"Speech-to-text failed: {e}"
+
+            if not raw or not raw.strip():
+                return "Transcription returned empty text (silent video or unsupported language)."
+
+            # If caller did not want timestamps, strip them
+            if not with_ts and raw.lstrip().startswith("["):
+                # remove [MM:SS] / [HH:MM:SS] prefixes
+                cleaned = re.sub(
+                    r"(?m)^\[\d{1,2}(?::\d{2}){1,2}\]\s*",
+                    "",
+                    raw,
+                )
+                text = re.sub(r"\s+", " ", cleaned).strip()
+            else:
+                text = raw.strip()
+
+            if len(text) > 12000:
+                text = text[:12000] + "\n… [transcript truncated]"
+
+            header = "Source: speech-to-text (audio download)\n\n"
+            out = header + text
+            _cache_set(cache_k, out)
+            return out
+    except Exception as e:
+        traceback.print_exc()
+        return f"transcribe_video failed: {e}"
+
+
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
     "web_search": _tool_web_search,
@@ -1235,6 +1610,7 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "file_list_onedrive": _tool_file_list_onedrive,
     "python_exec": _tool_python_exec,
     "note_down": _tool_note_down,
+    "transcribe_video": _tool_transcribe_video,
 }
 
 
@@ -1249,5 +1625,4 @@ def execute_tool(name: str, arguments: dict, ctx: dict) -> str:
         return f"Tool {name} raised: {e}"
 
 
-# late import for time used in set_reminder
-import time  # noqa: E402
+# time is imported at module top (used by set_reminder + transcript cache)

@@ -8,3 +8,5 @@ openpyxl
 python-pptx
 requests
 ddgs
+youtube-transcript-api
+yt-dlp
