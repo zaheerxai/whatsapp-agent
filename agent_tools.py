@@ -1372,6 +1372,50 @@ def _try_youtube_captions(
         return None
 
 
+def _resolve_short_url(url: str) -> str:
+    """Follow redirects for short links (vt.tiktok.com, vm.tiktok.com, bit.ly, etc.)."""
+    try:
+        # TikTok short links often need a real browser-like UA or they return a
+        # challenge / different landing page.
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = requests.get(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=12,
+            stream=True,  # don't download body
+        )
+        final = (r.url or url).split("?")[0]
+        # Prefer the canonical www.tiktok.com/@user/video/ID form when possible
+        if "tiktok.com" in final and "/video/" in final:
+            return final
+        return final or url
+    except Exception:
+        return url
+
+
+def _is_tiktok_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(
+        h in u
+        for h in (
+            "tiktok.com",
+            "vt.tiktok.com",
+            "vm.tiktok.com",
+            "tiktokv.com",
+            "musical.ly",
+        )
+    )
+
+
 def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
     """
     Download best audio, convert to mono 48k mp3.
@@ -1385,8 +1429,17 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
             "yt-dlp is not installed. Add 'yt-dlp' to requirements and redeploy."
         ) from e
 
+    # Resolve short links first (especially TikTok vt./vm.)
+    original = url
+    if any(x in url.lower() for x in ("vt.tiktok.", "vm.tiktok.", "tiktokv.com")):
+        url = _resolve_short_url(url)
+        if url != original:
+            print(f"[transcribe_video] resolved short URL → {url}")
+
     outtmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
-    ydl_opts = {
+
+    # Common options
+    base_opts: Dict[str, Any] = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "quiet": True,
@@ -1394,8 +1447,8 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
         "noprogress": True,
         "noplaylist": True,
         "socket_timeout": 30,
-        "retries": 2,
-        # Prefer shorter extract when possible
+        "retries": 3,
+        "fragment_retries": 3,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -1403,34 +1456,72 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
                 "preferredquality": "48",
             }
         ],
-        # Soft duration filter (skip if known longer than hard cap + buffer)
         "match_filter": lambda info, *, incomplete: (
             "Video too long for transcription "
             f"(>{_MAX_ASR_SECONDS // 60} min)"
             if (info.get("duration") or 0) > _MAX_ASR_SECONDS + 30
             else None
         ),
+        # Critical for TikTok (Aug 2026+): missing Referer triggers
+        # "Unexpected response from webpage request"
+        "http_headers": {
+            "Referer": "https://www.tiktok.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+        },
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not info:
-            raise RuntimeError("yt-dlp returned no info for this URL.")
-        duration = float(info.get("duration") or 0)
-        vid = info.get("id") or "audio"
-        # After FFmpegExtractAudio the file is .mp3
-        mp3_path = os.path.join(out_dir, f"{vid}.mp3")
-        if not os.path.isfile(mp3_path):
-            # Fallback: find any audio-like file yt-dlp wrote
-            candidates = [
-                os.path.join(out_dir, f)
-                for f in os.listdir(out_dir)
-                if f.startswith(vid)
-            ]
-            if not candidates:
-                raise RuntimeError("Audio download finished but no file found.")
-            mp3_path = candidates[0]
-        return mp3_path, duration
+    # TikTok-specific: try mobile API path first when possible; also keep
+    # webpage path with proper headers. Latest yt-dlp (2026.08.19+) fixed
+    # the challenge + referer issues.
+    if _is_tiktok_url(url):
+        base_opts["extractor_args"] = {
+            "tiktok": {
+                # Prefer mobile app-style extraction when web is blocked
+                "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"],
+            }
+        }
+
+    last_err: Optional[Exception] = None
+    # Two attempts: (1) with TikTok-friendly headers, (2) plain fallback
+    attempt_opts = [base_opts]
+    if _is_tiktok_url(url):
+        # Second attempt: strip extractor_args, keep only referer (web path)
+        fallback = dict(base_opts)
+        fallback.pop("extractor_args", None)
+        attempt_opts.append(fallback)
+
+    for opts in attempt_opts:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    raise RuntimeError("yt-dlp returned no info for this URL.")
+                duration = float(info.get("duration") or 0)
+                vid = info.get("id") or "audio"
+                mp3_path = os.path.join(out_dir, f"{vid}.mp3")
+                if not os.path.isfile(mp3_path):
+                    candidates = [
+                        os.path.join(out_dir, f)
+                        for f in os.listdir(out_dir)
+                        if f.startswith(str(vid))
+                    ]
+                    if not candidates:
+                        raise RuntimeError("Audio download finished but no file found.")
+                    mp3_path = candidates[0]
+                return mp3_path, duration
+        except Exception as e:
+            last_err = e
+            err_s = str(e).lower()
+            # Retry only on the known TikTok webpage challenge
+            if "unexpected response from webpage" not in err_s and "tiktok" not in err_s:
+                break
+            print(f"[transcribe_video] yt-dlp attempt failed, retrying: {e}")
+
+    raise RuntimeError(str(last_err) if last_err else "yt-dlp download failed")
 
 
 def _reencode_if_needed(src_path: str, work_dir: str) -> str:
@@ -1533,15 +1624,23 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 audio_path, duration = _download_audio_ytdlp(url, tmp)
             except Exception as e:
                 msg = str(e)
-                if "too long" in msg.lower():
+                low = msg.lower()
+                if "too long" in low:
                     return (
                         f"Video is longer than {_MAX_ASR_SECONDS // 60} minutes — "
                         "transcription limit for safety/cost. Try a shorter clip or "
                         "ask for a specific section."
                     )
+                if "tiktok" in low or "unexpected response from webpage" in low:
+                    return (
+                        "TikTok video se audio nahi nikal saka — TikTok abhi yt-dlp "
+                        "ko block / challenge kar raha hai (common temporary issue). "
+                        "YouTube link try karo, ya video download karke voice note "
+                        "bhej do to main transcribe kar sakta hoon."
+                    )
                 return (
-                    f"Could not download audio from this link ({msg}). "
-                    "Is the video public and supported by yt-dlp?"
+                    f"Could not download audio from this link ({msg[:180]}). "
+                    "Is the video public and supported?"
                 )
 
             if duration and duration > _MAX_ASR_SECONDS + 5:

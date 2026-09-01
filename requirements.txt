@@ -9,4 +9,4 @@ python-pptx
 requests
 ddgs
 youtube-transcript-api
-yt-dlp
+yt-dlp[default,curl-cffi]>=2026.8.19
