@@ -423,11 +423,13 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "transcribe_video",
             "description": (
-                "Get the spoken transcript of a public video from a link (YouTube, Vimeo, "
-                "TikTok, direct video URL, etc.). First tries existing captions (YouTube) for "
-                "speed; if none exist, downloads audio and runs speech-to-text. "
-                "Use when the user pastes a video link and asks what was said, transcript, "
-                "summary of spoken content, 'is video me kya bola', 'transcript nikaalo', etc. "
+                "Get spoken content from a public video link (YouTube, TikTok, Vimeo, etc.). "
+                "Use when user asks for transcript / summary / key points / 'is video me kya bola'. "
+                "Set mode from user intent: "
+                "'transcript' if they said transcript/full text/'poora transcript'/'likh ke do'; "
+                "'summary' if they said summary/khulasa/'short me batao'/'is about kya'; "
+                "'key_points' if they want bullets/points only. "
+                "Default 'transcript' when ambiguous. "
                 "Do NOT use for voice notes already transcribed in the chat."
             ),
             "parameters": {
@@ -436,6 +438,16 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "url": {
                         "type": "string",
                         "description": "Full public video URL (YouTube, youtu.be, Vimeo, etc.)",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["transcript", "summary", "key_points"],
+                        "description": (
+                            "transcript = cleaned spoken text (default when user says transcript). "
+                            "summary = short overview. "
+                            "key_points = bullet list only."
+                        ),
+                        "default": "transcript",
                     },
                     "language": {
                         "type": "string",
@@ -447,7 +459,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "timestamps": {
                         "type": "boolean",
-                        "description": "If true, include [MM:SS] timestamps per segment",
+                        "description": "If true, include [MM:SS] timestamps (transcript mode)",
                         "default": False,
                     },
                 },
@@ -1570,6 +1582,138 @@ def _clean_raw_transcript(text: str) -> str:
     return text.strip()
 
 
+def _has_arabic_or_devanagari(text: str) -> bool:
+    for ch in text[:4000]:
+        o = ord(ch)
+        # Arabic / Urdu Nastaliq block or Devanagari
+        if 0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F or 0x0900 <= o <= 0x097F:
+            return True
+    return False
+
+
+def _refine_transcript_compact(
+    raw: str, title: str = "", mode: str = "transcript"
+) -> str:
+    """
+    One cheap LLM pass → WhatsApp-ready text.
+
+    mode:
+      - transcript: cleaned continuous speech text (Roman Urdu when source is Hindi/Urdu)
+      - summary: short overview only
+      - key_points: bullet list only
+
+    Keeps agent context small (no 50k dump → no 413 / token burn).
+    """
+    if not raw or not raw.strip():
+        return raw
+
+    mode = (mode or "transcript").strip().lower()
+    if mode not in ("transcript", "summary", "key_points"):
+        mode = "transcript"
+
+    cleaned = _clean_raw_transcript(raw)
+    if _client_ai is None or not _MODEL_NAME:
+        return cleaned[:3000] + ("…" if len(cleaned) > 3000 else "")
+
+    # Cap refiner input for cost
+    if len(cleaned) > 18000:
+        cleaned = (
+            cleaned[:12000]
+            + "\n\n[...middle omitted for length...]\n\n"
+            + cleaned[-5000:]
+        )
+
+    script_rule = (
+        "OUTPUT SCRIPT: Roman Urdu only (Latin letters). "
+        "Transliterate any Hindi/Urdu/Devanagari/Arabic script. "
+        "Do NOT output Devanagari or Arabic letters at all."
+    )
+    if not _has_arabic_or_devanagari(cleaned):
+        script_rule = (
+            "OUTPUT SCRIPT: keep Latin script (English or Roman Urdu as in source). "
+            "Do not switch to Devanagari/Arabic."
+        )
+
+    if mode == "summary":
+        format_rule = (
+            "MODE=summary. Output ONLY:\n"
+            "- 1 line title if known\n"
+            "- 5–10 short lines covering what the video is about and main arguments\n"
+            "Hard limit: under 1200 characters. No bullets required. No code fences."
+        )
+        max_tok, hard_cap = 600, 1400
+    elif mode == "key_points":
+        format_rule = (
+            "MODE=key_points. Output ONLY:\n"
+            "- 1 line title if known\n"
+            "- 8–15 short bullet lines (use '- ') with the main ideas / quotes\n"
+            "Hard limit: under 1400 characters. No long paragraphs. No code fences."
+        )
+        max_tok, hard_cap = 700, 1600
+    else:  # transcript
+        format_rule = (
+            "MODE=transcript. Output the spoken content as clean readable text "
+            "(paragraphs ok). Remove music tags and noise. Keep meaning faithful. "
+            "If the source is very long, cover the whole talk in compressed but still "
+            "speech-like form (not a meta-summary). "
+            "Hard limit: under 3200 characters. If truncated, end with "
+            "'(transcript long hai — specific hissa chahiye to batao)'. "
+            "No code fences. No 'Key points' section."
+        )
+        max_tok, hard_cap = 1400, 3500
+
+    system = (
+        "You prepare video transcripts for WhatsApp. Be faithful. No fluff.\n"
+        f"{script_rule}\n"
+        f"{format_rule}"
+    )
+    user = (f"Title: {title}\n\n" if title else "") + "Raw transcript:\n" + cleaned
+
+    try:
+        resp = _client_ai.chat.completions.create(
+            model=_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=max_tok,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        if not out:
+            return cleaned[:hard_cap]
+        if _has_arabic_or_devanagari(out):
+            # Model ignored Roman-Urdu rule — force a second tiny pass or trim latin-only fail
+            print("[transcribe_video] refine returned non-Latin script, retrying")
+            try:
+                resp2 = _client_ai.chat.completions.create(
+                    model=_MODEL_NAME,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Transliterate the following into Roman Urdu "
+                                "(Latin letters only). Keep meaning. No Devanagari."
+                            ),
+                        },
+                        {"role": "user", "content": out[:3500]},
+                    ],
+                    temperature=0.1,
+                    max_tokens=max_tok,
+                )
+                out2 = (resp2.choices[0].message.content or "").strip()
+                if out2 and not _has_arabic_or_devanagari(out2):
+                    out = out2
+            except Exception as e2:
+                print(f"[transcribe_video] transliterate retry failed: {e2}")
+        if len(out) > hard_cap:
+            out = out[:hard_cap].rstrip() + "…"
+        return out
+    except Exception as e:
+        print(f"[transcribe_video] refine failed: {e}")
+        return cleaned[:hard_cap] + ("…" if len(cleaned) > hard_cap else "")
+
+
 def _try_piped_captions(
     video_id: str, language: str, with_timestamps: bool
 ) -> Optional[str]:
@@ -2034,32 +2178,36 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     url = (args.get("url") or "").strip()
     language = (args.get("language") or "auto").strip().lower() or "auto"
     with_ts = bool(args.get("timestamps"))
+    mode = (args.get("mode") or "transcript").strip().lower() or "transcript"
+    if mode not in ("transcript", "summary", "key_points"):
+        mode = "transcript"
 
     if not url:
         return "URL required. Example: https://www.youtube.com/watch?v=..."
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    cache_k = _cache_key(url, language, with_ts)
+    # Include mode in cache so summary ≠ transcript
+    cache_k = _cache_key(f"{url}|{mode}", language, with_ts)
     cached = _cache_get(cache_k)
     if cached:
         return cached
 
     yt_id = _extract_youtube_id(url)
 
-    # Soft cap for tool payload (agent_loop has a higher OBS cap for this tool).
-    # Keep enough for a 1h talk so the model can summarize accurately.
-    _TRANSCRIPT_SOFT_CAP = 50000
-
     def _pack(source: str, body: str) -> str:
-        body = _clean_raw_transcript(body)
-        if len(body) > _TRANSCRIPT_SOFT_CAP:
-            body = (
-                body[:_TRANSCRIPT_SOFT_CAP]
-                + "\n… [transcript continues — summarize available portion; "
-                "offer more detail on a section if user asks]"
-            )
-        out = f"Source: {source}\n\n{body}"
+        """
+        Clean + one refine pass → compact WhatsApp-ready text for the requested mode.
+        Agent presents this almost as-is.
+        """
+        title = ""
+        raw_body = body or ""
+        if raw_body.startswith("Title:"):
+            first, _, rest = raw_body.partition("\n")
+            title = first.replace("Title:", "", 1).strip()
+            raw_body = rest.lstrip("\n")
+        refined = _refine_transcript_compact(raw_body, title=title, mode=mode)
+        out = f"Source: {source} | mode={mode}\n\n{refined}"
         _cache_set(cache_k, out)
         return out
 
@@ -2155,7 +2303,6 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
 
             # If caller did not want timestamps, strip them
             if not with_ts and raw.lstrip().startswith("["):
-                # remove [MM:SS] / [HH:MM:SS] prefixes
                 cleaned = re.sub(
                     r"(?m)^\[\d{1,2}(?::\d{2}){1,2}\]\s*",
                     "",
@@ -2165,13 +2312,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             else:
                 text = raw.strip()
 
-            if len(text) > 12000:
-                text = text[:12000] + "\n… [transcript truncated]"
-
-            header = "Source: speech-to-text (audio download)\n\n"
-            out = header + text
-            _cache_set(cache_k, out)
-            return out
+            return _pack("speech-to-text (audio download)", text)
     except Exception as e:
         traceback.print_exc()
         return f"transcribe_video failed: {e}"

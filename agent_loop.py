@@ -36,8 +36,8 @@ MAX_TOOL_STEPS = 5
 MAX_HISTORY_MSGS = 12
 MAX_MSG_CHARS = 600
 MAX_OBS_CHARS = 3500
-# Long transcripts need more room so the model can summarize properly
-MAX_OBS_CHARS_TRANSCRIPT = 14000
+# Transcript tool now returns a compact refined summary (~2k), not raw 50k text
+MAX_OBS_CHARS_TRANSCRIPT = 3500
 
 _VAGUE_ACK_RE = re.compile(
     r"^(theek hai|ok|okay|done|ho gaya|sure|haan|ji|alright|got it)"
@@ -137,13 +137,16 @@ def _build_system_prompt(
 13. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
 14. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
 15. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
-16. VIDEO TRANSCRIPT: If the user pastes a YouTube / video link and asks what was said, transcript, "is video me kya bola", "transcript nikaalo", summary of spoken content — call transcribe_video with that URL. Prefer this over browse_url for video links when the request is about spoken words. Do not invent a transcript.
-16b. TRANSCRIPT REPLY QUALITY (CRITICAL):
-   - NEVER paste the raw tool dump as the final reply. Auto-captions are noisy ([संगीत], broken numbers, run-on sentences).
-   - ALWAYS refine: fix grammar lightly, remove music/sound tags, make readable paragraphs or clear bullet points.
-   - Mirror the USER'S SCRIPT from their message (LANGUAGE POLICY). If they wrote Roman Urdu ("Transcript dena iski"), reply in Roman Urdu — do NOT dump Devanagari/Hindi letters just because the source transcript is in that script. Transliterate key points into Roman Urdu.
-   - Long videos (30+ min / huge OBS): do NOT flood WhatsApp with the full hour. Give (1) 4–8 line summary of what the video is about, (2) 5–10 key points / quotes in the user's script, (3) offer "full detail chahiye kisi specific hisse ka?" if they want more.
-   - Short clips: you may give a cleaned near-full transcript, still in the user's script, still readable.
+16. VIDEO CONTENT: When user pastes a video link and asks about spoken content, call transcribe_video with the URL and the right mode:
+   - mode=transcript → user said "transcript", "poora transcript", "likh ke do", "kya bola", "is video me kya kaha"
+   - mode=summary → user said "summary", "khulasa", "short me batao", "ye video kis bare me hai"
+   - mode=key_points → user said "points", "key points", "main baatein", "bullets"
+   Default mode=transcript if unclear. Prefer this over browse_url for spoken-content requests. Do not invent content.
+16b. TRANSCRIPT REPLY (tool already refined for the chosen mode):
+   - Present the tool result almost as-is in a natural WhatsApp reply.
+   - Do NOT wrap in code fences, do NOT re-translate into Devanagari/Hindi letters, do NOT add long meta.
+   - Match LANGUAGE POLICY (Roman Urdu if user wrote Roman Urdu).
+   - If user later asks for a different form (e.g. first transcript, then "summary do"), call the tool again with the new mode.
 
 Agency knowledge is available via the search_knowledge tool (only when asked).
 Brief agency summary:
