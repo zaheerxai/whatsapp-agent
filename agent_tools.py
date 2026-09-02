@@ -1327,21 +1327,279 @@ def _format_segments(segments: List[dict], with_timestamps: bool) -> str:
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
+# Public Piped API instances — free YouTube frontend that often works from cloud IPs
+_PIPED_API_HOSTS = [
+    "https://api.piped.private.coffee",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.nosebs.ru",
+    "https://pipedapi.leptons.xyz",
+    "https://api.piped.yt",
+]
+
+
+def _parse_caption_time(s: str) -> float:
+    """Parse '12.5', '12.5s', '00:01:02.500', '01:02.5' → seconds."""
+    if not s:
+        return 0.0
+    s = s.strip().rstrip("sS")
+    try:
+        if ":" not in s:
+            return float(s)
+        parts = [float(p) for p in s.split(":")]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        return float(parts[-1])
+    except Exception:
+        return 0.0
+
+
+def _unescape_caption_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text or "")
+    return (
+        text.replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&quot;", '"')
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("\xa0", " ")
+    )
+
+
+def _parse_ttml_or_vtt(raw: str) -> List[dict]:
+    """Parse TTML/XML or WebVTT into {text, start, duration} segments."""
+    segs: List[dict] = []
+    if not raw or not raw.strip():
+        return segs
+
+    # TTML / XML timed text (Piped default)
+    if "<" in raw and (
+        "tt " in raw[:300].lower()
+        or "transcript" in raw[:300].lower()
+        or "<text" in raw[:800].lower()
+        or "<p " in raw[:800].lower()
+    ):
+        for m in re.finditer(
+            r'<(?:p|text)[^>]*\bbegin=["\']?([\d:.]+)["\']?[^>]*(?:\bend=["\']?([\d:.]+)["\']?)?[^>]*>(.*?)</(?:p|text)>',
+            raw,
+            flags=re.I | re.S,
+        ):
+            begin_s, end_s, body = m.group(1), m.group(2), m.group(3)
+            text = re.sub(r"\s+", " ", _unescape_caption_text(body)).strip()
+            if not text:
+                continue
+            start = _parse_caption_time(begin_s)
+            end = _parse_caption_time(end_s) if end_s else start + 2.0
+            segs.append({"text": text, "start": start, "duration": max(0.0, end - start)})
+        if segs:
+            return segs
+        # srv3 style
+        for m in re.finditer(
+            r'<text[^>]*\bstart=["\']?([\d.]+)["\']?[^>]*(?:\bdur=["\']?([\d.]+)["\']?)?[^>]*>(.*?)</text>',
+            raw,
+            flags=re.I | re.S,
+        ):
+            start = float(m.group(1))
+            dur = float(m.group(2)) if m.group(2) else 2.0
+            text = re.sub(r"\s+", " ", _unescape_caption_text(m.group(3))).strip()
+            if text:
+                segs.append({"text": text, "start": start, "duration": dur})
+        if segs:
+            return segs
+
+    # WebVTT
+    if "WEBVTT" in raw[:30] or "-->" in raw:
+        blocks = re.split(r"\n\s*\n", raw)
+        for block in blocks:
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            tline = None
+            text_lines: List[str] = []
+            for ln in lines:
+                if "-->" in ln:
+                    tline = ln
+                elif tline is not None and not re.match(r"^\d+$", ln):
+                    text_lines.append(_unescape_caption_text(ln))
+            if not tline or not text_lines:
+                continue
+            parts = [p.strip() for p in tline.split("-->")]
+            if len(parts) < 2:
+                continue
+            start = _parse_caption_time(parts[0].split()[0])
+            end = _parse_caption_time(parts[1].split()[0])
+            text = re.sub(r"\s+", " ", " ".join(text_lines)).strip()
+            if text:
+                segs.append({"text": text, "start": start, "duration": max(0.0, end - start)})
+    return segs
+
+
+def _try_piped_captions(
+    video_id: str, language: str, with_timestamps: bool
+) -> Optional[str]:
+    """
+    Fully free YouTube captions via public Piped instances.
+    Often works from cloud/datacenter IPs where youtube-transcript-api is blocked.
+    """
+    lang = (language or "auto").strip().lower()
+    preferred: List[str] = []
+    if lang and lang not in ("auto", ""):
+        preferred.append(lang)
+    preferred.extend(["en", "en-US", "en-GB", "ur", "hi"])
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)",
+        "Accept": "application/json",
+    }
+
+    for host in _PIPED_API_HOSTS:
+        try:
+            r = requests.get(
+                f"{host}/streams/{video_id}",
+                headers=headers,
+                timeout=15,
+            )
+            if r.status_code != 200:
+                print(f"[transcribe_video] Piped {host} → HTTP {r.status_code}")
+                continue
+            data = r.json()
+            subs = data.get("subtitles") or []
+            if not subs:
+                print(f"[transcribe_video] Piped {host}: no subtitles for {video_id}")
+                continue
+
+            def score(s: dict) -> tuple:
+                code = (s.get("code") or "").lower()
+                auto = 1 if s.get("autoGenerated") else 0
+                rank = 99
+                for i, p in enumerate(preferred):
+                    if code == p or code.startswith(p + "-") or p.startswith(code):
+                        rank = i
+                        break
+                return (rank, auto)
+
+            chosen = sorted(subs, key=score)[0]
+            sub_url = chosen.get("url") or ""
+            if not sub_url:
+                continue
+            if sub_url.startswith("/"):
+                # relative — prefix host
+                from urllib.parse import urlparse
+
+                p = urlparse(host)
+                sub_url = f"{p.scheme}://{p.netloc}{sub_url}"
+
+            r2 = requests.get(sub_url, headers=headers, timeout=20)
+            if r2.status_code != 200 or not (r2.text or "").strip():
+                print(f"[transcribe_video] Piped caption body {r2.status_code}")
+                continue
+
+            segs = _parse_ttml_or_vtt(r2.text)
+            if not segs:
+                print("[transcribe_video] Piped: 0 segments after parse")
+                continue
+
+            text = _format_segments(segs, with_timestamps)
+            if text:
+                print(
+                    f"[transcribe_video] Piped OK {host} "
+                    f"lang={chosen.get('code')} segs={len(segs)}"
+                )
+                return text
+        except Exception as e:
+            print(f"[transcribe_video] Piped {host} error: {e}")
+            continue
+    return None
+
+
+def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[str]:
+    """
+    Optional managed API (cloud-friendly for YT+TikTok+more).
+    Only used when SUPADATA_API_KEY is set (100 free credits/mo).
+    """
+    api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
+    if not api_key:
+        return None
+
+    params: Dict[str, Any] = {
+        "url": url,
+        "text": "false" if with_timestamps else "true",
+        "mode": "auto",
+    }
+    lang = (language or "auto").strip().lower()
+    if lang and lang not in ("auto", ""):
+        params["lang"] = lang
+
+    try:
+        r = requests.get(
+            "https://api.supadata.ai/v1/transcript",
+            params=params,
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=90,
+        )
+        if r.status_code != 200:
+            print(f"[transcribe_video] Supadata HTTP {r.status_code}: {r.text[:160]}")
+            return None
+        data = r.json()
+        content = data.get("content")
+        if isinstance(content, str):
+            return content.strip() or None
+        if isinstance(content, list):
+            segs = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                t = (item.get("text") or "").strip()
+                if not t:
+                    continue
+                start_ms = item.get("offset") or item.get("start") or 0
+                try:
+                    start_s = float(start_ms) / 1000.0
+                except Exception:
+                    start_s = 0.0
+                dur_ms = item.get("duration") or 0
+                try:
+                    dur_s = float(dur_ms) / 1000.0
+                except Exception:
+                    dur_s = 0.0
+                segs.append({"text": t, "start": start_s, "duration": dur_s})
+            return _format_segments(segs, with_timestamps) if segs else None
+        return None
+    except Exception as e:
+        print(f"[transcribe_video] Supadata error: {e}")
+        return None
+
+
 def _try_youtube_captions(
     video_id: str, language: str, with_timestamps: bool
 ) -> Optional[str]:
     """Return formatted transcript or None if captions unavailable / blocked."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        print("[transcribe_video] youtube-transcript-api not installed")
+        return None
+
+    # Collect known exception types without hard-failing on missing names
+    blocked_types = ()
+    try:
         from youtube_transcript_api._errors import (
             TranscriptsDisabled,
             NoTranscriptFound,
             VideoUnavailable,
         )
-    except ImportError:
-        return None
+        blocked_types = (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable)
+    except Exception:
+        pass
+    for name in ("IpBlocked", "RequestBlocked", "TooManyRequests"):
+        try:
+            mod = __import__("youtube_transcript_api._errors", fromlist=[name])
+            blocked_types = blocked_types + (getattr(mod, name),)
+        except Exception:
+            pass
 
-    # Language priority: requested → Urdu/Hindi/English → any
     lang = (language or "auto").strip().lower()
     if lang in ("", "auto"):
         preferred = ["en", "ur", "hi", "en-US", "en-GB"]
@@ -1349,7 +1607,6 @@ def _try_youtube_captions(
         preferred = [lang, "en", "ur", "hi"]
 
     try:
-        # New-style API (v1.x+)
         ytt = YouTubeTranscriptApi()
         try:
             fetched = ytt.fetch(video_id, languages=preferred)
@@ -1358,17 +1615,22 @@ def _try_youtube_captions(
                 for sn in fetched
             ]
             return _format_segments(segs, with_timestamps)
-        except Exception:
-            # Older static API fallback
+        except Exception as inner:
             if hasattr(YouTubeTranscriptApi, "get_transcript"):
-                raw = YouTubeTranscriptApi.get_transcript(video_id, languages=preferred)
-                return _format_segments(raw, with_timestamps)
+                try:
+                    raw = YouTubeTranscriptApi.get_transcript(
+                        video_id, languages=preferred
+                    )
+                    return _format_segments(raw, with_timestamps)
+                except Exception:
+                    raise inner
             raise
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
+    except blocked_types as e:
+        print(f"[transcribe_video] captions unavailable/blocked for {video_id}: {e}")
         return None
     except Exception as e:
-        # IP blocks / transient — fall through to ASR
-        print(f"[transcribe_video] youtube-transcript-api failed: {e}")
+        # Cloud IP blocks, rate limits, etc. — fall through to ASR
+        print(f"[transcribe_video] youtube-transcript-api failed for {video_id}: {e}")
         return None
 
 
@@ -1436,9 +1698,20 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
         if url != original:
             print(f"[transcribe_video] resolved short URL → {url}")
 
+    # Strip tracking params that sometimes confuse extractors
+    if "youtu" in url.lower() and "?" in url:
+        base, _, _qs = url.partition("?")
+        # keep only v= if present; otherwise drop all query
+        if "v=" in _qs:
+            for part in _qs.split("&"):
+                if part.startswith("v="):
+                    url = f"{base}?{part}"
+                    break
+        else:
+            url = base
+
     outtmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
 
-    # Common options
     base_opts: Dict[str, Any] = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -1462,10 +1735,7 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
             if (info.get("duration") or 0) > _MAX_ASR_SECONDS + 30
             else None
         ),
-        # Critical for TikTok (Aug 2026+): missing Referer triggers
-        # "Unexpected response from webpage request"
         "http_headers": {
-            "Referer": "https://www.tiktok.com/",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1474,26 +1744,50 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
         },
     }
 
-    # TikTok-specific: try mobile API path first when possible; also keep
-    # webpage path with proper headers. Latest yt-dlp (2026.08.19+) fixed
-    # the challenge + referer issues.
+    # Optional cookies file (set YTDLP_COOKIES=/path/to/cookies.txt on the host)
+    cookies_path = (os.getenv("YTDLP_COOKIES") or "").strip()
+    if cookies_path and os.path.isfile(cookies_path):
+        base_opts["cookiefile"] = cookies_path
+
+    attempt_opts: List[Dict[str, Any]] = []
+
     if _is_tiktok_url(url):
-        base_opts["extractor_args"] = {
+        # TikTok: Referer is required (Aug 2026+ challenge)
+        tiktok_opts = dict(base_opts)
+        tiktok_opts["http_headers"] = {
+            **base_opts["http_headers"],
+            "Referer": "https://www.tiktok.com/",
+        }
+        tiktok_opts["extractor_args"] = {
             "tiktok": {
-                # Prefer mobile app-style extraction when web is blocked
                 "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"],
             }
         }
+        attempt_opts.append(tiktok_opts)
+        # Fallback without extractor_args
+        fb = dict(tiktok_opts)
+        fb.pop("extractor_args", None)
+        attempt_opts.append(fb)
+    elif _extract_youtube_id(url):
+        # YouTube bot-check workaround for datacenter IPs (2026).
+        # Clients that often still work without cookies/PO tokens:
+        # tv_simply, tv, android_vr, web_embedded, mweb.
+        for clients in (
+            "tv_simply,tv,android_vr",
+            "android_vr,web_embedded,mweb",
+            "tv,android,ios",
+            "web_embedded",
+        ):
+            opts = dict(base_opts)
+            opts["extractor_args"] = {
+                "youtube": {"player_client": [clients]}
+            }
+            attempt_opts.append(opts)
+        attempt_opts.append(dict(base_opts))
+    else:
+        attempt_opts.append(base_opts)
 
     last_err: Optional[Exception] = None
-    # Two attempts: (1) with TikTok-friendly headers, (2) plain fallback
-    attempt_opts = [base_opts]
-    if _is_tiktok_url(url):
-        # Second attempt: strip extractor_args, keep only referer (web path)
-        fallback = dict(base_opts)
-        fallback.pop("extractor_args", None)
-        attempt_opts.append(fallback)
-
     for opts in attempt_opts:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1516,10 +1810,23 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
         except Exception as e:
             last_err = e
             err_s = str(e).lower()
-            # Retry only on the known TikTok webpage challenge
-            if "unexpected response from webpage" not in err_s and "tiktok" not in err_s:
-                break
-            print(f"[transcribe_video] yt-dlp attempt failed, retrying: {e}")
+            # Keep trying alternate clients on bot-check / challenge errors
+            retryable = any(
+                x in err_s
+                for x in (
+                    "sign in to confirm",
+                    "not a bot",
+                    "unexpected response from webpage",
+                    "login_required",
+                    "confirm you're not a bot",
+                )
+            )
+            print(f"[transcribe_video] yt-dlp attempt failed: {e}")
+            if not retryable and len(attempt_opts) > 1:
+                # Non-retryable (e.g. private, deleted) — stop early
+                if "private" in err_s or "unavailable" in err_s or "too long" in err_s:
+                    break
+            continue
 
     raise RuntimeError(str(last_err) if last_err else "yt-dlp download failed")
 
@@ -1604,12 +1911,31 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     if cached:
         return cached
 
-    # --- 1. YouTube captions (fast path) ---
     yt_id = _extract_youtube_id(url)
+
+    # --- 0. FREE cloud-friendly path: public Piped instances (YouTube only) ---
+    if yt_id:
+        text = _try_piped_captions(yt_id, language, with_ts)
+        if text:
+            if len(text) > 12000:
+                text = text[:12000] + "\n… [transcript truncated]"
+            out = f"Source: Piped captions (video {yt_id})\n\n" + text
+            _cache_set(cache_k, out)
+            return out
+
+    # --- 1. Optional managed API (if SUPADATA_API_KEY set) ---
+    text = _try_supadata(url, language, with_ts)
+    if text:
+        if len(text) > 12000:
+            text = text[:12000] + "\n… [transcript truncated]"
+        out = "Source: Supadata\n\n" + text
+        _cache_set(cache_k, out)
+        return out
+
+    # --- 2. Direct youtube-transcript-api (often blocked on cloud IPs) ---
     if yt_id:
         text = _try_youtube_captions(yt_id, language, with_ts)
         if text:
-            # Soft length guard for WhatsApp / LLM context
             if len(text) > 12000:
                 text = text[:12000] + "\n… [transcript truncated]"
             header = f"Source: YouTube captions (video {yt_id})\n\n"
@@ -1617,7 +1943,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             _cache_set(cache_k, out)
             return out
 
-    # --- 2. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
+    # --- 3. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
     try:
         with tempfile.TemporaryDirectory(prefix="mojo_vid_") as tmp:
             try:
@@ -1637,6 +1963,21 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                         "ko block / challenge kar raha hai (common temporary issue). "
                         "YouTube link try karo, ya video download karke voice note "
                         "bhej do to main transcribe kar sakta hoon."
+                    )
+                if any(
+                    x in low
+                    for x in (
+                        "sign in to confirm",
+                        "not a bot",
+                        "login_required",
+                        "confirm you're not a bot",
+                    )
+                ):
+                    return (
+                        "YouTube ne is link pe bot-check laga diya hai (cloud server IP "
+                        "block). Captions bhi available nahi the. "
+                        "Workaround: video download karke voice note bhej do, ya "
+                        "host pe YTDLP_COOKIES env set karo (browser cookies.txt)."
                     )
                 return (
                     f"Could not download audio from this link ({msg[:180]}). "
