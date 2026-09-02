@@ -1436,6 +1436,111 @@ def _parse_ttml_or_vtt(raw: str) -> List[dict]:
     return segs
 
 
+# Shared free demo-key cache for youtube2text.org
+_Y2T_KEY: Optional[str] = None
+_Y2T_KEY_TS: float = 0.0
+
+
+def _youtube2text_api_key() -> Optional[str]:
+    """Prefer env YOUTUBE2TEXT_API_KEY; else shared free demo key."""
+    global _Y2T_KEY, _Y2T_KEY_TS
+    env_key = (os.getenv("YOUTUBE2TEXT_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    if _Y2T_KEY and (time.time() - _Y2T_KEY_TS) < 6 * 3600:
+        return _Y2T_KEY
+    try:
+        r = requests.get(
+            "https://youtube2text.org/api/demo-key",
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)"},
+        )
+        if r.status_code == 200:
+            data = r.json() or {}
+            key = data.get("apiKey") or data.get("api_key")
+            if key:
+                _Y2T_KEY = str(key)
+                _Y2T_KEY_TS = time.time()
+                return _Y2T_KEY
+    except Exception as e:
+        print(f"[transcribe_video] youtube2text demo-key error: {e}")
+    return _Y2T_KEY
+
+
+def _try_youtube2text(
+    url: str, language: str, with_timestamps: bool
+) -> Optional[str]:
+    """
+    Fully free, cloud-working YouTube transcripts via youtube2text.org.
+    Verified on datacenter IPs for videos that Piped/yt-dlp/Innertube block.
+    """
+    key = _youtube2text_api_key()
+    if not key:
+        return None
+
+    params: Dict[str, Any] = {"url": url, "maxChars": "12000"}
+    lang = (language or "auto").strip().lower()
+    if lang and lang not in ("auto", ""):
+        params["lang"] = lang
+
+    headers = {
+        "x-api-key": key,
+        "User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(
+            "https://youtube2text.org/api/transcribe",
+            params=params,
+            headers=headers,
+            timeout=60,
+        )
+        if r.status_code == 401:
+            global _Y2T_KEY, _Y2T_KEY_TS
+            _Y2T_KEY, _Y2T_KEY_TS = None, 0.0
+            key2 = _youtube2text_api_key()
+            if not key2 or key2 == key:
+                print("[transcribe_video] youtube2text 401 unauthorized")
+                return None
+            headers["x-api-key"] = key2
+            r = requests.get(
+                "https://youtube2text.org/api/transcribe",
+                params=params,
+                headers=headers,
+                timeout=60,
+            )
+        if r.status_code != 200:
+            print(
+                f"[transcribe_video] youtube2text HTTP {r.status_code}: {r.text[:160]}"
+            )
+            return None
+
+        data = r.json() or {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else data
+        content = (
+            (result or {}).get("content")
+            or (result or {}).get("transcript")
+            or (result or {}).get("text")
+            or data.get("content")
+        )
+        if not content or not str(content).strip():
+            print("[transcribe_video] youtube2text empty content")
+            return None
+
+        text = str(content).strip()
+        if text.startswith("[] "):
+            text = text[3:].strip()
+        title = (result or {}).get("title") or ""
+        print(
+            f"[transcribe_video] youtube2text OK chars={len(text)} "
+            f"title={(title or '')[:40]!r}"
+        )
+        return text
+    except Exception as e:
+        print(f"[transcribe_video] youtube2text error: {e}")
+        return None
+
+
 def _try_piped_captions(
     video_id: str, language: str, with_timestamps: bool
 ) -> Optional[str]:
@@ -1913,7 +2018,17 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
 
     yt_id = _extract_youtube_id(url)
 
-    # --- 0. FREE cloud-friendly path: public Piped instances (YouTube only) ---
+    # --- 0. FREE cloud-working path: youtube2text.org (proven on blocked videos) ---
+    if yt_id or "youtu" in url.lower():
+        text = _try_youtube2text(url, language, with_ts)
+        if text:
+            if len(text) > 12000:
+                text = text[:12000] + "\n… [transcript truncated]"
+            out = "Source: youtube2text.org\n\n" + text
+            _cache_set(cache_k, out)
+            return out
+
+    # --- 1. FREE: public Piped instances (YouTube captions) ---
     if yt_id:
         text = _try_piped_captions(yt_id, language, with_ts)
         if text:
@@ -1923,7 +2038,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             _cache_set(cache_k, out)
             return out
 
-    # --- 1. Optional managed API (if SUPADATA_API_KEY set) ---
+    # --- 2. Optional managed API (if SUPADATA_API_KEY set) ---
     text = _try_supadata(url, language, with_ts)
     if text:
         if len(text) > 12000:
@@ -1932,7 +2047,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         _cache_set(cache_k, out)
         return out
 
-    # --- 2. Direct youtube-transcript-api (often blocked on cloud IPs) ---
+    # --- 3. Direct youtube-transcript-api (often blocked on cloud IPs) ---
     if yt_id:
         text = _try_youtube_captions(yt_id, language, with_ts)
         if text:
@@ -1943,7 +2058,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             _cache_set(cache_k, out)
             return out
 
-    # --- 3. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
+    # --- 4. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
     try:
         with tempfile.TemporaryDirectory(prefix="mojo_vid_") as tmp:
             try:
