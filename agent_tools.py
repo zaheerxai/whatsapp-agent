@@ -1478,7 +1478,8 @@ def _try_youtube2text(
     if not key:
         return None
 
-    params: Dict[str, Any] = {"url": url, "maxChars": "12000"}
+    # 1h+ videos need a high ceiling; 12k was truncating mid-sentence
+    params: Dict[str, Any] = {"url": url, "maxChars": "100000"}
     lang = (language or "auto").strip().lower()
     if lang and lang not in ("auto", ""):
         params["lang"] = lang
@@ -1493,7 +1494,7 @@ def _try_youtube2text(
             "https://youtube2text.org/api/transcribe",
             params=params,
             headers=headers,
-            timeout=60,
+            timeout=90,
         )
         if r.status_code == 401:
             global _Y2T_KEY, _Y2T_KEY_TS
@@ -1530,15 +1531,43 @@ def _try_youtube2text(
         text = str(content).strip()
         if text.startswith("[] "):
             text = text[3:].strip()
+        text = _clean_raw_transcript(text)
         title = (result or {}).get("title") or ""
         print(
             f"[transcribe_video] youtube2text OK chars={len(text)} "
             f"title={(title or '')[:40]!r}"
         )
+        if title:
+            return f"Title: {title}\n\n{text}"
         return text
     except Exception as e:
         print(f"[transcribe_video] youtube2text error: {e}")
         return None
+
+
+def _clean_raw_transcript(text: str) -> str:
+    """
+    Strip ASR/music noise so the model can refine more easily.
+    Removes [संगीत], [music], bracketed sound effects, collapses gaps.
+    """
+    if not text:
+        return text
+    # Common auto-caption noise markers (Hindi/English/brackets)
+    text = re.sub(
+        r"\[\s*(?:संगीत| संगीत |music|Music|MUSIC|applause|laughter|"
+        r"hansa|हंसी|नाक से[^\]]*|अचानक[^\]]*|sound[^\]]*)\s*\]",
+        " ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\[[^\]]{0,40}\]", " ", text)  # other short [tags]
+    text = re.sub(r"[♪♫]+", " ", text)
+    # Broken currency / number artifacts like ₹000
+    text = re.sub(r"₹\s*0{2,}", "₹", text)
+    # Collapse whitespace
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _try_piped_captions(
@@ -2018,45 +2047,44 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
 
     yt_id = _extract_youtube_id(url)
 
+    # Soft cap for tool payload (agent_loop has a higher OBS cap for this tool).
+    # Keep enough for a 1h talk so the model can summarize accurately.
+    _TRANSCRIPT_SOFT_CAP = 50000
+
+    def _pack(source: str, body: str) -> str:
+        body = _clean_raw_transcript(body)
+        if len(body) > _TRANSCRIPT_SOFT_CAP:
+            body = (
+                body[:_TRANSCRIPT_SOFT_CAP]
+                + "\n… [transcript continues — summarize available portion; "
+                "offer more detail on a section if user asks]"
+            )
+        out = f"Source: {source}\n\n{body}"
+        _cache_set(cache_k, out)
+        return out
+
     # --- 0. FREE cloud-working path: youtube2text.org (proven on blocked videos) ---
     if yt_id or "youtu" in url.lower():
         text = _try_youtube2text(url, language, with_ts)
         if text:
-            if len(text) > 12000:
-                text = text[:12000] + "\n… [transcript truncated]"
-            out = "Source: youtube2text.org\n\n" + text
-            _cache_set(cache_k, out)
-            return out
+            return _pack("youtube2text.org", text)
 
     # --- 1. FREE: public Piped instances (YouTube captions) ---
     if yt_id:
         text = _try_piped_captions(yt_id, language, with_ts)
         if text:
-            if len(text) > 12000:
-                text = text[:12000] + "\n… [transcript truncated]"
-            out = f"Source: Piped captions (video {yt_id})\n\n" + text
-            _cache_set(cache_k, out)
-            return out
+            return _pack(f"Piped captions (video {yt_id})", text)
 
     # --- 2. Optional managed API (if SUPADATA_API_KEY set) ---
     text = _try_supadata(url, language, with_ts)
     if text:
-        if len(text) > 12000:
-            text = text[:12000] + "\n… [transcript truncated]"
-        out = "Source: Supadata\n\n" + text
-        _cache_set(cache_k, out)
-        return out
+        return _pack("Supadata", text)
 
     # --- 3. Direct youtube-transcript-api (often blocked on cloud IPs) ---
     if yt_id:
         text = _try_youtube_captions(yt_id, language, with_ts)
         if text:
-            if len(text) > 12000:
-                text = text[:12000] + "\n… [transcript truncated]"
-            header = f"Source: YouTube captions (video {yt_id})\n\n"
-            out = header + text
-            _cache_set(cache_k, out)
-            return out
+            return _pack(f"YouTube captions (video {yt_id})", text)
 
     # --- 4. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
     try:

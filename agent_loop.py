@@ -36,6 +36,8 @@ MAX_TOOL_STEPS = 5
 MAX_HISTORY_MSGS = 12
 MAX_MSG_CHARS = 600
 MAX_OBS_CHARS = 3500
+# Long transcripts need more room so the model can summarize properly
+MAX_OBS_CHARS_TRANSCRIPT = 14000
 
 _VAGUE_ACK_RE = re.compile(
     r"^(theek hai|ok|okay|done|ho gaya|sure|haan|ji|alright|got it)"
@@ -136,6 +138,12 @@ def _build_system_prompt(
 14. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
 15. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
 16. VIDEO TRANSCRIPT: If the user pastes a YouTube / video link and asks what was said, transcript, "is video me kya bola", "transcript nikaalo", summary of spoken content — call transcribe_video with that URL. Prefer this over browse_url for video links when the request is about spoken words. Do not invent a transcript.
+16b. TRANSCRIPT REPLY QUALITY (CRITICAL):
+   - NEVER paste the raw tool dump as the final reply. Auto-captions are noisy ([संगीत], broken numbers, run-on sentences).
+   - ALWAYS refine: fix grammar lightly, remove music/sound tags, make readable paragraphs or clear bullet points.
+   - Mirror the USER'S SCRIPT from their message (LANGUAGE POLICY). If they wrote Roman Urdu ("Transcript dena iski"), reply in Roman Urdu — do NOT dump Devanagari/Hindi letters just because the source transcript is in that script. Transliterate key points into Roman Urdu.
+   - Long videos (30+ min / huge OBS): do NOT flood WhatsApp with the full hour. Give (1) 4–8 line summary of what the video is about, (2) 5–10 key points / quotes in the user's script, (3) offer "full detail chahiye kisi specific hisse ka?" if they want more.
+   - Short clips: you may give a cleaned near-full transcript, still in the user's script, still readable.
 
 Agency knowledge is available via the search_knowledge tool (only when asked).
 Brief agency summary:
@@ -605,8 +613,19 @@ def run_agent(
                     traceback.print_exc()
                     observation = f"Tool error: {te}"
                 obs_str = str(observation)
-                if len(obs_str) > MAX_OBS_CHARS:
-                    obs_str = obs_str[:MAX_OBS_CHARS] + "…"
+                # Transcripts need a higher cap so the model can refine/summarize
+                # a long video instead of only seeing the first ~3k chars.
+                obs_cap = (
+                    MAX_OBS_CHARS_TRANSCRIPT
+                    if name == "transcribe_video"
+                    else MAX_OBS_CHARS
+                )
+                if len(obs_str) > obs_cap:
+                    obs_str = (
+                        obs_str[:obs_cap]
+                        + "\n… [truncated for context — video may be longer; "
+                        "summarize what you have, note if incomplete]"
+                    )
                 logging.getLogger("mojo.agent").info("OBS %s", obs_str[:500])
                 print(f"[AGENT OBS] {obs_str[:400]}{'…' if len(obs_str) > 400 else ''}")
                 messages.append(
