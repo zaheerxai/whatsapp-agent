@@ -31,13 +31,16 @@ _get_contacts_maps = None
 _get_group_memory = None
 _get_tzinfo = None
 
-MAX_TOOL_STEPS = 5
+MAX_TOOL_STEPS = 3  # was 5 — each step is a full Groq call + tool schemas
 # Keep payloads under Groq limits (413 Payload Too Large was hitting group chats)
 MAX_HISTORY_MSGS = 12
 MAX_MSG_CHARS = 600
 MAX_OBS_CHARS = 3500
 # Transcript tool now returns a compact refined summary (~2k), not raw 50k text
 MAX_OBS_CHARS_TRANSCRIPT = 3500
+# Cap completion size — WhatsApp replies are short; unbounded drafts burn quota
+MAX_COMPLETION_TOKENS = 1024
+MAX_COMPLETION_TOKENS_SHORT = 512
 
 _VAGUE_ACK_RE = re.compile(
     r"^(theek hai|ok|okay|done|ho gaya|sure|haan|ji|alright|got it)"
@@ -341,15 +344,22 @@ def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
     return out
 
 
-def _chat_completion(messages: List[dict], tools: Optional[List] = None, temperature: float = 0.4):
+def _chat_completion(
+    messages: List[dict],
+    tools: Optional[List] = None,
+    temperature: float = 0.4,
+    max_tokens: Optional[int] = None,
+):
     """Primary Groq (429 + 413 aware), fallback Gemini. Returns the message object."""
     import time as _time
 
     working = messages
+    tok = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
     kwargs: Dict[str, Any] = {
         "model": _MODEL_NAME,
         "messages": working,
         "temperature": temperature,
+        "max_tokens": tok,
     }
     if tools:
         kwargs["tools"] = tools
@@ -390,6 +400,7 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
             "model": _GEMINI_MODEL,
             "messages": clean,
             "temperature": temperature,
+            "max_tokens": tok,
         }
         resp = _client_gemini.chat.completions.create(**gkwargs)
         return resp.choices[0].message
@@ -614,6 +625,10 @@ def run_agent(
             except ValueError:
                 return None
 
+        # After force-inject, next completion must NOT re-send full tool schemas
+        # (large payload) or invite more tool calls — synthesis only.
+        tools_for_next: Optional[List] = TOOL_SCHEMAS
+
         if urls_in_last:
             # Deterministic pre-fetch: tool_choice=auto is not a guarantee the model
             # will call the right tool. Inject the tool result ourselves.
@@ -664,6 +679,21 @@ def run_agent(
                     "tool_call_id": _forced_call_id,
                     "content": _forced_obs_str,
                 })
+                # transcribe_video already refined for WhatsApp — skip another
+                # Groq synthesis call (saves 1–2 requests + avoids 429 storms).
+                if not str(_forced_observation).startswith("Tool error"):
+                    direct = _last_tool_obs_for_user(messages)
+                    if direct and len(direct) >= 40:
+                        print(
+                            "[AGENT] force transcribe_video → direct OBS reply "
+                            "(no synthesis call)"
+                        )
+                        logging.getLogger("mojo.agent").info(
+                            "DIRECT_OBS_REPLY mode=%s chars=%s",
+                            spoken_mode,
+                            len(direct),
+                        )
+                        return direct
                 messages.append({
                     "role": "system",
                     "content": (
@@ -713,11 +743,17 @@ def run_agent(
                         "chat history. Do NOT invent rate-limit errors."
                     ),
                 })
+                tools_for_next = None  # synthesis only — no tool schema payload
 
         # --- Agentic loop ---
         for step in range(MAX_TOOL_STEPS):
             try:
-                msg = _chat_completion(messages, tools=TOOL_SCHEMAS, temperature=0.3)
+                msg = _chat_completion(
+                    messages,
+                    tools=tools_for_next,
+                    temperature=0.3,
+                    max_tokens=MAX_COMPLETION_TOKENS,
+                )
             except Exception as e:
                 print(f"[AGENT] completion failed at step {step}: {e}")
                 traceback.print_exc()
@@ -730,7 +766,12 @@ def run_agent(
                     return obs
                 if step > 0:
                     try:
-                        final = _chat_completion(messages, tools=None, temperature=0.4)
+                        final = _chat_completion(
+                            messages,
+                            tools=None,
+                            temperature=0.4,
+                            max_tokens=MAX_COMPLETION_TOKENS_SHORT,
+                        )
                         ans = (final.content or "").strip()
                         if ans and not _is_bad_post_tool_reply(ans):
                             return ans
@@ -787,7 +828,12 @@ def run_agent(
                         ),
                     })
                     try:
-                        final = _chat_completion(messages, tools=None, temperature=0.3)
+                        final = _chat_completion(
+                            messages,
+                            tools=None,
+                            temperature=0.3,
+                            max_tokens=MAX_COMPLETION_TOKENS_SHORT,
+                        )
                         forced = (final.content or "").strip()
                         if forced and not _is_bad_post_tool_reply(forced):
                             return forced
@@ -839,6 +885,8 @@ def run_agent(
                         "content": obs_str,
                     }
                 )
+            # After tools ran this step → next step is synthesis only (no schema payload)
+            tools_for_next = None
 
         # Max steps — force close without tools
         messages.append(
@@ -851,7 +899,12 @@ def run_agent(
             }
         )
         try:
-            final = _chat_completion(messages, tools=None, temperature=0.4)
+            final = _chat_completion(
+                messages,
+                tools=None,
+                temperature=0.4,
+                max_tokens=MAX_COMPLETION_TOKENS_SHORT,
+            )
             ans = (final.content or "").strip()
             if ans and not _is_bad_post_tool_reply(ans):
                 return ans

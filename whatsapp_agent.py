@@ -583,6 +583,7 @@ def transliterate_to_roman_if_needed(text: str) -> str:
                 {"role": "user", "content": text},
             ],
             temperature=0,
+            max_tokens=min(1200, max(200, len(text) // 2 + 100)),
         )
         result = (resp.choices[0].message.content or "").strip()
         return result or text
@@ -1572,7 +1573,8 @@ If you cannot parse any concrete time, still return valid JSON with empty arrays
                 {"role": "user", "content": text_content}
             ],
             response_format={"type": "json_object"},
-            temperature=0
+            temperature=0,
+            max_tokens=500,
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
@@ -1643,7 +1645,8 @@ def handle_reminder_request(chat_id, sender_id, text_content, msg_time):
             ai_tz = client_ai.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": ai_tz_prompt}],
-                temperature=0
+                temperature=0,
+                max_tokens=40,
             ).choices[0].message.content.strip()
 
             if ai_tz != "NONE" and "/" in ai_tz:
