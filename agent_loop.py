@@ -56,6 +56,59 @@ def _is_vague_ack(text: str) -> bool:
     return False
 
 
+def _is_bad_post_tool_reply(text: str) -> bool:
+    """
+    Catch replies that discard good tool OBS: multi-part promises, 'part 1',
+    technical-issue placeholders, pure meta without the actual content.
+    """
+    t = (text or "").strip()
+    if _is_vague_ack(t):
+        return True
+    low = t.lower()
+    bad_markers = (
+        "part 1",
+        "part\u202f1",
+        "here's part",
+        "here is part",
+        "few short messages",
+        "i'll send",
+        "i will send",
+        "sending in parts",
+        "technical issue",
+        "thori si technical",
+        "dobara try",
+        "try again later",
+        "ek second baad",
+    )
+    if any(m in low for m in bad_markers):
+        return True
+    # Very short after tools usually means the model bailed
+    if len(t) < 40:
+        return True
+    return False
+
+
+def _last_tool_obs_for_user(messages: List[dict], max_len: int = 3500) -> Optional[str]:
+    """Strip Source header from last tool OBS so it can be sent to the user as-is."""
+    for m in reversed(messages or []):
+        if m.get("role") != "tool":
+            continue
+        obs = str(m.get("content") or "").strip()
+        if not obs:
+            continue
+        # Drop "Source: … | mode=…" first line if present
+        lines = obs.split("\n")
+        if lines and lines[0].lower().startswith("source:"):
+            obs = "\n".join(lines[1:]).lstrip("\n")
+        obs = obs.strip()
+        if not obs:
+            continue
+        if len(obs) > max_len:
+            obs = obs[:max_len].rstrip() + "…"
+        return obs
+    return None
+
+
 def init_agent(
     client_ai,
     client_gemini,
@@ -138,15 +191,16 @@ def _build_system_prompt(
 14. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
 15. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
 16. VIDEO CONTENT: When user pastes a video link and asks about spoken content, call transcribe_video with the URL and the right mode:
-   - mode=transcript → user said "transcript", "poora transcript", "likh ke do", "kya bola", "is video me kya kaha"
-   - mode=summary → user said "summary", "khulasa", "short me batao", "ye video kis bare me hai"
-   - mode=key_points → user said "points", "key points", "main baatein", "bullets"
-   Default mode=transcript if unclear. Prefer this over browse_url for spoken-content requests. Do not invent content.
+   - mode=transcript → "transcript", "poora transcript", "whole transcript", "likh ke do", "kya bola"
+   - mode=summary → "summary", "khulasa", "short me batao", "ye video kis bare me hai"
+   - mode=key_points → "points", "key points", "main baatein", "bullets"
+   If user asks for N words (e.g. "400 word summary", "600 words"), set target_words=N and mode=summary.
+   ALWAYS call the tool again when mode/length changes — never invent from a prior short summary.
+   Prefer this over browse_url for spoken-content requests. Do not invent content.
 16b. TRANSCRIPT REPLY (tool already refined for the chosen mode):
-   - Present the tool result almost as-is in a natural WhatsApp reply.
-   - Do NOT wrap in code fences, do NOT re-translate into Devanagari/Hindi letters, do NOT add long meta.
+   - Present the tool result almost as-is in ONE WhatsApp message.
+   - Do NOT wrap in code fences, do NOT promise "part 1 / more messages later", do NOT re-translate into Devanagari.
    - Match LANGUAGE POLICY (Roman Urdu if user wrote Roman Urdu).
-   - If user later asks for a different form (e.g. first transcript, then "summary do"), call the tool again with the new mode.
 
 Agency knowledge is available via the search_knowledge tool (only when asked).
 Brief agency summary:
@@ -303,7 +357,8 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
             print(f"[AGENT] Primary model failed: {primary_err}. Trying Gemini...")
             break
 
-    # Gemini fallback — sanitize tool messages so we don't get 400s
+    # Gemini fallback — sanitize tool messages so we don't get 400s.
+    # Single attempt only (no nested retry storms on 503/429).
     try:
         clean = _sanitize_messages_for_gemini(working)
         gkwargs: Dict[str, Any] = {
@@ -311,36 +366,12 @@ def _chat_completion(messages: List[dict], tools: Optional[List] = None, tempera
             "messages": clean,
             "temperature": temperature,
         }
-        # Prefer no tools on Gemini; we already have observations folded in
         resp = _client_gemini.chat.completions.create(**gkwargs)
         return resp.choices[0].message
     except Exception as e2:
         print(f"[AGENT] Gemini fallback failed: {e2}")
-        # Last resort: tiny prompt with last user + last tool obs only
-        try:
-            slim: List[dict] = []
-            sys_m = next((m for m in working if m.get("role") == "system"), None)
-            if sys_m:
-                slim.append({"role": "system", "content": str(sys_m.get("content") or "")[:1500]})
-            for m in reversed(working):
-                if m.get("role") in ("user", "tool", "assistant") and m.get("content"):
-                    role = "user" if m["role"] == "tool" else m["role"]
-                    slim.append({"role": role, "content": str(m["content"])[:1500]})
-                    if len(slim) >= 4:
-                        break
-            # reverse back to chrono order (system stays first)
-            body = list(reversed(slim[1:])) if slim and slim[0].get("role") == "system" else list(reversed(slim))
-            slim = ([slim[0]] if slim and slim[0].get("role") == "system" else []) + body
-            slim = _sanitize_messages_for_gemini(slim)
-            resp = _client_gemini.chat.completions.create(
-                model=_GEMINI_MODEL,
-                messages=slim or [{"role": "user", "content": "Reply briefly that there was a temporary issue."}],
-                temperature=temperature,
-            )
-            return resp.choices[0].message
-        except Exception as e3:
-            print(f"[AGENT] All models failed: {e3}")
-            raise last_err or e3
+        # Do NOT burn more time on Gemini 503 loops. Caller uses tool OBS.
+        raise last_err or e2
 
 
 def run_agent(
@@ -523,11 +554,19 @@ def run_agent(
             except Exception as e:
                 print(f"[AGENT] completion failed at step {step}: {e}")
                 traceback.print_exc()
-                # If we already have observations, try a no-tool close
+                # Prefer already-fetched tool OBS over spinning on rate limits
+                obs = _last_tool_obs_for_user(messages)
+                if obs:
+                    logging.getLogger("mojo.agent").info(
+                        "RETURNING_TOOL_OBS after completion failure (step=%s)", step
+                    )
+                    return obs
                 if step > 0:
                     try:
                         final = _chat_completion(messages, tools=None, temperature=0.4)
-                        return (final.content or "").strip() or "Ho gaya."
+                        ans = (final.content or "").strip()
+                        if ans and not _is_bad_post_tool_reply(ans):
+                            return ans
                     except Exception:
                         pass
                 return "Thori si technical issue aa gayi — ek second baad dobara try karo."
@@ -563,38 +602,30 @@ def run_agent(
 
             if not tool_calls:
                 answer = (content or "").strip()
-                # After tools ran, reject empty / pure-ack replies and force a
-                # short synthesis from the tool observations (Groq 429 → Gemini
-                # was answering only "Theek hai 👍" despite good search results).
-                if step > 0 and _is_vague_ack(answer):
+                # After tools: reject vague acks, multi-part promises, meta-only replies
+                if step > 0 and _is_bad_post_tool_reply(answer):
                     logging.getLogger("mojo.agent").info(
-                        "VAGUE_AFTER_TOOLS answer=%r — forcing synthesis", answer
+                        "BAD_AFTER_TOOLS answer=%r — forcing synthesis or OBS", answer
                     )
                     messages.append({
                         "role": "user",
                         "content": (
-                            "Tool results are already above. Give the user a short direct "
-                            "answer with concrete facts and any full URLs from those results. "
-                            "Do not reply with only 'Theek hai' or a vague acknowledgement."
+                            "Tool results are already above. Reply with the useful content "
+                            "from those results in ONE message. Do NOT say you will send "
+                            "parts later. Do NOT only acknowledge. Prefer the tool text as-is "
+                            "if it is already a clean transcript/summary."
                         ),
                     })
                     try:
                         final = _chat_completion(messages, tools=None, temperature=0.3)
                         forced = (final.content or "").strip()
-                        if forced and not _is_vague_ack(forced):
-                            return forced
-                        if forced:
+                        if forced and not _is_bad_post_tool_reply(forced):
                             return forced
                     except Exception as fe:
                         print(f"[AGENT] forced synthesis failed: {fe}")
-                    # Last resort: surface the last tool observation so the user
-                    # at least gets something useful instead of a bare ack.
-                    for m in reversed(messages):
-                        if m.get("role") == "tool" and (m.get("content") or "").strip():
-                            obs = str(m["content"]).strip()
-                            if len(obs) > 900:
-                                obs = obs[:900] + "…"
-                            return obs
+                    obs = _last_tool_obs_for_user(messages)
+                    if obs:
+                        return obs
                 return answer or "Theek hai 👍"
 
             # Execute tools
@@ -643,15 +674,23 @@ def run_agent(
         messages.append(
             {
                 "role": "user",
-                "content": "Give the best final short answer now from the tool results above. No more tools.",
+                "content": (
+                    "Give the best final answer now from the tool results above in ONE message. "
+                    "No more tools. Do not promise parts later."
+                ),
             }
         )
         try:
             final = _chat_completion(messages, tools=None, temperature=0.4)
-            return (final.content or "").strip() or "Ho gaya."
+            ans = (final.content or "").strip()
+            if ans and not _is_bad_post_tool_reply(ans):
+                return ans
         except Exception as e:
             print(f"[AGENT] final close failed: {e}")
-            return "Kaam almost complete ho gaya — list reminders dobara try kar lo."
+        obs = _last_tool_obs_for_user(messages)
+        if obs:
+            return obs
+        return "Kaam almost complete ho gaya — dobara try kar lo."
 
     except Exception as e:
         traceback.print_exc()

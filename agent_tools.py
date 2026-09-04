@@ -425,11 +425,10 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "description": (
                 "Get spoken content from a public video link (YouTube, TikTok, Vimeo, etc.). "
                 "Use when user asks for transcript / summary / key points / 'is video me kya bola'. "
-                "Set mode from user intent: "
-                "'transcript' if they said transcript/full text/'poora transcript'/'likh ke do'; "
-                "'summary' if they said summary/khulasa/'short me batao'/'is about kya'; "
-                "'key_points' if they want bullets/points only. "
-                "Default 'transcript' when ambiguous. "
+                "ALWAYS call again if user changes mode or asks for a longer/shorter version — "
+                "do not invent from memory. "
+                "mode: transcript | summary | key_points. "
+                "If user asks for N words (e.g. 400-word summary), set target_words=N. "
                 "Do NOT use for voice notes already transcribed in the chat."
             ),
             "parameters": {
@@ -443,11 +442,18 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "enum": ["transcript", "summary", "key_points"],
                         "description": (
-                            "transcript = cleaned spoken text (default when user says transcript). "
-                            "summary = short overview. "
+                            "transcript = cleaned spoken text. "
+                            "summary = overview (use with target_words if user asks for length). "
                             "key_points = bullet list only."
                         ),
                         "default": "transcript",
+                    },
+                    "target_words": {
+                        "type": "integer",
+                        "description": (
+                            "Optional approximate word count when user asks e.g. "
+                            "'400 word summary' or '600 words'. Clamp 80–800."
+                        ),
                     },
                     "language": {
                         "type": "string",
@@ -1592,14 +1598,17 @@ def _has_arabic_or_devanagari(text: str) -> bool:
 
 
 def _refine_transcript_compact(
-    raw: str, title: str = "", mode: str = "transcript"
+    raw: str,
+    title: str = "",
+    mode: str = "transcript",
+    target_words: Optional[int] = None,
 ) -> str:
     """
     One cheap LLM pass → WhatsApp-ready text.
 
     mode:
-      - transcript: cleaned continuous speech text (Roman Urdu when source is Hindi/Urdu)
-      - summary: short overview only
+      - transcript: cleaned continuous speech text
+      - summary: overview (honours target_words when set)
       - key_points: bullet list only
 
     Keeps agent context small (no 50k dump → no 413 / token burn).
@@ -1610,6 +1619,15 @@ def _refine_transcript_compact(
     mode = (mode or "transcript").strip().lower()
     if mode not in ("transcript", "summary", "key_points"):
         mode = "transcript"
+
+    tw = None
+    if target_words is not None:
+        try:
+            tw = int(target_words)
+        except (TypeError, ValueError):
+            tw = None
+        if tw is not None:
+            tw = max(80, min(800, tw))
 
     cleaned = _clean_raw_transcript(raw)
     if _client_ai is None or not _MODEL_NAME:
@@ -1635,13 +1653,24 @@ def _refine_transcript_compact(
         )
 
     if mode == "summary":
-        format_rule = (
-            "MODE=summary. Output ONLY:\n"
-            "- 1 line title if known\n"
-            "- 5–10 short lines covering what the video is about and main arguments\n"
-            "Hard limit: under 1200 characters. No bullets required. No code fences."
-        )
-        max_tok, hard_cap = 600, 1400
+        if tw:
+            # ~5 chars/word rough; leave headroom for title/sections
+            hard_cap = min(4500, max(1400, tw * 7))
+            max_tok = min(2200, max(700, int(tw * 1.6)))
+            format_rule = (
+                f"MODE=summary. Aim for about {tw} words (not fewer than {int(tw*0.7)}). "
+                "Use clear section headings if useful. Cover the whole video fairly. "
+                "ONE complete message — do not say you will send more parts. "
+                f"Hard limit: under {hard_cap} characters. No code fences."
+            )
+        else:
+            format_rule = (
+                "MODE=summary. Output ONLY:\n"
+                "- 1 line title if known\n"
+                "- 5–10 short lines covering what the video is about and main arguments\n"
+                "Hard limit: under 1200 characters. No code fences."
+            )
+            max_tok, hard_cap = 600, 1400
     elif mode == "key_points":
         format_rule = (
             "MODE=key_points. Output ONLY:\n"
@@ -1658,7 +1687,7 @@ def _refine_transcript_compact(
             "speech-like form (not a meta-summary). "
             "Hard limit: under 3200 characters. If truncated, end with "
             "'(transcript long hai — specific hissa chahiye to batao)'. "
-            "No code fences. No 'Key points' section."
+            "ONE message only. No code fences. No 'Key points' section."
         )
         max_tok, hard_cap = 1400, 3500
 
@@ -2181,14 +2210,21 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     mode = (args.get("mode") or "transcript").strip().lower() or "transcript"
     if mode not in ("transcript", "summary", "key_points"):
         mode = "transcript"
+    target_words = args.get("target_words")
+    try:
+        target_words = int(target_words) if target_words is not None else None
+    except (TypeError, ValueError):
+        target_words = None
 
     if not url:
         return "URL required. Example: https://www.youtube.com/watch?v=..."
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # Include mode in cache so summary ≠ transcript
-    cache_k = _cache_key(f"{url}|{mode}", language, with_ts)
+    # Include mode + length in cache so summary ≠ 400-word summary ≠ transcript
+    cache_k = _cache_key(
+        f"{url}|{mode}|tw={target_words or 0}", language, with_ts
+    )
     cached = _cache_get(cache_k)
     if cached:
         return cached
@@ -2206,8 +2242,13 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             first, _, rest = raw_body.partition("\n")
             title = first.replace("Title:", "", 1).strip()
             raw_body = rest.lstrip("\n")
-        refined = _refine_transcript_compact(raw_body, title=title, mode=mode)
-        out = f"Source: {source} | mode={mode}\n\n{refined}"
+        refined = _refine_transcript_compact(
+            raw_body, title=title, mode=mode, target_words=target_words
+        )
+        meta = f"Source: {source} | mode={mode}"
+        if target_words:
+            meta += f" | target_words={target_words}"
+        out = f"{meta}\n\n{refined}"
         _cache_set(cache_k, out)
         return out
 
