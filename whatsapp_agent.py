@@ -1036,7 +1036,144 @@ def _file_magic_kind(path: str) -> str:
         return "unknown"
 
 
-def extract_document_text(tmp_path, mime, ext, max_chars=30000) -> str:
+def _extract_xlsx_smart(path: str, max_chars: int = 60000) -> str:
+    """
+    Excel → compact text optimised for Q&A (distinct clusters, buildings, etc.).
+
+    For each sheet:
+      1. Detect header row
+      2. Collect ALL unique non-empty values per column (capped)
+      3. Prioritise columns that look like cluster/building/project/tower
+      4. Include a small sample of data rows for context
+
+    This avoids the old 200-row dump that missed most inventory rows and
+    caused Groq 413 Payload Too Large on large Damac-style workbooks.
+    """
+    from openpyxl import load_workbook
+    from collections import OrderedDict
+
+    # Columns whose unique values answer "list all clusters / buildings / towers"
+    PRIORITY_COL_HINTS = (
+        "cluster", "building", "project", "tower", "community", "phase",
+        "lagoon", "master project", "master_project", "sub project",
+        "subproject", "unit type", "unit_type", "typology", "wing",
+        "block", "zone", "sector", "neighbourhood", "neighborhood",
+        "villa", "apartment", "residence", "name",
+    )
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    parts: list[str] = []
+
+    try:
+        for sheet in wb.worksheets:
+            # Materialise non-empty rows (string cells only) with a hard safety cap
+            rows: list[tuple] = []
+            for i, row in enumerate(sheet.iter_rows(values_only=True)):
+                if i >= 25000:  # safety — extreme sheets
+                    break
+                vals = tuple("" if v is None else str(v).strip() for v in row)
+                if any(vals):
+                    rows.append(vals)
+            if not rows:
+                parts.append(f"## Sheet: {sheet.title}\n(empty)")
+                continue
+
+            # Header = first row that has ≥2 non-empty cells and looks like labels
+            header = rows[0]
+            data_rows = rows[1:] if len(rows) > 1 else []
+
+            # Normalise header labels
+            headers = []
+            for idx, h in enumerate(header):
+                label = (h or "").strip() or f"Col{idx + 1}"
+                headers.append(label)
+
+            # Collect unique values per column
+            uniques: list[OrderedDict] = [OrderedDict() for _ in headers]
+            for r in data_rows:
+                for c, cell in enumerate(r):
+                    if c >= len(uniques):
+                        break
+                    if not cell:
+                        continue
+                    # Cap individual value length
+                    val = cell if len(cell) <= 120 else cell[:117] + "…"
+                    if val not in uniques[c] and len(uniques[c]) < 800:
+                        uniques[c][val] = None
+
+            # Rank columns: priority name match first, then by cardinality (more uniques = more useful for "list all")
+            def col_score(ci: int) -> tuple:
+                name_l = headers[ci].lower()
+                pri = 0
+                for hint in PRIORITY_COL_HINTS:
+                    if hint in name_l:
+                        pri = 1
+                        break
+                n_unique = len(uniques[ci])
+                # Prefer moderate-high cardinality (not a single constant, not every-row-unique IDs)
+                useful = 1 if 2 <= n_unique <= 500 else 0
+                return (pri, useful, n_unique)
+
+            order = sorted(range(len(headers)), key=col_score, reverse=True)
+
+            sheet_lines = [
+                f"## Sheet: {sheet.title}",
+                f"Rows (data): {len(data_rows)} | Columns: {len(headers)}",
+                "Headers: " + " | ".join(headers),
+            ]
+
+            # Emit distinct-value lists for the most useful columns first
+            emitted = 0
+            for ci in order:
+                n = len(uniques[ci])
+                if n == 0:
+                    continue
+                # Skip pure ID columns with huge cardinality (unit numbers etc.)
+                name_l = headers[ci].lower()
+                if n > 400 and not any(h in name_l for h in PRIORITY_COL_HINTS):
+                    continue
+                vals_list = list(uniques[ci].keys())
+                # Sort for stable readable output
+                try:
+                    vals_list = sorted(vals_list, key=lambda s: s.lower())
+                except Exception:
+                    pass
+                sheet_lines.append(
+                    f"\n### Distinct values in column [{headers[ci]}] ({n} unique):"
+                )
+                for v in vals_list:
+                    sheet_lines.append(f"- {v}")
+                emitted += 1
+                if emitted >= 12:  # enough columns for Q&A
+                    break
+
+            # Sample rows for context (head + tail)
+            sample_n = min(25, len(data_rows))
+            if sample_n:
+                sheet_lines.append("\n### Sample rows (tab-separated):")
+                sheet_lines.append("\t".join(headers))
+                for r in data_rows[:sample_n]:
+                    # pad/truncate to header width
+                    cells = list(r) + [""] * max(0, len(headers) - len(r))
+                    sheet_lines.append("\t".join(cells[: len(headers)]))
+                if len(data_rows) > sample_n:
+                    sheet_lines.append(
+                        f"…[{len(data_rows) - sample_n} more data rows not shown; "
+                        "use the Distinct values lists above for complete cluster/building lists]…"
+                    )
+
+            parts.append("\n".join(sheet_lines))
+    finally:
+        wb.close()
+
+    text = "\n\n".join(parts).strip()
+    if len(text) > max_chars:
+        # Prefer keeping distinct-value sections; cut sample rows first by hard slice
+        text = text[:max_chars] + "\n\n…[xlsx extract truncated at char limit]…"
+    return text
+
+
+def extract_document_text(tmp_path, mime, ext, max_chars=60000) -> str:
     """Return plain text from common document types. Raises on hard failure."""
     path = tmp_path
     text = ""
@@ -1064,26 +1201,16 @@ def extract_document_text(tmp_path, mime, ext, max_chars=30000) -> str:
         text = "\n".join(parts)
 
     # --- Excel (.xlsx) ---
+    # Inventory/sales sheets can be 1k–20k rows. Dumping raw rows hits 413 and
+    # misses distinct clusters/buildings. Prefer: headers + full unique values
+    # per categorical column + small row sample.
     elif ext == ".xlsx" or "spreadsheetml" in mime:
         if _file_magic_kind(path) != "zip_ooxml":
             raise ValueError(
                 "File is not a real .xlsx (content is not an Excel package). "
                 "Open it in Excel and Save As .xlsx, or send PDF/CSV."
             )
-        from openpyxl import load_workbook
-        wb = load_workbook(path, read_only=True, data_only=True)
-        chunks = []
-        for sheet in wb.worksheets:
-            chunks.append(f"## Sheet: {sheet.title}")
-            for i, row in enumerate(sheet.iter_rows(values_only=True)):
-                if i > 200:  # cap rows per sheet
-                    chunks.append("…[more rows truncated]…")
-                    break
-                vals = ["" if v is None else str(v) for v in row]
-                if any(v.strip() for v in vals):
-                    chunks.append("\t".join(vals))
-        wb.close()
-        text = "\n".join(chunks)
+        text = _extract_xlsx_smart(path, max_chars=max_chars)
 
     # --- PowerPoint (.pptx) ---
     elif ext == ".pptx" or "presentationml" in mime:

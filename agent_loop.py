@@ -306,19 +306,37 @@ def _sanitize_messages_for_gemini(messages: List[dict]) -> List[dict]:
 
 
 def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
-    """Drop older turns to recover from 413 Payload Too Large."""
+    """Drop older turns to recover from 413 Payload Too Large.
+
+    Preserve the latest user message more aggressively — it often carries a
+    full document extract (xlsx distinct values). Truncating that to 1200
+    chars is what made cluster lists incomplete.
+    """
     if not messages:
         return messages
     system = [m for m in messages if m.get("role") == "system"][:1]
     rest = [m for m in messages if m.get("role") != "system"]
-    # Keep the most recent turns (tools + user + assistant)
     rest = rest[-keep_last:]
-    # Also hard-cap content length
     out = []
-    for m in system + rest:
+    for idx, m in enumerate(system + rest):
         c = m.get("content")
-        if isinstance(c, str) and len(c) > 1200:
-            m = {**m, "content": c[:1200] + "…"}
+        if not isinstance(c, str):
+            out.append(m)
+            continue
+        is_last_user = (
+            m.get("role") == "user"
+            and idx == len(system + rest) - 1
+        )
+        is_doc = "[Document:" in c or "### Distinct values" in c
+        # Keep document / latest user extracts much larger
+        if is_last_user or is_doc:
+            cap = 50000
+        elif m.get("role") == "tool":
+            cap = 3500
+        else:
+            cap = 1200
+        if len(c) > cap:
+            m = {**m, "content": c[:cap] + "…"}
         out.append(m)
     return out
 
