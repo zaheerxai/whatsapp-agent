@@ -59,7 +59,7 @@ def _is_vague_ack(text: str) -> bool:
 def _is_bad_post_tool_reply(text: str) -> bool:
     """
     Catch replies that discard good tool OBS: multi-part promises, 'part 1',
-    technical-issue placeholders, pure meta without the actual content.
+    invented rate-limit excuses, pure meta without the actual content.
     """
     t = (text or "").strip()
     if _is_vague_ack(t):
@@ -79,6 +79,13 @@ def _is_bad_post_tool_reply(text: str) -> bool:
         "dobara try",
         "try again later",
         "ek second baad",
+        "request limit",
+        "rate limit",
+        "rate-limit",
+        "couldn't pull",
+        "could not pull",
+        "try again later",
+        "due to a request",
     )
     if any(m in low for m in bad_markers):
         return True
@@ -502,50 +509,192 @@ def run_agent(
         # de-dupe
         _seen = set()
         urls_in_last = [u for u in urls_in_last if not (u in _seen or _seen.add(u))]
-        if urls_in_last:
-            # Deterministic pre-fetch instead of asking the model to call browse_url:
-            # tool_choice="auto" means a "You MUST call X" system prompt is a request,
-            # not a guarantee — the model can skip it, call something else first, or
-            # retype the URL wrong. We already know the exact URL, so fetch it
-            # ourselves and inject a synthetic assistant tool_call + tool result.
-            # The model then answers from real data on this turn, no dice roll.
-            primary_url = urls_in_last[0]
-            print(f"[AGENT] force browse_url for: {urls_in_last}")
-            try:
-                _forced_observation = execute_tool("browse_url", {"url": primary_url}, tool_ctx)
-            except Exception as _fe:
-                _forced_observation = f"Tool error: {_fe}"
-            _forced_obs_str = str(_forced_observation)
-            if len(_forced_obs_str) > MAX_OBS_CHARS:
-                _forced_obs_str = _forced_obs_str[:MAX_OBS_CHARS] + "…"
 
-            _forced_call_id = "call_forced_browse_0"
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": _forced_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": "browse_url",
-                        "arguments": json.dumps({"url": primary_url}),
-                    },
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": _forced_call_id,
-                "content": _forced_obs_str,
-            })
-            messages.append({
-                "role": "system",
-                "content": (
-                    f"You already fetched {primary_url} above via browse_url — that IS the "
-                    "user's latest link. Answer from that tool result only. Do NOT call "
-                    "browse_url again this turn, and ignore any older/different links from "
-                    "chat history."
-                ),
-            })
+        # Resolve the user text used for intent detection
+        _intent_text = (latest_user_text or "")
+        if not _intent_text:
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    _intent_text = m.get("content") or ""
+                    break
+        _intent_low = _intent_text.lower()
+
+        def _is_video_url(u: str) -> bool:
+            ul = (u or "").lower()
+            return any(
+                h in ul
+                for h in (
+                    "youtube.com/",
+                    "youtu.be/",
+                    "tiktok.com/",
+                    "vm.tiktok.com/",
+                    "vt.tiktok.com/",
+                    "vimeo.com/",
+                    "facebook.com/watch",
+                    "fb.watch/",
+                    "instagram.com/reel",
+                    "instagram.com/p/",
+                    "instagram.com/tv/",
+                )
+            )
+
+        def _video_spoken_intent(text_low: str) -> Optional[str]:
+            """Return transcribe_video mode if user wants spoken content, else None."""
+            if any(
+                w in text_low
+                for w in (
+                    "transcript",
+                    "poora transcript",
+                    "whole transcript",
+                    "full transcript",
+                    "likh ke do",
+                    "kya bola",
+                    "kya kaha",
+                    "is video me kya",
+                    "video me kya",
+                )
+            ):
+                return "transcript"
+            if any(
+                w in text_low
+                for w in (
+                    "key points",
+                    "keypoints",
+                    "main baatein",
+                    "main points",
+                    "bullet",
+                )
+            ):
+                return "key_points"
+            if any(
+                w in text_low
+                for w in (
+                    "summary",
+                    "summarise",
+                    "summarize",
+                    "khulasa",
+                    "short me batao",
+                    "kis bare me",
+                    "kis baare",
+                    "what is this video",
+                    "video about",
+                    "is video ka",
+                )
+            ):
+                return "summary"
+            return None
+
+        def _parse_target_words(text_low: str) -> Optional[int]:
+            m = _re.search(r"(\d{2,4})\s*[- ]?\s*words?", text_low)
+            if not m:
+                m = _re.search(r"(\d{2,4})\s*word", text_low)
+            if not m:
+                return None
+            try:
+                n = int(m.group(1))
+                return max(80, min(800, n))
+            except ValueError:
+                return None
+
+        if urls_in_last:
+            # Deterministic pre-fetch: tool_choice=auto is not a guarantee the model
+            # will call the right tool. Inject the tool result ourselves.
+            primary_url = urls_in_last[0]
+            spoken_mode = _video_spoken_intent(_intent_low)
+            use_video = spoken_mode and _is_video_url(primary_url)
+
+            if use_video:
+                tw = _parse_target_words(_intent_low)
+                tool_args: Dict[str, Any] = {
+                    "url": primary_url,
+                    "mode": spoken_mode,
+                    "language": "auto",
+                    "timestamps": False,
+                }
+                if tw and spoken_mode == "summary":
+                    tool_args["target_words"] = tw
+                print(
+                    f"[AGENT] force transcribe_video mode={spoken_mode} "
+                    f"tw={tw} for: {primary_url}"
+                )
+                try:
+                    _forced_observation = execute_tool(
+                        "transcribe_video", tool_args, tool_ctx
+                    )
+                except Exception as _fe:
+                    _forced_observation = f"Tool error: {_fe}"
+                _forced_obs_str = str(_forced_observation)
+                _obs_cap = MAX_OBS_CHARS_TRANSCRIPT
+                if len(_forced_obs_str) > _obs_cap:
+                    _forced_obs_str = _forced_obs_str[:_obs_cap] + "…"
+
+                _forced_call_id = "call_forced_transcribe_0"
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": _forced_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "transcribe_video",
+                            "arguments": json.dumps(tool_args),
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": _forced_call_id,
+                    "content": _forced_obs_str,
+                })
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"You already ran transcribe_video on {primary_url} "
+                        f"(mode={spoken_mode}). Answer from that tool result only in "
+                        "ONE message. Present the content almost as-is. Do NOT invent a "
+                        "rate-limit / request-limit excuse. Do NOT call transcribe_video "
+                        "or browse_url again this turn. Do NOT promise parts later."
+                    ),
+                })
+            else:
+                print(f"[AGENT] force browse_url for: {urls_in_last}")
+                try:
+                    _forced_observation = execute_tool(
+                        "browse_url", {"url": primary_url}, tool_ctx
+                    )
+                except Exception as _fe:
+                    _forced_observation = f"Tool error: {_fe}"
+                _forced_obs_str = str(_forced_observation)
+                if len(_forced_obs_str) > MAX_OBS_CHARS:
+                    _forced_obs_str = _forced_obs_str[:MAX_OBS_CHARS] + "…"
+
+                _forced_call_id = "call_forced_browse_0"
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": _forced_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "browse_url",
+                            "arguments": json.dumps({"url": primary_url}),
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": _forced_call_id,
+                    "content": _forced_obs_str,
+                })
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"You already fetched {primary_url} above via browse_url — that IS the "
+                        "user's latest link. Answer from that tool result only. Do NOT call "
+                        "browse_url again this turn, and ignore any older/different links from "
+                        "chat history. Do NOT invent rate-limit errors."
+                    ),
+                })
 
         # --- Agentic loop ---
         for step in range(MAX_TOOL_STEPS):
@@ -602,8 +751,10 @@ def run_agent(
 
             if not tool_calls:
                 answer = (content or "").strip()
-                # After tools: reject vague acks, multi-part promises, meta-only replies
-                if step > 0 and _is_bad_post_tool_reply(answer):
+                # After tools (including force-injected ones before the loop): reject
+                # vague acks, multi-part promises, invented rate-limit excuses.
+                had_tools = any(m.get("role") == "tool" for m in messages)
+                if had_tools and _is_bad_post_tool_reply(answer):
                     logging.getLogger("mojo.agent").info(
                         "BAD_AFTER_TOOLS answer=%r — forcing synthesis or OBS", answer
                     )
@@ -611,9 +762,10 @@ def run_agent(
                         "role": "user",
                         "content": (
                             "Tool results are already above. Reply with the useful content "
-                            "from those results in ONE message. Do NOT say you will send "
-                            "parts later. Do NOT only acknowledge. Prefer the tool text as-is "
-                            "if it is already a clean transcript/summary."
+                            "from those results in ONE message. Do NOT invent rate-limit or "
+                            "request-limit errors. Do NOT say you will send parts later. "
+                            "Prefer the tool text as-is if it is already a clean "
+                            "transcript/summary."
                         ),
                     })
                     try:
