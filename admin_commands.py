@@ -288,15 +288,19 @@ def set_feature_enabled(chat_id, feature, enabled):
         print(f"Error saving feature flag {feature} for {chat_id}: {e}")
 
 
-# --- Agent tool flags (default OFF everywhere) ---
+# --- Agent tool flags ---
+# Non-owner chats: default OFF (explicit enable required).
+# Owner private chat: default ON for every known tool (and any future entry in
+# KNOWN_TOOLS) unless an explicit row disables it — same policy as features.
 
 def is_tool_enabled(chat_id, tool_name: str) -> bool:
-    """Per-chat tool flag. Default False for everyone (no owner auto-ON).
+    """Per-chat tool flag.
 
     Resolution order:
       1. Exact (chat_id, tool:<name>) row
-      2. Global (*, tool:<name>) row
-      3. False
+      2. Owner private chat → True (admin gets all tools + future additions ON)
+      3. Global (*, tool:<name>) row
+      4. False
 
     Owner-only tools still require OWNER_SENDER_ID at executor time; this flag
     only controls whether the tool appears in the agent schema / force-path.
@@ -309,6 +313,10 @@ def is_tool_enabled(chat_id, tool_name: str) -> bool:
             .eq("chat_id", chat_id).eq("feature", key).execute()
         if response.data:
             return bool(response.data[0]["enabled"])
+
+        # Admin / owner private chat: all tools and future KNOWN_TOOLS entries ON
+        if OWNER_SENDER_ID and chat_id and chat_id.split("@")[0] == OWNER_SENDER_ID:
+            return True
 
         response = _supabase.table("feature_flags").select("enabled") \
             .eq("chat_id", "*").eq("feature", key).execute()
@@ -453,7 +461,10 @@ def cmd_status(args):
             state = "🟢 ON" if is_feature_enabled(resolved_id, feature) else "🔴 OFF"
             lines.append(f"- {feature}: {state}")
 
-        lines.append(f"\nTool flags for {target} ({resolved_id}) — default OFF:")
+        lines.append(
+            f"\nTool flags for {target} ({resolved_id}) "
+            "(owner private: default ON; others: default OFF):"
+        )
         for tool in KNOWN_TOOLS:
             state = "🟢 ON" if is_tool_enabled(resolved_id, tool) else "🔴 OFF"
             owner_tag = " (owner-only)" if tool in OWNER_ONLY_TOOLS else ""
@@ -461,7 +472,9 @@ def cmd_status(args):
     else:
         lines.append(
             "\nPass a phone number, group name, or 'all' to view feature + tool flags.\n"
-            f"Tools (default OFF): {', '.join(KNOWN_TOOLS)}"
+            "Policy: owner private chat → features+tools default ON; "
+            "all other chats → default OFF until /enable.\n"
+            f"Tools: {', '.join(KNOWN_TOOLS)}"
         )
     return "\n".join(lines)
 
