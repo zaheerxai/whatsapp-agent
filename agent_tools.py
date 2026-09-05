@@ -1693,6 +1693,11 @@ def _refine_transcript_compact(
 
     system = (
         "You prepare video transcripts for WhatsApp. Be faithful. No fluff.\n"
+        "CRITICAL: Use ONLY facts and words supported by the Raw transcript below. "
+        "Do NOT invent scenes, topics, greetings, or conclusions that are not clearly "
+        "present in the raw text. If the raw transcript is very short or mostly noise, "
+        "say so in one honest line (e.g. 'Transcript bahut short / unclear hai') — "
+        "do NOT pad it into a fake multi-bullet summary.\n"
         f"{script_rule}\n"
         f"{format_rule}"
     )
@@ -1824,24 +1829,25 @@ def _try_piped_captions(
 def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[str]:
     """
     Managed API — YouTube, TikTok, Instagram, Facebook, X (cloud-friendly).
-    Requires SUPADATA_API_KEY (100 free credits/mo). mode=auto uses native
-    captions when present, otherwise AI generate.
-    Handles async jobId responses by short-polling.
+    Requires SUPADATA_API_KEY (100 free credits/mo).
+
+    Instagram/Facebook rarely expose native captions → try mode=auto then
+    mode=generate. Handles async jobId via short-polling.
     """
     api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
     if not api_key:
+        print("[transcribe_video] Supadata skipped — SUPADATA_API_KEY not set")
         return None
+    print(
+        f"[transcribe_video] Supadata key present (…{api_key[-4:]}) "
+        f"url={url[:80]}"
+    )
 
-    params: Dict[str, Any] = {
-        "url": url,
-        "text": "false" if with_timestamps else "true",
-        "mode": "auto",
-    }
     lang = (language or "auto").strip().lower()
-    if lang and lang not in ("auto", ""):
-        params["lang"] = lang
 
     def _parse_content(data: dict) -> Optional[str]:
+        if not isinstance(data, dict):
+            return None
         content = data.get("content")
         if isinstance(content, str):
             return content.strip() or None
@@ -1865,60 +1871,114 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
                     dur_s = 0.0
                 segs.append({"text": t, "start": start_s, "duration": dur_s})
             return _format_segments(segs, with_timestamps) if segs else None
-        # Alternate shapes
         for key in ("transcript", "text", "plainText"):
             v = data.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
+        # Nested result shapes
+        for nest in ("data", "result", "transcript"):
+            inner = data.get(nest)
+            if isinstance(inner, dict):
+                got = _parse_content(inner)
+                if got:
+                    return got
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
         return None
 
-    try:
-        r = requests.get(
-            "https://api.supadata.ai/v1/transcript",
-            params=params,
-            headers={"x-api-key": api_key, "Accept": "application/json"},
-            timeout=90,
-        )
-        # 206 = transcript unavailable under current mode
-        if r.status_code == 206:
-            print("[transcribe_video] Supadata 206 transcript unavailable")
-            return None
-        if r.status_code not in (200, 202):
-            print(f"[transcribe_video] Supadata HTTP {r.status_code}: {r.text[:160]}")
-            return None
-        data = r.json() or {}
-        # Async job?
-        job_id = data.get("jobId") or data.get("job_id")
-        if job_id:
-            print(f"[transcribe_video] Supadata job {job_id} — polling")
-            for _ in range(12):
-                time.sleep(2.5)
-                jr = requests.get(
-                    f"https://api.supadata.ai/v1/transcript/{job_id}",
-                    headers={"x-api-key": api_key, "Accept": "application/json"},
-                    timeout=30,
-                )
+    def _poll_job(job_id: str) -> Optional[str]:
+        print(f"[transcribe_video] Supadata job {job_id} — polling")
+        job_urls = [
+            f"https://api.supadata.ai/v1/transcript/{job_id}",
+            f"https://api.supadata.ai/v1/transcript/job/{job_id}",
+            f"https://api.supadata.ai/v1/job/{job_id}",
+        ]
+        for _ in range(18):  # ~45s
+            time.sleep(2.5)
+            for ju in job_urls:
+                try:
+                    jr = requests.get(
+                        ju,
+                        headers={"x-api-key": api_key, "Accept": "application/json"},
+                        timeout=30,
+                    )
+                except Exception as e:
+                    print(f"[transcribe_video] Supadata poll error: {e}")
+                    continue
                 if jr.status_code not in (200, 202):
-                    print(f"[transcribe_video] Supadata job HTTP {jr.status_code}")
-                    break
+                    continue
                 jdata = jr.json() or {}
-                status = (jdata.get("status") or "").lower()
-                if status in ("completed", "done", "success") or jdata.get("content"):
-                    parsed = _parse_content(jdata)
-                    if parsed:
-                        return parsed
-                    break
+                status = str(jdata.get("status") or "").lower()
+                parsed = _parse_content(jdata)
+                if parsed:
+                    print(f"[transcribe_video] Supadata job OK chars={len(parsed)}")
+                    return parsed
                 if status in ("failed", "error"):
-                    print(f"[transcribe_video] Supadata job failed: {jdata}")
-                    break
-            return None
-        parsed = _parse_content(data)
-        if parsed:
-            print(f"[transcribe_video] Supadata OK chars={len(parsed)}")
-        return parsed
-    except Exception as e:
-        print(f"[transcribe_video] Supadata error: {e}")
+                    print(f"[transcribe_video] Supadata job failed: {str(jdata)[:200]}")
+                    return None
+                if status in ("pending", "processing", "queued", "running", ""):
+                    break  # try next sleep cycle
+            else:
+                continue
+        print("[transcribe_video] Supadata job timed out")
         return None
+
+    def _one_mode(mode: str) -> Optional[str]:
+        params: Dict[str, Any] = {
+            "url": url,
+            "text": "false" if with_timestamps else "true",
+            "mode": mode,
+        }
+        if lang and lang not in ("auto", ""):
+            params["lang"] = lang
+        try:
+            r = requests.get(
+                "https://api.supadata.ai/v1/transcript",
+                params=params,
+                headers={"x-api-key": api_key, "Accept": "application/json"},
+                timeout=120,
+            )
+            if r.status_code == 206:
+                print(f"[transcribe_video] Supadata mode={mode} → 206 unavailable")
+                return None
+            if r.status_code not in (200, 202):
+                print(
+                    f"[transcribe_video] Supadata mode={mode} HTTP {r.status_code}: "
+                    f"{r.text[:200]}"
+                )
+                return None
+            data = r.json() or {}
+            job_id = data.get("jobId") or data.get("job_id")
+            if job_id:
+                return _poll_job(str(job_id))
+            parsed = _parse_content(data)
+            if parsed:
+                print(
+                    f"[transcribe_video] Supadata mode={mode} OK chars={len(parsed)}"
+                )
+                return parsed
+            print(
+                f"[transcribe_video] Supadata mode={mode} empty body keys="
+                f"{list(data.keys())[:12]}"
+            )
+            return None
+        except Exception as e:
+            print(f"[transcribe_video] Supadata mode={mode} error: {e}")
+            return None
+
+    # IG/FB: native captions rare → try generate first for reliability
+    is_meta = _is_instagram_url(url) or _is_facebook_url(url)
+    modes = ("generate", "auto") if is_meta else ("auto", "generate")
+    for m in modes:
+        got = _one_mode(m)
+        if got and len(got.strip()) >= 20:
+            return got
+        if got:
+            print(
+                f"[transcribe_video] Supadata mode={m} too short "
+                f"({len(got.strip())} chars) — trying next"
+            )
+    return None
 
 
 def _try_youtube_captions(
@@ -2326,7 +2386,8 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
     outtmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
 
     base_opts: Dict[str, Any] = {
-        "format": "bestaudio/best",
+        # Prefer real audio stream; fall back to muxed best (IG often has no separate ba)
+        "format": "bestaudio[ext=m4a]/bestaudio/best[height<=720]/best",
         "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
@@ -2450,6 +2511,11 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
                     raise RuntimeError("yt-dlp returned no info for this URL.")
                 duration = float(info.get("duration") or 0)
                 vid = info.get("id") or "audio"
+                title = (info.get("title") or info.get("fulltitle") or "")[:80]
+                print(
+                    f"[transcribe_video] yt-dlp downloaded id={vid} "
+                    f"duration={duration:.1f}s title={title!r}"
+                )
                 mp3_path = os.path.join(out_dir, f"{vid}.mp3")
                 if not os.path.isfile(mp3_path):
                     candidates = [
@@ -2460,6 +2526,16 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
                     if not candidates:
                         raise RuntimeError("Audio download finished but no file found.")
                     mp3_path = candidates[0]
+                # Reject absurdly short files for non-trivial videos
+                try:
+                    fsz = os.path.getsize(mp3_path)
+                except OSError:
+                    fsz = 0
+                if duration >= 15 and fsz < 8000:
+                    raise RuntimeError(
+                        f"Downloaded audio too small ({fsz} bytes for {duration:.0f}s) — "
+                        "wrong/partial stream"
+                    )
                 return mp3_path, duration
         except Exception as e:
             last_err = e
@@ -2701,7 +2777,9 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 return f"Speech-to-text failed: {e}"
 
             if not raw or not raw.strip():
-                return "Transcription returned empty text (silent video or unsupported language)."
+                raise RuntimeError(
+                    "Transcription returned empty text (silent video or unsupported language)."
+                )
 
             # If caller did not want timestamps, strip them
             if not with_ts and raw.lstrip().startswith("["):
@@ -2713,6 +2791,23 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 text = re.sub(r"\s+", " ", cleaned).strip()
             else:
                 text = raw.strip()
+
+            # Guard: very thin ASR vs longer video → likely wrong/partial download
+            # (this caused fake "What's up / Bye" summaries on Instagram reels).
+            word_count = len(re.findall(r"\w+", text))
+            print(
+                f"[transcribe_video] ASR words={word_count} duration={duration:.1f}s "
+                f"chars={len(text)}"
+            )
+            if duration and duration >= 12 and word_count < 12:
+                raise RuntimeError(
+                    f"ASR too thin ({word_count} words for {duration:.0f}s video) — "
+                    "likely wrong/partial audio stream"
+                )
+            if word_count < 4:
+                raise RuntimeError(
+                    f"ASR too thin ({word_count} words) — not usable as transcript"
+                )
 
             return _pack("speech-to-text (audio download)", text)
     except Exception as e:
