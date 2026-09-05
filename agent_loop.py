@@ -142,6 +142,11 @@ def _is_bad_post_tool_reply(text: str) -> bool:
         "exact details nahi",
         "fetch nahi ho paaya",
         "fetch nahi hua",
+        "koi detail ya content",
+        "content yahan available nahi",
+        "summarize nahi kar sakta",
+        "detail ya content yahan",
+        "available nahi hai, isliye",
     )
     if any(m in low for m in bad_markers):
         return True
@@ -726,13 +731,53 @@ def run_agent(
                     "samjha do",
                     "tell me about",
                     "about this",
+                    # Roman Urdu "tell me" variants (common miss before)
+                    "batana",
+                    "bata na",
+                    "bata do",
+                    "bata dena",
+                    "btao",
+                    "btana",
+                    "ye bata",
+                    "ye batana",
+                    "mujhe bata",
+                    "sunao",
+                    "suna do",
+                    "suna dena",
+                    "dekho ye",
+                    "check karo",
+                    "dekhna",
+                    "dekho isko",
                 )
             ):
                 return "summary"
             # Very short residual text after stripping URL/mention ("?", "ye?", "ye")
             # still means "tell me about the linked video".
             residual = re.sub(r"[^\w\s]", "", t).strip()
-            if residual in ("", "ye", "yeh", "this", "bro", "bhai", "ji", "pls", "please"):
+            residual_l = residual.lower()
+            if residual_l in (
+                "",
+                "ye",
+                "yeh",
+                "this",
+                "bro",
+                "bhai",
+                "ji",
+                "pls",
+                "please",
+                "yaar",
+                "yar",
+                "boss",
+            ):
+                return "summary"
+            # Any short residual (≤6 tokens) that is not pure greeting → summary.
+            # Covers "ye batana", "ye batao", "isko dekho", "bata", etc.
+            tokens = residual_l.split()
+            greetings = {
+                "hi", "hello", "hey", "salam", "salaam", "assalam", "asalam",
+                "thanks", "shukriya", "ok", "okay", "theek", "haan", "han",
+            }
+            if tokens and len(tokens) <= 6 and not all(tok in greetings for tok in tokens):
                 return "summary"
             return None
 
@@ -772,26 +817,24 @@ def run_agent(
             # If intent matched → use that mode; if intent missed but URL is clearly
             # a video and the user is asking about the linked message, default summary.
             if is_video and not spoken_mode:
-                # Link-intent / "about the quoted video" without exact phrase match
-                _li = _intent_low
-                if any(
-                    w in _li
-                    for w in (
-                        "kya",
-                        "what",
-                        "about",
-                        "summary",
-                        "summar",
-                        "batao",
-                        "batain",
-                        "explain",
-                        "samjha",
-                        "content",
-                        "video",
-                        "reel",
-                    )
-                ):
+                # Broad net: almost any non-empty ask with a video URL → summary.
+                # Only skip pure greetings so we don't force-transcribe on "hi @bot".
+                _li = re.sub(r"@\d[\d\s]*", " ", _intent_low or "")
+                _li = re.sub(r"\[quoted message\]:.*", " ", _li, flags=re.I | re.S)
+                _li = re.sub(r"https?://\S+", " ", _li)
+                _li = re.sub(r"\s+", " ", _li).strip()
+                _greet_only = re.fullmatch(
+                    r"(hi|hello|hey|salam|salaam|assalamu?alaikum|ok|okay|thanks|shukriya|"
+                    r"theek|haan|han|ji|bro|bhai)?[\s!.]*",
+                    _li,
+                    flags=re.I,
+                )
+                if _li and not _greet_only:
                     spoken_mode = "summary"
+                    print(
+                        f"[AGENT] video URL + non-greeting ask → force summary "
+                        f"intent={_li[:80]!r}"
+                    )
             use_video = bool(spoken_mode and is_video)
             can_transcribe = _tool_allowed_for_chat(chat_id, "transcribe_video")
             can_browse = _tool_allowed_for_chat(chat_id, "browse_url")
