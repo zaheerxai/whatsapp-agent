@@ -2383,6 +2383,20 @@ def execute_tool(name: str, arguments: dict, ctx: dict) -> str:
     fn = TOOL_EXECUTORS.get(name)
     if not fn:
         return f"Unknown tool: {name}"
+    # Admin tool flags (default OFF). Fail closed if control plane unavailable.
+    # Owner-only tools keep their existing executor checks as a second layer.
+    try:
+        import admin_commands as _ac
+        chat_id = (ctx or {}).get("chat_id") or ""
+        if name in getattr(_ac, "KNOWN_TOOLS", ()) and chat_id:
+            if not _ac.is_tool_enabled(chat_id, name):
+                return (
+                    f"Tool '{name}' is disabled for this chat. "
+                    "Ask the bot owner to enable it if needed."
+                )
+    except Exception as e:
+        print(f"[execute_tool] permission check failed for {name}: {e}")
+        return f"Tool '{name}' unavailable (permission check failed)."
     try:
         return fn(arguments or {}, ctx)
     except Exception as e:

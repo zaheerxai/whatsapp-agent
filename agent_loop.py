@@ -17,6 +17,11 @@ from zoneinfo import ZoneInfo
 
 from agent_tools import TOOL_SCHEMAS, execute_tool, LANGUAGE_POLICY
 
+try:
+    import admin_commands as _admin_commands
+except ImportError:  # pragma: no cover — always present in production package
+    _admin_commands = None
+
 # Injected
 _client_ai = None
 _client_gemini = None
@@ -41,6 +46,43 @@ MAX_OBS_CHARS_TRANSCRIPT = 3500
 # Cap completion size — WhatsApp replies are short; unbounded drafts burn quota
 MAX_COMPLETION_TOKENS = 1024
 MAX_COMPLETION_TOKENS_SHORT = 512
+
+
+def _tool_allowed_for_chat(chat_id: str, tool_name: str) -> bool:
+    """True only if admin enabled this tool for the chat (default OFF)."""
+    if not tool_name:
+        return False
+    if _admin_commands is None:
+        # Fail closed if control plane missing
+        return False
+    try:
+        return bool(_admin_commands.is_tool_enabled(chat_id, tool_name))
+    except Exception as e:
+        print(f"[AGENT] is_tool_enabled failed for {tool_name}: {e}")
+        return False
+
+
+def _schemas_for_chat(chat_id: str) -> List[Dict[str, Any]]:
+    """Subset of TOOL_SCHEMAS that are enabled for this chat. Empty = pure chat."""
+    if _admin_commands is None:
+        return []
+    try:
+        enabled = set(_admin_commands.get_enabled_tools(chat_id) or [])
+    except Exception as e:
+        print(f"[AGENT] get_enabled_tools failed: {e}")
+        return []
+    if not enabled:
+        return []
+    out: List[Dict[str, Any]] = []
+    for schema in TOOL_SCHEMAS:
+        name = (
+            (schema.get("function") or {}).get("name")
+            if isinstance(schema, dict)
+            else None
+        )
+        if name and name in enabled:
+            out.append(schema)
+    return out
 
 _VAGUE_ACK_RE = re.compile(
     r"^(theek hai|ok|okay|done|ho gaya|sure|haan|ji|alright|got it)"
@@ -625,18 +667,30 @@ def run_agent(
             except ValueError:
                 return None
 
-        # After force-inject, next completion must NOT re-send full tool schemas
-        # (large payload) or invite more tool calls — synthesis only.
-        tools_for_next: Optional[List] = TOOL_SCHEMAS
+        # Only tools the admin enabled for this chat are offered to the model.
+        # Default is empty → pure conversational reply (ai_chat), no tools.
+        tools_for_next: Optional[List] = _schemas_for_chat(chat_id)
+        if tools_for_next:
+            print(
+                f"[AGENT] tools enabled for {chat_id}: "
+                + ", ".join(
+                    (s.get("function") or {}).get("name", "?") for s in tools_for_next
+                )
+            )
+        else:
+            print(f"[AGENT] no tools enabled for {chat_id} — chat-only mode")
 
         if urls_in_last:
             # Deterministic pre-fetch: tool_choice=auto is not a guarantee the model
-            # will call the right tool. Inject the tool result ourselves.
+            # will call the right tool. Inject the tool result ourselves — but ONLY
+            # when the corresponding tool flag is ON for this chat.
             primary_url = urls_in_last[0]
             spoken_mode = _video_spoken_intent(_intent_low)
             use_video = spoken_mode and _is_video_url(primary_url)
+            can_transcribe = _tool_allowed_for_chat(chat_id, "transcribe_video")
+            can_browse = _tool_allowed_for_chat(chat_id, "browse_url")
 
-            if use_video:
+            if use_video and can_transcribe:
                 tw = _parse_target_words(_intent_low)
                 tool_args: Dict[str, Any] = {
                     "url": primary_url,
@@ -704,7 +758,23 @@ def run_agent(
                         "or browse_url again this turn. Do NOT promise parts later."
                     ),
                 })
-            else:
+                tools_for_next = None  # synthesis only — no tool schema payload
+            elif use_video and not can_transcribe:
+                print(
+                    f"[AGENT] SKIP force transcribe_video — tool disabled for {chat_id}"
+                )
+                logging.getLogger("mojo.agent").info(
+                    "TOOL_BLOCKED transcribe_video chat=%s", chat_id
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Video transcript/summary tool is turned OFF for this chat. "
+                        "Politely tell the user you cannot transcribe or summarize "
+                        "video links here. Do NOT invent a transcript or summary."
+                    ),
+                })
+            elif can_browse:
                 print(f"[AGENT] force browse_url for: {urls_in_last}")
                 try:
                     _forced_observation = execute_tool(
@@ -744,6 +814,14 @@ def run_agent(
                     ),
                 })
                 tools_for_next = None  # synthesis only — no tool schema payload
+            else:
+                # URL present but neither transcribe nor browse is allowed
+                print(
+                    f"[AGENT] SKIP force URL tools — disabled for {chat_id} url={primary_url}"
+                )
+                logging.getLogger("mojo.agent").info(
+                    "TOOL_BLOCKED browse_url/transcribe chat=%s", chat_id
+                )
 
         # --- Agentic loop ---
         for step in range(MAX_TOOL_STEPS):
@@ -857,11 +935,22 @@ def run_agent(
                     args = {}
                 print(f"[AGENT TOOL] step={step+1} {name}({args})")
                 logging.getLogger("mojo.agent").info("TOOL %s %s", name, args)
-                try:
-                    observation = execute_tool(name, args, tool_ctx)
-                except Exception as te:
-                    traceback.print_exc()
-                    observation = f"Tool error: {te}"
+                # Defense in depth: refuse tools not enabled for this chat even if
+                # the model hallucinated a call (or schemas leaked from history).
+                if not _tool_allowed_for_chat(chat_id, name):
+                    observation = (
+                        f"Tool '{name}' is disabled for this chat. "
+                        "Do not claim you ran it. Tell the user it is unavailable."
+                    )
+                    logging.getLogger("mojo.agent").info(
+                        "TOOL_BLOCKED %s chat=%s", name, chat_id
+                    )
+                else:
+                    try:
+                        observation = execute_tool(name, args, tool_ctx)
+                    except Exception as te:
+                        traceback.print_exc()
+                        observation = f"Tool error: {te}"
                 obs_str = str(observation)
                 # Transcripts need a higher cap so the model can refine/summarize
                 # a long video instead of only seeing the first ~3k chars.

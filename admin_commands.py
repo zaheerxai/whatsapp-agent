@@ -22,6 +22,37 @@ KNOWN_FEATURES = [
     "audio"         # Voice note transcription and responses
 ]
 
+# Agent tools (ReAct loop). Stored in feature_flags as "tool:<name>".
+# DEFAULT OFF for every chat (including owner and global "*") until explicitly enabled.
+# Owner-only tools still require OWNER_SENDER_ID even when the flag is ON.
+KNOWN_TOOLS = [
+    "search_knowledge",
+    "web_search",
+    "browse_url",
+    "get_weather",
+    "get_memory",
+    "save_memory",
+    "set_reminder",
+    "list_reminders",
+    "cancel_reminders",
+    "query_contacts",
+    "lookup_user",
+    "send_message_to",   # owner-only at executor
+    "file_list_onedrive",
+    "python_exec",       # owner-only at executor
+    "note_down",         # owner-only at executor
+    "transcribe_video",
+]
+
+OWNER_ONLY_TOOLS = frozenset({
+    "send_message_to",
+    "python_exec",
+    "note_down",
+})
+
+def _tool_flag_key(tool_name: str) -> str:
+    return f"tool:{tool_name}"
+
 COMMANDS = {}
 
 _supabase = None
@@ -257,20 +288,113 @@ def set_feature_enabled(chat_id, feature, enabled):
         print(f"Error saving feature flag {feature} for {chat_id}: {e}")
 
 
+# --- Agent tool flags (default OFF everywhere) ---
+
+def is_tool_enabled(chat_id, tool_name: str) -> bool:
+    """Per-chat tool flag. Default False for everyone (no owner auto-ON).
+
+    Resolution order:
+      1. Exact (chat_id, tool:<name>) row
+      2. Global (*, tool:<name>) row
+      3. False
+
+    Owner-only tools still require OWNER_SENDER_ID at executor time; this flag
+    only controls whether the tool appears in the agent schema / force-path.
+    """
+    if tool_name not in KNOWN_TOOLS:
+        return False
+    key = _tool_flag_key(tool_name)
+    try:
+        response = _supabase.table("feature_flags").select("enabled") \
+            .eq("chat_id", chat_id).eq("feature", key).execute()
+        if response.data:
+            return bool(response.data[0]["enabled"])
+
+        response = _supabase.table("feature_flags").select("enabled") \
+            .eq("chat_id", "*").eq("feature", key).execute()
+        if response.data:
+            return bool(response.data[0]["enabled"])
+    except Exception as e:
+        print(f"Error checking tool flag {tool_name} for {chat_id}: {e}")
+    return False
+
+
+def set_tool_enabled(chat_id, tool_name: str, enabled: bool) -> None:
+    if tool_name not in KNOWN_TOOLS:
+        raise ValueError(f"Unknown tool: {tool_name}")
+    set_feature_enabled(chat_id, _tool_flag_key(tool_name), enabled)
+
+
+def get_enabled_tools(chat_id) -> list:
+    """Return list of tool names enabled for this chat (order = KNOWN_TOOLS)."""
+    return [t for t in KNOWN_TOOLS if is_tool_enabled(chat_id, t)]
+
+
 # --- Commands ---
+
+def _handle_tool_enable_disable(rest: str, enabled: bool) -> str:
+    """Handle: tool <name|all> <phone|group|all>"""
+    parts = rest.split(maxsplit=1)
+    if not parts:
+        return (
+            f"Usage: /{'enable' if enabled else 'disable'} tool <tool_name|all> "
+            f"<phone|group_name|all>\nKnown tools: {', '.join(KNOWN_TOOLS)}"
+        )
+    target_tool = parts[0].lower().strip()
+    if target_tool not in ("all",) and target_tool not in KNOWN_TOOLS:
+        return (
+            f"Unknown tool '{target_tool}'. Known tools: {', '.join(KNOWN_TOOLS)} or 'all'"
+        )
+    if len(parts) < 2:
+        return (
+            f"Usage: /{'enable' if enabled else 'disable'} tool {target_tool} "
+            f"<phone|group_name|all>. Try /chats to see chats."
+        )
+    raw_target = parts[1].strip()
+    try:
+        chat_target = resolve_chat_id(raw_target)
+    except ValueError as e:
+        return f"❌ {e}"
+    if chat_target is None:
+        return f"❌ Could not find a group or contact named '{raw_target}'."
+
+    tools_to_toggle = KNOWN_TOOLS if target_tool == "all" else [target_tool]
+    for t in tools_to_toggle:
+        set_tool_enabled(chat_target, t, enabled)
+
+    where = "ALL chats" if chat_target == "*" else f"'{raw_target}' ({chat_target})"
+    tool_str = "ALL tools" if target_tool == "all" else f"tool '{target_tool}'"
+    return f"{'✅' if enabled else '🛑'} {tool_str} {'enabled' if enabled else 'disabled'} for {where}."
+
 
 def _handle_enable_disable(args, enabled):
     parts = args.split(maxsplit=1)
     if not parts:
-        return "Usage: /enable agent   OR   /enable <feature|all> <phone|group_name|all>"
+        return (
+            "Usage:\n"
+            "  /enable agent\n"
+            "  /enable <feature|all> <phone|group_name|all>\n"
+            "  /enable tool <tool_name|all> <phone|group_name|all>\n"
+            f"Features: {', '.join(KNOWN_FEATURES)}\n"
+            f"Tools: {', '.join(KNOWN_TOOLS)}"
+        )
     target_feature = parts[0].lower()
 
     if target_feature == "agent":
         set_global_setting("agent_enabled", enabled)
         return f"{'✅' if enabled else '🛑'} Agent {'enabled' if enabled else 'disabled'} everywhere."
 
+    # Tool path: /enable tool <name|all> <chat|all>
+    if target_feature in ("tool", "tools"):
+        rest = parts[1] if len(parts) > 1 else ""
+        return _handle_tool_enable_disable(rest, enabled)
+
     if target_feature != "all" and target_feature not in KNOWN_FEATURES:
-        return f"Unknown feature '{target_feature}'. Known features: {', '.join(KNOWN_FEATURES)} or 'all'"
+        return (
+            f"Unknown feature '{target_feature}'. "
+            f"Known features: {', '.join(KNOWN_FEATURES)} or 'all'. "
+            f"For agent tools use: /{'enable' if enabled else 'disable'} tool <name|all> <chat|all>"
+        )
 
     if len(parts) < 2:
         return f"Usage: /{'enable' if enabled else 'disable'} {target_feature} <phone|group_name|all>. Try /chats to see chats."
@@ -294,17 +418,26 @@ def _handle_enable_disable(args, enabled):
     return f"{'✅' if enabled else '🛑'} {feat_str} {'enabled' if enabled else 'disabled'} for {where}."
 
 
-@command("enable", "Usage: /enable agent   OR   /enable <feature|all> <phone|group_name|all>")
+@command(
+    "enable",
+    "Usage: /enable agent | /enable <feature|all> <chat|all> | /enable tool <tool|all> <chat|all>",
+)
 def cmd_enable(args):
     return _handle_enable_disable(args, True)
 
 
-@command("disable", "Usage: /disable agent   OR   /disable <feature|all> <phone|group_name|all>")
+@command(
+    "disable",
+    "Usage: /disable agent | /disable <feature|all> <chat|all> | /disable tool <tool|all> <chat|all>",
+)
 def cmd_disable(args):
     return _handle_enable_disable(args, False)
 
 
-@command("status", "Usage: /status [phone|group_name|chat_id|all] — shows agent state and feature flags.")
+@command(
+    "status",
+    "Usage: /status [phone|group_name|chat_id|all] — agent, features, and tools.",
+)
 def cmd_status(args):
     agent_on = get_global_setting("agent_enabled", default=True)
     lines = [f"Agent Global Switch: {'🟢 ON' if agent_on else '🔴 OFF'}"]
@@ -314,13 +447,22 @@ def cmd_status(args):
             resolved_id = resolve_chat_id(target)
         except ValueError as e:
             return f"❌ {e}"
-        
+
         lines.append(f"\nFeature flags for {target} ({resolved_id}):")
         for feature in KNOWN_FEATURES:
             state = "🟢 ON" if is_feature_enabled(resolved_id, feature) else "🔴 OFF"
             lines.append(f"- {feature}: {state}")
+
+        lines.append(f"\nTool flags for {target} ({resolved_id}) — default OFF:")
+        for tool in KNOWN_TOOLS:
+            state = "🟢 ON" if is_tool_enabled(resolved_id, tool) else "🔴 OFF"
+            owner_tag = " (owner-only)" if tool in OWNER_ONLY_TOOLS else ""
+            lines.append(f"- {tool}: {state}{owner_tag}")
     else:
-        lines.append("\nPass a phone number, group name, or 'all' to view feature flags.")
+        lines.append(
+            "\nPass a phone number, group name, or 'all' to view feature + tool flags.\n"
+            f"Tools (default OFF): {', '.join(KNOWN_TOOLS)}"
+        )
     return "\n".join(lines)
 
 
