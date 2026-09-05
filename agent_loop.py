@@ -84,6 +84,240 @@ def _schemas_for_chat(chat_id: str) -> List[Dict[str, Any]]:
             out.append(schema)
     return out
 
+
+# ---------------------------------------------------------------------------
+# Video / link intent (module-level so unit tests can import without run_agent)
+# ---------------------------------------------------------------------------
+
+_VIDEO_URL_HOST_MARKERS = (
+    "youtube.com/",
+    "youtu.be/",
+    "tiktok.com/",
+    "vm.tiktok.com/",
+    "vt.tiktok.com/",
+    "vimeo.com/",
+    "facebook.com/watch",
+    "facebook.com/reel",
+    "facebook.com/reels",
+    "facebook.com/share/r/",
+    "facebook.com/share/v/",
+    "fb.watch/",
+    "fb.gg/",
+    "instagram.com/reel",
+    "instagram.com/reels",
+    "instagram.com/p/",
+    "instagram.com/tv/",
+    "instagr.am/",
+)
+
+_TRANSCRIPT_PHRASES = frozenset({
+    "transcript",
+    "poora transcript",
+    "whole transcript",
+    "full transcript",
+    "likh ke do",
+    "likh do",
+    "kya bola",
+    "kya kaha",
+    "kya keh raha",
+    "is video me kya",
+    "video me kya",
+    "poora sunao",
+    "word for word",
+})
+
+_KEY_POINTS_PHRASES = frozenset({
+    "key points",
+    "keypoints",
+    "main baatein",
+    "main baate",
+    "main points",
+    "bullet",
+    "points nikal",
+    "key takeaway",
+})
+
+_SUMMARY_PHRASES = frozenset({
+    "summary",
+    "summarise",
+    "summarize",
+    "summarise karo",
+    "summarize karo",
+    "khulasa",
+    "short me batao",
+    "short mein batao",
+    "mukhtasir",
+    "kis bare me",
+    "kis baare",
+    "kis bare",
+    "kiske bare",
+    "what is this video",
+    "what's this video",
+    "video about",
+    "is video ka",
+    "ye video",
+    "this video",
+    "this reel",
+    "ye reel",
+    "is reel",
+    "what is this about",
+    "what's this about",
+    "what is this",
+    "whats this",
+    "what's this",
+    "ye kya hai",
+    "ye kia hai",
+    "ye kya he",
+    "ye kia he",
+    "isme kya hai",
+    "isme kia hai",
+    "isme kya he",
+    "is mein kya",
+    "is me kya",
+    "iska matlab",
+    "ye about",
+    "batao iske",
+    "iske bare",
+    "iske baare",
+    "explain this",
+    "explain karo",
+    "samjhao",
+    "samjha do",
+    "tell me about",
+    "about this",
+    "batana",
+    "bata na",
+    "bata do",
+    "bata dena",
+    "btao",
+    "btana",
+    "ye bata",
+    "ye batana",
+    "mujhe bata",
+    "sunao",
+    "suna do",
+    "suna dena",
+    "dekho ye",
+    "check karo",
+    "dekhna",
+    "dekho isko",
+})
+
+# Vague "about" — prefer link_preview (caption) over full ASR when possible
+_VAGUE_ABOUT_PHRASES = frozenset({
+    "ye kya hai",
+    "ye kia hai",
+    "ye kya he",
+    "ye kia he",
+    "isme kya hai",
+    "isme kia hai",
+    "what is this",
+    "whats this",
+    "what's this",
+    "what is this about",
+    "what's this about",
+    "ye about",
+    "iska matlab",
+})
+
+_GREETING_TOKENS = frozenset({
+    "hi", "hello", "hey", "salam", "salaam", "assalam", "asalam",
+    "assalamualaikum", "assalamu", "alaikum",
+    "thanks", "shukriya", "ok", "okay", "theek", "haan", "han",
+    "ji", "bro", "bhai", "yaar", "yar", "boss", "pls", "please",
+    "ye", "yeh", "this",
+})
+
+# Commands / non-video intents — never force-transcribe even if a video URL is present
+_BLOCK_FORCE_VIDEO_PHRASES = frozenset({
+    # reminders
+    "reminder", "remind", "reminders", "yaad", "alarm",
+    "set karo", "set kar", "list reminder", "cancel reminder",
+    "cancel karo", "delete reminder", "sab cancel",
+    # admin / ops
+    "enable", "disable", "status", "/enable", "/disable", "/status",
+    "/help", "/chats", "feature",
+    # messaging / group actions
+    "bhejo", "bhej do", "bhej dena", "send karo", "forward",
+    "delete", "remove", "milte", "milte hain", "meeting",
+    "call karo", "phone karo",
+    # pure admin-ish
+    "group ka status", "is group", "members",
+})
+
+_BLOCK_FORCE_VIDEO_TOKENS = frozenset({
+    "reminder", "remind", "reminders", "yaad", "alarm",
+    "enable", "disable", "bhejo", "bhej", "delete", "remove",
+    "milte", "meeting", "cancel", "forward",
+})
+
+
+def _strip_intent_noise(text: str) -> str:
+    t = text or ""
+    t = re.sub(r"@\d[\d\s]*", " ", t)
+    t = re.sub(r"\[quoted message\]:.*", " ", t, flags=re.I | re.S)
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def is_video_url(u: str) -> bool:
+    ul = (u or "").lower()
+    return any(h in ul for h in _VIDEO_URL_HOST_MARKERS)
+
+
+def _is_blocked_force_command(text_low: str) -> bool:
+    """True when residual is a reminder/admin/imperative — do not force video tools."""
+    t = _strip_intent_noise(text_low).lower()
+    if not t:
+        return False
+    if any(p in t for p in _BLOCK_FORCE_VIDEO_PHRASES):
+        return True
+    tokens = re.sub(r"[^\w\s]", "", t).split()
+    if any(tok in _BLOCK_FORCE_VIDEO_TOKENS for tok in tokens):
+        return True
+    return False
+
+
+def _is_vague_about_ask(text_low: str) -> bool:
+    t = _strip_intent_noise(text_low).lower()
+    if any(p in t for p in _VAGUE_ABOUT_PHRASES):
+        return True
+    # bare residual like "ye" / "this" after strip
+    residual = re.sub(r"[^\w\s]", "", t).strip()
+    return residual in ("", "ye", "yeh", "this", "ye kya", "kya hai")
+
+
+def video_spoken_intent(text_low: str) -> Optional[str]:
+    """
+    Return transcribe mode if user wants spoken/video content, else None.
+
+    Does NOT itself decide force — caller must also check is_video_url and
+    _is_blocked_force_command. Safe for unit tests.
+    """
+    t = _strip_intent_noise(text_low).lower()
+    if not t:
+        return "summary"
+
+    if any(w in t for w in _TRANSCRIPT_PHRASES):
+        return "transcript"
+    if any(w in t for w in _KEY_POINTS_PHRASES):
+        return "key_points"
+    if any(w in t for w in _SUMMARY_PHRASES):
+        return "summary"
+
+    residual = re.sub(r"[^\w\s]", "", t).strip()
+    tokens = residual.split()
+    if not tokens:
+        return "summary"
+    if all(tok in _GREETING_TOKENS for tok in tokens):
+        return None
+    # Short non-greeting residual (≤6 tokens) → summary, unless blocked command
+    if len(tokens) <= 6 and not _is_blocked_force_command(t):
+        return "summary"
+    return None
+
+
 _VAGUE_ACK_RE = re.compile(
     r"^(theek hai|ok|okay|done|ho gaya|sure|haan|ji|alright|got it)"
     r"(\s*[.!.👍✅🙏]*)?$",
@@ -258,13 +492,13 @@ def _build_system_prompt(
 13. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
 14. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
 15. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
-16. VIDEO CONTENT: When the CURRENT message has a video link (YouTube / TikTok / Instagram reel / Vimeo / FB) and the user asks what it is about — including Roman Urdu "ye kya hai", "isme kya hai", "summarize karo", "what is this about" — you MUST use transcribe_video (never browse_url, never invent).
-   - mode=transcript → "transcript", "poora transcript", "likh ke do", "kya bola"
-   - mode=summary → "summary", "khulasa", "ye kya hai", "isme kya hai", "what is this", "what is this about"
-   - mode=key_points → "points", "key points", "main baatein", "bullets"
-   If user asks for N words, set target_words=N and mode=summary.
-   ALWAYS call the tool again when mode/length changes — never invent from a prior short summary.
-   Prefer this over browse_url. Do NOT invent rate-limit / "fetch nahi hua" / "thodi der baad" excuses.
+16. VIDEO / LINK CONTENT: When the CURRENT message has a video or social link and the user asks what it is about:
+   - Vague "ye kya hai" / "what is this" on Instagram/Facebook/TikTok → prefer link_preview (title/caption/author only, no ASR).
+   - Explicit transcript/summary/key points / "kya bola" / "summarize karo" → transcribe_video.
+   - mode=transcript | summary | key_points as appropriate; target_words when user asks for N words.
+   - Never browse_url for spoken video content. Never invent rate-limit / "fetch nahi hua" excuses.
+   - If a tool says private/restricted/unavailable, relay that honestly in 1–2 lines.
+   - Do NOT force video tools for reminder/admin/cancel/send commands even if a link is in the quote.
 16b. TRANSCRIPT REPLY (tool already refined for the chosen mode):
    - Present the tool result almost as-is in ONE WhatsApp message.
    - Do NOT wrap in code fences, do NOT promise "part 1 / more messages later", do NOT re-translate into Devanagari.
@@ -606,181 +840,6 @@ def run_agent(
                     break
         _intent_low = _intent_text.lower()
 
-        def _is_video_url(u: str) -> bool:
-            ul = (u or "").lower()
-            return any(
-                h in ul
-                for h in (
-                    "youtube.com/",
-                    "youtu.be/",
-                    "tiktok.com/",
-                    "vm.tiktok.com/",
-                    "vt.tiktok.com/",
-                    "vimeo.com/",
-                    "facebook.com/watch",
-                    "facebook.com/reel",
-                    "facebook.com/reels",
-                    "facebook.com/share/r/",
-                    "facebook.com/share/v/",
-                    "fb.watch/",
-                    "fb.gg/",
-                    "instagram.com/reel",
-                    "instagram.com/reels",
-                    "instagram.com/p/",
-                    "instagram.com/tv/",
-                    "instagr.am/",
-                )
-            )
-
-        def _video_spoken_intent(text_low: str) -> Optional[str]:
-            """Return transcribe_video mode if user wants spoken/video content, else None.
-
-            Covers English + Roman Urdu. Vague "what is this / ye kya hai" on a
-            video link is treated as summary — never leave it to browse_url
-            (browse cannot hear spoken content and models invent rate-limits).
-            """
-            # Strip bot mentions / quoted-url noise so phrase match is reliable
-            t = text_low or ""
-            t = re.sub(r"@\d[\d\s]*", " ", t)
-            t = re.sub(r"\[quoted message\]:.*", " ", t, flags=re.I | re.S)
-            t = re.sub(r"https?://\S+", " ", t)
-            t = re.sub(r"\s+", " ", t).strip()
-
-            if any(
-                w in t
-                for w in (
-                    "transcript",
-                    "poora transcript",
-                    "whole transcript",
-                    "full transcript",
-                    "likh ke do",
-                    "likh do",
-                    "kya bola",
-                    "kya kaha",
-                    "kya keh raha",
-                    "is video me kya",
-                    "video me kya",
-                    "poora sunao",
-                    "word for word",
-                )
-            ):
-                return "transcript"
-            if any(
-                w in t
-                for w in (
-                    "key points",
-                    "keypoints",
-                    "main baatein",
-                    "main baate",
-                    "main points",
-                    "bullet",
-                    "points nikal",
-                    "key takeaway",
-                )
-            ):
-                return "key_points"
-            if any(
-                w in t
-                for w in (
-                    "summary",
-                    "summarise",
-                    "summarize",
-                    "summarise karo",
-                    "summarize karo",
-                    "khulasa",
-                    "short me batao",
-                    "short mein batao",
-                    "mukhtasir",
-                    "kis bare me",
-                    "kis baare",
-                    "kis bare",
-                    "kiske bare",
-                    "what is this video",
-                    "what's this video",
-                    "video about",
-                    "is video ka",
-                    "ye video",
-                    "this video",
-                    "this reel",
-                    "ye reel",
-                    "is reel",
-                    # Generic "what is this / ye kya hai" — with a video URL present
-                    # the force-path caller only invokes us when URL is video.
-                    "what is this about",
-                    "what's this about",
-                    "what is this",
-                    "whats this",
-                    "what's this",
-                    "ye kya hai",
-                    "ye kia hai",
-                    "ye kya he",
-                    "ye kia he",
-                    "isme kya hai",
-                    "isme kia hai",
-                    "isme kya he",
-                    "is mein kya",
-                    "is me kya",
-                    "iska matlab",
-                    "ye about",
-                    "batao iske",
-                    "iske bare",
-                    "iske baare",
-                    "explain this",
-                    "explain karo",
-                    "samjhao",
-                    "samjha do",
-                    "tell me about",
-                    "about this",
-                    # Roman Urdu "tell me" variants (common miss before)
-                    "batana",
-                    "bata na",
-                    "bata do",
-                    "bata dena",
-                    "btao",
-                    "btana",
-                    "ye bata",
-                    "ye batana",
-                    "mujhe bata",
-                    "sunao",
-                    "suna do",
-                    "suna dena",
-                    "dekho ye",
-                    "check karo",
-                    "dekhna",
-                    "dekho isko",
-                )
-            ):
-                return "summary"
-            # Very short residual text after stripping URL/mention ("?", "ye?", "ye")
-            # still means "tell me about the linked video".
-            residual = re.sub(r"[^\w\s]", "", t).strip()
-            residual_l = residual.lower()
-            if residual_l in (
-                "",
-                "ye",
-                "yeh",
-                "this",
-                "bro",
-                "bhai",
-                "ji",
-                "pls",
-                "please",
-                "yaar",
-                "yar",
-                "boss",
-            ):
-                return "summary"
-            # Any short residual (≤6 tokens) that is not pure greeting → summary.
-            # Covers "ye batana", "ye batao", "isko dekho", "bata", etc.
-            tokens = residual_l.split()
-            greetings = {
-                "hi", "hello", "hey", "salam", "salaam", "assalam", "asalam",
-                "thanks", "shukriya", "ok", "okay", "theek", "haan", "han",
-            }
-            if tokens and len(tokens) <= 6 and not all(tok in greetings for tok in tokens):
-                return "summary"
-            return None
-
         def _parse_target_words(text_low: str) -> Optional[int]:
             m = _re.search(r"(\d{2,4})\s*[- ]?\s*words?", text_low)
             if not m:
@@ -792,6 +851,27 @@ def run_agent(
                 return max(80, min(800, n))
             except ValueError:
                 return None
+
+        def _obs_looks_failed_or_thin(obs: str) -> bool:
+            o = (obs or "").strip().lower()
+            if not o or len(o) < 40:
+                return True
+            markers = (
+                "tool error",
+                "disabled for this chat",
+                "bahut short",
+                "unclear hai",
+                "private",
+                "restricted",
+                "nahi nikal",
+                "not available",
+                "could not download",
+                "transcript bahut",
+                "login wall",
+                "unavailable",
+                "failed",
+            )
+            return any(m in o for m in markers)
 
         # Only tools the admin enabled for this chat are offered to the model.
         # Default is empty → pure conversational reply (ai_chat), no tools.
@@ -811,35 +891,89 @@ def run_agent(
             # will call the right tool. Inject the tool result ourselves — but ONLY
             # when the corresponding tool flag is ON for this chat.
             primary_url = urls_in_last[0]
-            spoken_mode = _video_spoken_intent(_intent_low)
-            is_video = _is_video_url(primary_url)
-            # Video links: never fall through to browse_url for content questions.
-            # If intent matched → use that mode; if intent missed but URL is clearly
-            # a video and the user is asking about the linked message, default summary.
-            if is_video and not spoken_mode:
-                # Broad net: almost any non-empty ask with a video URL → summary.
-                # Only skip pure greetings so we don't force-transcribe on "hi @bot".
-                _li = re.sub(r"@\d[\d\s]*", " ", _intent_low or "")
-                _li = re.sub(r"\[quoted message\]:.*", " ", _li, flags=re.I | re.S)
-                _li = re.sub(r"https?://\S+", " ", _li)
-                _li = re.sub(r"\s+", " ", _li).strip()
-                _greet_only = re.fullmatch(
-                    r"(hi|hello|hey|salam|salaam|assalamu?alaikum|ok|okay|thanks|shukriya|"
-                    r"theek|haan|han|ji|bro|bhai)?[\s!.]*",
-                    _li,
-                    flags=re.I,
+            is_video = is_video_url(primary_url)
+            blocked_cmd = _is_blocked_force_command(_intent_low)
+            spoken_mode = None
+            if is_video and not blocked_cmd:
+                spoken_mode = video_spoken_intent(_intent_low)
+            elif is_video and blocked_cmd:
+                print(
+                    f"[AGENT] SKIP force video tools — blocked command intent "
+                    f"{_strip_intent_noise(_intent_low)[:80]!r}"
                 )
-                if _li and not _greet_only:
-                    spoken_mode = "summary"
-                    print(
-                        f"[AGENT] video URL + non-greeting ask → force summary "
-                        f"intent={_li[:80]!r}"
-                    )
-            use_video = bool(spoken_mode and is_video)
-            can_transcribe = _tool_allowed_for_chat(chat_id, "transcribe_video")
-            can_browse = _tool_allowed_for_chat(chat_id, "browse_url")
 
-            if use_video and can_transcribe:
+            use_video = bool(spoken_mode and is_video and not blocked_cmd)
+            can_transcribe = _tool_allowed_for_chat(chat_id, "transcribe_video")
+            can_preview = _tool_allowed_for_chat(chat_id, "link_preview")
+            can_browse = _tool_allowed_for_chat(chat_id, "browse_url")
+            vague_about = use_video and _is_vague_about_ask(_intent_low)
+            # Prefer cheap caption preview for vague "ye kya hai" on IG/FB/TikTok
+            prefer_preview = vague_about and can_preview and any(
+                h in (primary_url or "").lower()
+                for h in ("instagram.com", "instagr.am", "facebook.com", "fb.watch", "tiktok.com")
+            )
+
+            def _force_tool(name: str, args: dict, call_id: str) -> str:
+                try:
+                    obs = execute_tool(name, args, tool_ctx)
+                except Exception as _fe:
+                    obs = f"Tool error: {_fe}"
+                obs_s = str(obs)
+                cap = (
+                    MAX_OBS_CHARS_TRANSCRIPT
+                    if name == "transcribe_video"
+                    else MAX_OBS_CHARS
+                )
+                if len(obs_s) > cap:
+                    obs_s = obs_s[:cap] + "…"
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args),
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": obs_s,
+                })
+                return obs_s
+
+            if prefer_preview:
+                print(f"[AGENT] force link_preview (vague about) for: {primary_url}")
+                _forced_obs_str = _force_tool(
+                    "link_preview", {"url": primary_url}, "call_forced_preview_0"
+                )
+                # If caption-only is weak and speech tools allowed, try transcribe
+                if _obs_looks_failed_or_thin(_forced_obs_str) and can_transcribe:
+                    print("[AGENT] link_preview thin/failed → fallback transcribe_video")
+                    tw = _parse_target_words(_intent_low)
+                    targs: Dict[str, Any] = {
+                        "url": primary_url,
+                        "mode": spoken_mode or "summary",
+                        "language": "auto",
+                        "timestamps": False,
+                    }
+                    if tw:
+                        targs["target_words"] = tw
+                    _forced_obs_str = _force_tool(
+                        "transcribe_video", targs, "call_forced_transcribe_0"
+                    )
+                direct = _last_tool_obs_for_user(messages)
+                if direct and len(direct) >= 20:
+                    logging.getLogger("mojo.agent").info(
+                        "DIRECT_OBS_REPLY mode=preview/fallback chars=%s", len(direct)
+                    )
+                    return direct
+                tools_for_next = None
+
+            elif use_video and can_transcribe:
                 tw = _parse_target_words(_intent_low)
                 tool_args: Dict[str, Any] = {
                     "url": primary_url,
@@ -853,42 +987,21 @@ def run_agent(
                     f"[AGENT] force transcribe_video mode={spoken_mode} "
                     f"tw={tw} for: {primary_url}"
                 )
-                try:
-                    _forced_observation = execute_tool(
-                        "transcribe_video", tool_args, tool_ctx
+                _forced_obs_str = _force_tool(
+                    "transcribe_video", tool_args, "call_forced_transcribe_0"
+                )
+                # ASR blocked / thin → caption preview (esp. private IG)
+                if _obs_looks_failed_or_thin(_forced_obs_str) and can_preview:
+                    print("[AGENT] transcribe thin/failed → fallback link_preview")
+                    _forced_obs_str = _force_tool(
+                        "link_preview",
+                        {"url": primary_url},
+                        "call_forced_preview_1",
                     )
-                except Exception as _fe:
-                    _forced_observation = f"Tool error: {_fe}"
-                _forced_obs_str = str(_forced_observation)
-                _obs_cap = MAX_OBS_CHARS_TRANSCRIPT
-                if len(_forced_obs_str) > _obs_cap:
-                    _forced_obs_str = _forced_obs_str[:_obs_cap] + "…"
-
-                _forced_call_id = "call_forced_transcribe_0"
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": _forced_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": "transcribe_video",
-                            "arguments": json.dumps(tool_args),
-                        },
-                    }],
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": _forced_call_id,
-                    "content": _forced_obs_str,
-                })
-                # Always prefer the tool observation as the user-facing reply —
-                # both success (refined summary) and honest failures (private IG,
-                # bot-check, etc.). Avoids a second LLM call inventing rate-limits.
                 direct = _last_tool_obs_for_user(messages)
-                if direct and len(direct) >= 30:
+                if direct and len(direct) >= 20:
                     print(
-                        "[AGENT] force transcribe_video → direct OBS reply "
+                        "[AGENT] force transcribe/preview → direct OBS reply "
                         f"(chars={len(direct)}, starts={direct[:40]!r})"
                     )
                     logging.getLogger("mojo.agent").info(
@@ -900,7 +1013,7 @@ def run_agent(
                 messages.append({
                     "role": "system",
                     "content": (
-                        f"You already ran transcribe_video on {primary_url} "
+                        f"You already ran video tools on {primary_url} "
                         f"(mode={spoken_mode}). Answer from that tool result only in "
                         "ONE message. Present the content almost as-is. If the tool "
                         "reported an error (private video, download failed, etc.), "
@@ -910,7 +1023,17 @@ def run_agent(
                     ),
                 })
                 tools_for_next = None  # synthesis only — no tool schema payload
-            elif use_video and not can_transcribe:
+            elif use_video and can_preview:
+                # transcribe disabled but preview allowed
+                print(f"[AGENT] force link_preview (no transcribe) for: {primary_url}")
+                _forced_obs_str = _force_tool(
+                    "link_preview", {"url": primary_url}, "call_forced_preview_0"
+                )
+                direct = _last_tool_obs_for_user(messages)
+                if direct and len(direct) >= 20:
+                    return direct
+                tools_for_next = None
+            elif use_video and not can_transcribe and not can_preview:
                 print(
                     f"[AGENT] SKIP force transcribe_video — tool disabled for {chat_id}"
                 )

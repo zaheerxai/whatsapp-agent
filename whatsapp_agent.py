@@ -167,23 +167,62 @@ def get_session_path():
     _download_session_from_bucket()
     return LOCAL_SESSION_FILE
 
+def _resolve_git_sha() -> str:
+    """Best-effort running commit for /health (deploy verification)."""
+    import os
+    import subprocess
+
+    for key in (
+        "RENDER_GIT_COMMIT",
+        "GIT_COMMIT",
+        "SOURCE_VERSION",
+        "COMMIT_SHA",
+        "GITHUB_SHA",
+    ):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v[:40]
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return out.decode().strip()[:40]
+    except Exception:
+        return "unknown"
+
+
+_GIT_SHA = None  # resolved once at health-server start
+
+
 def start_health_server():
-    """Minimal HTTP health endpoint for Render free tier + UptimeRobot."""
+    """Minimal HTTP health endpoint for Render free tier + UptimeRobot.
+
+    GET /health returns plain text including git SHA so deploy checks can
+    verify the running commit (not just HTTP 200).
+    """
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import os
 
+    global _GIT_SHA
     port = int(os.environ.get("PORT", 10000))
+    _GIT_SHA = _resolve_git_sha()
+    body = f"ok sha={_GIT_SHA}\n".encode("utf-8")
 
     class HealthHandler(BaseHTTPRequestHandler):
         def _send_ok(self):
             self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.send_header("Content-Length", "2")
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Git-Sha", _GIT_SHA or "unknown")
             self.end_headers()
-            self.wfile.write(b"ok")
+            self.wfile.write(body)
 
         def do_GET(self):
-            if self.path in ("/", "/health", "/healthz"):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/health", "/healthz"):
                 self._send_ok()
             else:
                 self.send_response(404)
@@ -191,10 +230,12 @@ def start_health_server():
 
         def do_HEAD(self):
             # UptimeRobot (and many monitors) use HEAD
-            if self.path in ("/", "/health", "/healthz"):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/health", "/healthz"):
                 self.send_response(200)
-                self.send_header("Content-type", "text/plain")
-                self.send_header("Content-Length", "2")
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Git-Sha", _GIT_SHA or "unknown")
                 self.end_headers()
             else:
                 self.send_response(404)
@@ -205,7 +246,10 @@ def start_health_server():
 
     def run():
         server = HTTPServer(("0.0.0.0", port), HealthHandler)
-        print(f"[HEALTH] Listening on 0.0.0.0:{port}  (GET/HEAD / /health /healthz)")
+        print(
+            f"[HEALTH] Listening on 0.0.0.0:{port}  "
+            f"(GET/HEAD / /health /healthz) sha={_GIT_SHA}"
+        )
         server.serve_forever()
 
     t = threading.Thread(target=run, daemon=True)

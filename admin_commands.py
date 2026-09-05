@@ -42,6 +42,7 @@ KNOWN_TOOLS = [
     "python_exec",       # owner-only at executor
     "note_down",         # owner-only at executor
     "transcribe_video",
+    "link_preview",      # title/caption/author without ASR
 ]
 
 OWNER_ONLY_TOOLS = frozenset({

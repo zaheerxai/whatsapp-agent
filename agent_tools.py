@@ -421,6 +421,29 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "link_preview",
+            "description": (
+                "Fetch public link metadata only: title, caption/description, author. "
+                "NO speech-to-text, NO audio download. Use for 'ye kya hai' / 'what is this' "
+                "on Instagram/Facebook/TikTok when full transcript is unnecessary, blocked, "
+                "or private. Prefer this over transcribe_video for quick about/caption asks. "
+                "Do NOT invent captions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full https URL (Instagram reel, Facebook video, TikTok, etc.)",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "transcribe_video",
             "description": (
                 "Get spoken content from a public video link (YouTube, TikTok, Vimeo, etc.). "
@@ -429,7 +452,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "do not invent from memory. "
                 "mode: transcript | summary | key_points. "
                 "If user asks for N words (e.g. 400-word summary), set target_words=N. "
-                "Do NOT use for voice notes already transcribed in the chat."
+                "Do NOT use for voice notes already transcribed in the chat. "
+                "If audio is blocked, prefer link_preview for caption/about."
             ),
             "parameters": {
                 "type": "object",
@@ -2867,6 +2891,56 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         )
 
 
+def _tool_link_preview(args: dict, ctx: dict) -> str:
+    """Title + caption + author only — no ASR. Cheap path for IG/FB about asks."""
+    url = (args.get("url") or "").strip()
+    if not url:
+        return "URL required for link_preview."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    if _is_instagram_url(url) or _is_facebook_url(url):
+        url = _normalize_ig_fb_url(url)
+
+    # Reuse the about cascade (Supadata metadata → yt-dlp info → oEmbed)
+    body = None
+    source = None
+    for fn, name in (
+        (_try_supadata_metadata, "Supadata metadata"),
+        (_try_ytdlp_metadata_about, "yt-dlp metadata"),
+        (_try_oembed_about, "oEmbed"),
+    ):
+        try:
+            body = fn(url)
+        except Exception as e:
+            print(f"[link_preview] {name} error: {e}")
+            body = None
+        if body and len(body.strip()) >= 8:
+            source = name
+            break
+
+    if not body:
+        if _is_instagram_url(url):
+            return (
+                "Is Instagram link ka public caption/title nahi mila "
+                "(private, restricted, ya login wall). "
+                "Public reel share karo ya video download karke voice note bhej do."
+            )
+        if _is_facebook_url(url):
+            return (
+                "Is Facebook link ka public title/caption nahi mila. "
+                "Public post try karo."
+            )
+        return (
+            "Link preview nahi nikal saka (title/caption unavailable). "
+            "Public URL confirm karo."
+        )
+
+    lines = [f"Source: link_preview ({source})", "", body.strip()]
+    out = "\n".join(lines)
+    print(f"[link_preview] OK source={source} chars={len(out)}")
+    return out
+
+
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
     "web_search": _tool_web_search,
@@ -2884,6 +2958,7 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "python_exec": _tool_python_exec,
     "note_down": _tool_note_down,
     "transcribe_video": _tool_transcribe_video,
+    "link_preview": _tool_link_preview,
 }
 
 
