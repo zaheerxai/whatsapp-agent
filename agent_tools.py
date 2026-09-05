@@ -1823,8 +1823,10 @@ def _try_piped_captions(
 
 def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[str]:
     """
-    Optional managed API (cloud-friendly for YT+TikTok+more).
-    Only used when SUPADATA_API_KEY is set (100 free credits/mo).
+    Managed API — YouTube, TikTok, Instagram, Facebook, X (cloud-friendly).
+    Requires SUPADATA_API_KEY (100 free credits/mo). mode=auto uses native
+    captions when present, otherwise AI generate.
+    Handles async jobId responses by short-polling.
     """
     api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
     if not api_key:
@@ -1839,17 +1841,7 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
     if lang and lang not in ("auto", ""):
         params["lang"] = lang
 
-    try:
-        r = requests.get(
-            "https://api.supadata.ai/v1/transcript",
-            params=params,
-            headers={"x-api-key": api_key, "Accept": "application/json"},
-            timeout=90,
-        )
-        if r.status_code != 200:
-            print(f"[transcribe_video] Supadata HTTP {r.status_code}: {r.text[:160]}")
-            return None
-        data = r.json()
+    def _parse_content(data: dict) -> Optional[str]:
         content = data.get("content")
         if isinstance(content, str):
             return content.strip() or None
@@ -1873,7 +1865,57 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
                     dur_s = 0.0
                 segs.append({"text": t, "start": start_s, "duration": dur_s})
             return _format_segments(segs, with_timestamps) if segs else None
+        # Alternate shapes
+        for key in ("transcript", "text", "plainText"):
+            v = data.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
         return None
+
+    try:
+        r = requests.get(
+            "https://api.supadata.ai/v1/transcript",
+            params=params,
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=90,
+        )
+        # 206 = transcript unavailable under current mode
+        if r.status_code == 206:
+            print("[transcribe_video] Supadata 206 transcript unavailable")
+            return None
+        if r.status_code not in (200, 202):
+            print(f"[transcribe_video] Supadata HTTP {r.status_code}: {r.text[:160]}")
+            return None
+        data = r.json() or {}
+        # Async job?
+        job_id = data.get("jobId") or data.get("job_id")
+        if job_id:
+            print(f"[transcribe_video] Supadata job {job_id} — polling")
+            for _ in range(12):
+                time.sleep(2.5)
+                jr = requests.get(
+                    f"https://api.supadata.ai/v1/transcript/{job_id}",
+                    headers={"x-api-key": api_key, "Accept": "application/json"},
+                    timeout=30,
+                )
+                if jr.status_code not in (200, 202):
+                    print(f"[transcribe_video] Supadata job HTTP {jr.status_code}")
+                    break
+                jdata = jr.json() or {}
+                status = (jdata.get("status") or "").lower()
+                if status in ("completed", "done", "success") or jdata.get("content"):
+                    parsed = _parse_content(jdata)
+                    if parsed:
+                        return parsed
+                    break
+                if status in ("failed", "error"):
+                    print(f"[transcribe_video] Supadata job failed: {jdata}")
+                    break
+            return None
+        parsed = _parse_content(data)
+        if parsed:
+            print(f"[transcribe_video] Supadata OK chars={len(parsed)}")
+        return parsed
     except Exception as e:
         print(f"[transcribe_video] Supadata error: {e}")
         return None
@@ -1985,6 +2027,270 @@ def _is_tiktok_url(url: str) -> bool:
     )
 
 
+def _is_instagram_url(url: str) -> bool:
+    u = (url or "").lower()
+    return "instagram.com" in u or "instagr.am" in u
+
+
+def _is_facebook_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(
+        h in u
+        for h in (
+            "facebook.com/",
+            "fb.watch/",
+            "fb.gg/",
+            "fb.com/",
+            "m.facebook.com/",
+        )
+    )
+
+
+def _normalize_ig_fb_url(url: str) -> str:
+    """Strip tracking query noise; keep reel/p/tv/watch path intact."""
+    u = (url or "").strip()
+    if not u:
+        return u
+    # Drop common trackers (igshid, igsi, si, fbclid, …) but keep path
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+        p = urlparse(u)
+        qs = parse_qs(p.query)
+        keep = {}
+        for k, v in qs.items():
+            kl = k.lower()
+            if kl in ("v", "story_fbid", "id"):
+                keep[k] = v
+        new_q = urlencode({k: v[0] for k, v in keep.items()}) if keep else ""
+        return urlunparse((p.scheme or "https", p.netloc, p.path, "", new_q, ""))
+    except Exception:
+        return u.split("?")[0] if "?" in u else u
+
+
+def _try_oembed_about(url: str) -> Optional[str]:
+    """
+    Public oEmbed / lightweight page metadata for Instagram + Facebook.
+    Gives title + author + caption-like description when full ASR is blocked.
+    Free, no API key.
+    """
+    u = _normalize_ig_fb_url(url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+    }
+    endpoints = []
+    if _is_instagram_url(u):
+        endpoints.append(
+            f"https://www.instagram.com/api/v1/oembed/?url={requests.utils.quote(u, safe='')}"
+        )
+        endpoints.append(
+            f"https://api.instagram.com/oembed/?url={requests.utils.quote(u, safe='')}"
+        )
+    if _is_facebook_url(u):
+        endpoints.append(
+            "https://www.facebook.com/plugins/video/oembed.json"
+            f"?url={requests.utils.quote(u, safe='')}&omitscript=true"
+        )
+        endpoints.append(
+            "https://www.facebook.com/plugins/post/oembed.json"
+            f"?url={requests.utils.quote(u, safe='')}&omitscript=true"
+        )
+
+    for ep in endpoints:
+        try:
+            r = requests.get(ep, headers=headers, timeout=12)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            title = (data.get("title") or "").strip()
+            author = (
+                data.get("author_name")
+                or data.get("author_url")
+                or data.get("provider_name")
+                or ""
+            ).strip()
+            # Some oEmbed payloads put caption in title; html is noise
+            parts = []
+            if author:
+                parts.append(f"Creator: {author}")
+            if title:
+                parts.append(title)
+            text = "\n".join(parts).strip()
+            if text and len(text) >= 8:
+                print(f"[transcribe_video] oEmbed OK chars={len(text)}")
+                return text
+        except Exception as e:
+            print(f"[transcribe_video] oEmbed fail {ep[:60]}: {e}")
+    return None
+
+
+def _try_ytdlp_metadata_about(url: str) -> Optional[str]:
+    """
+    yt-dlp extract_info (no download) → title/description/uploader.
+    Works for many public IG/FB/TikTok posts even when audio download is blocked.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
+
+    u = _normalize_ig_fb_url(url)
+    opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 25,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    if _is_instagram_url(u):
+        opts["http_headers"]["Referer"] = "https://www.instagram.com/"
+    elif _is_facebook_url(u):
+        opts["http_headers"]["Referer"] = "https://www.facebook.com/"
+
+    cookies_path = (os.getenv("YTDLP_COOKIES") or "").strip()
+    if cookies_path and os.path.isfile(cookies_path):
+        opts["cookiefile"] = cookies_path
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(u, download=False)
+        if not info:
+            return None
+        title = (info.get("title") or info.get("fulltitle") or "").strip()
+        desc = (info.get("description") or "").strip()
+        uploader = (
+            info.get("uploader")
+            or info.get("channel")
+            or info.get("creator")
+            or info.get("uploader_id")
+            or ""
+        ).strip()
+        # Instagram sometimes puts caption only in description
+        parts = []
+        if uploader:
+            parts.append(f"Creator: {uploader}")
+        if title and title.lower() not in (desc.lower() if desc else ""):
+            parts.append(f"Title: {title}")
+        if desc:
+            # Cap description — captions can be long
+            parts.append(desc[:2500])
+        text = "\n".join(parts).strip()
+        if text and len(text) >= 12:
+            print(
+                f"[transcribe_video] yt-dlp metadata OK "
+                f"title={title[:40]!r} desc_len={len(desc)}"
+            )
+            return text
+    except Exception as e:
+        print(f"[transcribe_video] yt-dlp metadata fail: {e}")
+    return None
+
+
+def _try_supadata_metadata(url: str) -> Optional[str]:
+    """Optional Supadata /metadata for IG/FB/TikTok when key is set."""
+    api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
+    if not api_key:
+        return None
+    try:
+        r = requests.get(
+            "https://api.supadata.ai/v1/metadata",
+            params={"url": url},
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"[transcribe_video] Supadata metadata HTTP {r.status_code}")
+            return None
+        data = r.json() or {}
+        # Flexible field names across platform payloads
+        title = (
+            data.get("title")
+            or (data.get("post") or {}).get("title")
+            or ""
+        )
+        if isinstance(title, dict):
+            title = title.get("text") or ""
+        desc = (
+            data.get("description")
+            or data.get("caption")
+            or (data.get("post") or {}).get("description")
+            or (data.get("post") or {}).get("caption")
+            or ""
+        )
+        author_raw = data.get("author") or data.get("authorName") or ""
+        if isinstance(author_raw, dict):
+            author = (
+                author_raw.get("name")
+                or author_raw.get("username")
+                or author_raw.get("handle")
+                or ""
+            )
+        else:
+            author = author_raw or ""
+        parts = []
+        if author:
+            parts.append(f"Creator: {str(author).strip()}")
+        if title:
+            parts.append(f"Title: {str(title).strip()}")
+        if desc:
+            parts.append(str(desc).strip()[:2500])
+        text = "\n".join(p for p in parts if p).strip()
+        if text and len(text) >= 8:
+            print(f"[transcribe_video] Supadata metadata OK chars={len(text)}")
+            return text
+    except Exception as e:
+        print(f"[transcribe_video] Supadata metadata error: {e}")
+    return None
+
+
+def _about_fallback_pack(url: str, mode: str) -> Optional[str]:
+    """
+    When speech transcript is unavailable, return best-effort 'about' text
+    (caption / description / oEmbed). Useful for IG/FB restricted reels.
+    """
+    body = None
+    # Prefer richer sources first
+    for fn, name in (
+        (_try_supadata_metadata, "Supadata metadata"),
+        (_try_ytdlp_metadata_about, "yt-dlp metadata"),
+        (_try_oembed_about, "oEmbed"),
+    ):
+        try:
+            body = fn(url)
+        except Exception as e:
+            print(f"[transcribe_video] about via {name} error: {e}")
+            body = None
+        if body:
+            header = (
+                f"Title: (about / caption — full spoken transcript unavailable)\n\n"
+                f"{body}"
+            )
+            # Light refine still ok for summary/key_points; for transcript return raw
+            if mode in ("summary", "key_points"):
+                refined = _refine_transcript_compact(
+                    body, title="", mode=mode, target_words=None
+                )
+                return (
+                    f"Source: {name} (about/caption) | mode={mode}\n\n{refined}"
+                )
+            return f"Source: {name} (about/caption) | mode={mode}\n\n{body.strip()}"
+    return None
+
+
 def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
     """
     Download best audio, convert to mono 48k mp3.
@@ -2091,6 +2397,47 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
             }
             attempt_opts.append(opts)
         attempt_opts.append(dict(base_opts))
+    elif _is_instagram_url(url):
+        # Instagram: mobile UA + Referer; cookies help a lot for restricted posts
+        url = _normalize_ig_fb_url(url)
+        ig_opts = dict(base_opts)
+        ig_opts["http_headers"] = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Referer": "https://www.instagram.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        attempt_opts.append(ig_opts)
+        # Desktop UA fallback
+        ig2 = dict(base_opts)
+        ig2["http_headers"] = {
+            **base_opts["http_headers"],
+            "Referer": "https://www.instagram.com/",
+        }
+        attempt_opts.append(ig2)
+    elif _is_facebook_url(url):
+        url = _normalize_ig_fb_url(url)
+        fb_opts = dict(base_opts)
+        fb_opts["http_headers"] = {
+            **base_opts["http_headers"],
+            "Referer": "https://www.facebook.com/",
+        }
+        attempt_opts.append(fb_opts)
+        # Mobile site fallback
+        fb_m = dict(base_opts)
+        fb_m["http_headers"] = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Referer": "https://m.facebook.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        attempt_opts.append(fb_m)
     else:
         attempt_opts.append(base_opts)
 
@@ -2252,6 +2599,11 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         _cache_set(cache_k, out)
         return out
 
+    is_ig = _is_instagram_url(url)
+    is_fb = _is_facebook_url(url)
+    if is_ig or is_fb:
+        url = _normalize_ig_fb_url(url)
+
     # --- 0. FREE cloud-working path: youtube2text.org (proven on blocked videos) ---
     if yt_id or "youtu" in url.lower():
         text = _try_youtube2text(url, language, with_ts)
@@ -2264,7 +2616,8 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         if text:
             return _pack(f"Piped captions (video {yt_id})", text)
 
-    # --- 2. Optional managed API (if SUPADATA_API_KEY set) ---
+    # --- 2. Managed API (SUPADATA_API_KEY) — best path for IG / FB / TikTok ---
+    # Prefer this BEFORE local yt-dlp on Instagram/Facebook (cloud IPs often blocked).
     text = _try_supadata(url, language, with_ts)
     if text:
         return _pack("Supadata", text)
@@ -2276,6 +2629,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             return _pack(f"YouTube captions (video {yt_id})", text)
 
     # --- 4. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
+    asr_error_msg: Optional[str] = None
     try:
         with tempfile.TemporaryDirectory(prefix="mojo_vid_") as tmp:
             try:
@@ -2289,13 +2643,16 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                         "transcription limit for safety/cost. Try a shorter clip or "
                         "ask for a specific section."
                     )
-                if "tiktok" in low or "unexpected response from webpage" in low:
-                    return (
+                if "tiktok" in low or (
+                    _is_tiktok_url(url) and "unexpected response from webpage" in low
+                ):
+                    asr_error_msg = (
                         "TikTok video se audio nahi nikal saka — TikTok abhi yt-dlp "
                         "ko block / challenge kar raha hai (common temporary issue). "
                         "YouTube link try karo, ya video download karke voice note "
                         "bhej do to main transcribe kar sakta hoon."
                     )
+                    raise
                 if any(
                     x in low
                     for x in (
@@ -2304,17 +2661,21 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                         "login_required",
                         "confirm you're not a bot",
                     )
-                ):
-                    return (
+                ) and (yt_id or "youtu" in url.lower()):
+                    asr_error_msg = (
                         "YouTube ne is link pe bot-check laga diya hai (cloud server IP "
                         "block). Captions bhi available nahi the. "
                         "Workaround: video download karke voice note bhej do, ya "
                         "host pe YTDLP_COOKIES env set karo (browser cookies.txt)."
                     )
-                return (
-                    f"Could not download audio from this link ({msg[:180]}). "
-                    "Is the video public and supported?"
-                )
+                    raise
+                # Instagram / Facebook: keep going to about/caption fallback
+                if is_ig or is_fb or "instagram" in low or "facebook" in low:
+                    print(f"[transcribe_video] IG/FB audio download failed: {msg[:200]}")
+                    asr_error_msg = msg
+                    raise
+                asr_error_msg = msg
+                raise
 
             if duration and duration > _MAX_ASR_SECONDS + 5:
                 return (
@@ -2355,8 +2716,60 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
 
             return _pack("speech-to-text (audio download)", text)
     except Exception as e:
+        # Don't dump full traceback for expected platform blocks
+        err_s = str(asr_error_msg or e)
+        low = err_s.lower()
+        print(f"[transcribe_video] ASR path failed: {err_s[:240]}")
+
+        # --- 5. About / caption fallback (esp. Instagram + Facebook) ---
+        # Public caption/description is often still readable when audio download
+        # is blocked (restricted audience, login wall, cloud IP).
+        if is_ig or is_fb or _is_tiktok_url(url):
+            about = _about_fallback_pack(url, mode)
+            if about:
+                _cache_set(cache_k, about)
+                return about
+
+        if is_ig:
+            if any(
+                x in low
+                for x in (
+                    "isn't available to everyone",
+                    "not available to everyone",
+                    "can't be seen by certain audiences",
+                    "cannot be seen by certain audiences",
+                    "login_required",
+                    "private",
+                    "only available to",
+                    "restricted",
+                )
+            ):
+                return (
+                    "Ye Instagram reel/post public nahi hai (private ya restricted "
+                    "audience). Main iska audio/transcript nahi nikaal sakta. "
+                    "Public reel share karo, ya video download karke voice note bhej do."
+                )
+            return (
+                "Instagram se spoken transcript nahi nikal saka (login wall / block "
+                "common hai cloud servers pe). Caption/about bhi available nahi tha. "
+                "Public reel try karo, SUPADATA_API_KEY set karo, ya video download "
+                "karke voice note bhej do."
+            )
+        if is_fb:
+            return (
+                "Facebook video/reel se transcript nahi nikal saka (public + "
+                "login-free posts best work karte hain). Caption/about bhi empty. "
+                "Public link try karo, ya video download karke voice note bhej do."
+            )
+        if asr_error_msg and (
+            "TikTok" in asr_error_msg or "YouTube" in asr_error_msg
+        ):
+            return asr_error_msg
         traceback.print_exc()
-        return f"transcribe_video failed: {e}"
+        return (
+            f"Could not download audio from this link ({err_s[:180]}). "
+            "Is the video public and supported?"
+        )
 
 
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {

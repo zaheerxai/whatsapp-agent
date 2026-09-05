@@ -124,13 +124,24 @@ def _is_bad_post_tool_reply(text: str) -> bool:
         "dobara try",
         "try again later",
         "ek second baad",
+        "thodi der baad",
+        "thori der baad",
+        "phir try",
         "request limit",
         "rate limit",
         "rate-limit",
+        "rate‑limit",  # unicode hyphen variant models invent
         "couldn't pull",
         "could not pull",
-        "try again later",
         "due to a request",
+        "fetch nahi",
+        "fetch karte",
+        "content abhi",
+        "content dekh nahi",
+        "abhi tak fetch",
+        "exact details nahi",
+        "fetch nahi ho paaya",
+        "fetch nahi hua",
     )
     if any(m in low for m in bad_markers):
         return True
@@ -242,13 +253,13 @@ def _build_system_prompt(
 13. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
 14. If a tool returns an error or empty data, say so honestly. Do not fabricate fallback facts.
 15. For weather / temperature / mausam (e.g. Islamabad kitna garam hai), ALWAYS call get_weather — not web_search.
-16. VIDEO CONTENT: When user pastes a video link and asks about spoken content, call transcribe_video with the URL and the right mode:
-   - mode=transcript → "transcript", "poora transcript", "whole transcript", "likh ke do", "kya bola"
-   - mode=summary → "summary", "khulasa", "short me batao", "ye video kis bare me hai"
+16. VIDEO CONTENT: When the CURRENT message has a video link (YouTube / TikTok / Instagram reel / Vimeo / FB) and the user asks what it is about — including Roman Urdu "ye kya hai", "isme kya hai", "summarize karo", "what is this about" — you MUST use transcribe_video (never browse_url, never invent).
+   - mode=transcript → "transcript", "poora transcript", "likh ke do", "kya bola"
+   - mode=summary → "summary", "khulasa", "ye kya hai", "isme kya hai", "what is this", "what is this about"
    - mode=key_points → "points", "key points", "main baatein", "bullets"
-   If user asks for N words (e.g. "400 word summary", "600 words"), set target_words=N and mode=summary.
+   If user asks for N words, set target_words=N and mode=summary.
    ALWAYS call the tool again when mode/length changes — never invent from a prior short summary.
-   Prefer this over browse_url for spoken-content requests. Do not invent content.
+   Prefer this over browse_url. Do NOT invent rate-limit / "fetch nahi hua" / "thodi der baad" excuses.
 16b. TRANSCRIPT REPLY (tool already refined for the chosen mode):
    - Present the tool result almost as-is in ONE WhatsApp message.
    - Do NOT wrap in code fences, do NOT promise "part 1 / more messages later", do NOT re-translate into Devanagari.
@@ -602,56 +613,126 @@ def run_agent(
                     "vt.tiktok.com/",
                     "vimeo.com/",
                     "facebook.com/watch",
+                    "facebook.com/reel",
+                    "facebook.com/reels",
+                    "facebook.com/share/r/",
+                    "facebook.com/share/v/",
                     "fb.watch/",
+                    "fb.gg/",
                     "instagram.com/reel",
+                    "instagram.com/reels",
                     "instagram.com/p/",
                     "instagram.com/tv/",
+                    "instagr.am/",
                 )
             )
 
         def _video_spoken_intent(text_low: str) -> Optional[str]:
-            """Return transcribe_video mode if user wants spoken content, else None."""
+            """Return transcribe_video mode if user wants spoken/video content, else None.
+
+            Covers English + Roman Urdu. Vague "what is this / ye kya hai" on a
+            video link is treated as summary — never leave it to browse_url
+            (browse cannot hear spoken content and models invent rate-limits).
+            """
+            # Strip bot mentions / quoted-url noise so phrase match is reliable
+            t = text_low or ""
+            t = re.sub(r"@\d[\d\s]*", " ", t)
+            t = re.sub(r"\[quoted message\]:.*", " ", t, flags=re.I | re.S)
+            t = re.sub(r"https?://\S+", " ", t)
+            t = re.sub(r"\s+", " ", t).strip()
+
             if any(
-                w in text_low
+                w in t
                 for w in (
                     "transcript",
                     "poora transcript",
                     "whole transcript",
                     "full transcript",
                     "likh ke do",
+                    "likh do",
                     "kya bola",
                     "kya kaha",
+                    "kya keh raha",
                     "is video me kya",
                     "video me kya",
+                    "poora sunao",
+                    "word for word",
                 )
             ):
                 return "transcript"
             if any(
-                w in text_low
+                w in t
                 for w in (
                     "key points",
                     "keypoints",
                     "main baatein",
+                    "main baate",
                     "main points",
                     "bullet",
+                    "points nikal",
+                    "key takeaway",
                 )
             ):
                 return "key_points"
             if any(
-                w in text_low
+                w in t
                 for w in (
                     "summary",
                     "summarise",
                     "summarize",
+                    "summarise karo",
+                    "summarize karo",
                     "khulasa",
                     "short me batao",
+                    "short mein batao",
+                    "mukhtasir",
                     "kis bare me",
                     "kis baare",
+                    "kis bare",
+                    "kiske bare",
                     "what is this video",
+                    "what's this video",
                     "video about",
                     "is video ka",
+                    "ye video",
+                    "this video",
+                    "this reel",
+                    "ye reel",
+                    "is reel",
+                    # Generic "what is this / ye kya hai" — with a video URL present
+                    # the force-path caller only invokes us when URL is video.
+                    "what is this about",
+                    "what's this about",
+                    "what is this",
+                    "whats this",
+                    "what's this",
+                    "ye kya hai",
+                    "ye kia hai",
+                    "ye kya he",
+                    "ye kia he",
+                    "isme kya hai",
+                    "isme kia hai",
+                    "isme kya he",
+                    "is mein kya",
+                    "is me kya",
+                    "iska matlab",
+                    "ye about",
+                    "batao iske",
+                    "iske bare",
+                    "iske baare",
+                    "explain this",
+                    "explain karo",
+                    "samjhao",
+                    "samjha do",
+                    "tell me about",
+                    "about this",
                 )
             ):
+                return "summary"
+            # Very short residual text after stripping URL/mention ("?", "ye?", "ye")
+            # still means "tell me about the linked video".
+            residual = re.sub(r"[^\w\s]", "", t).strip()
+            if residual in ("", "ye", "yeh", "this", "bro", "bhai", "ji", "pls", "please"):
                 return "summary"
             return None
 
@@ -686,7 +767,32 @@ def run_agent(
             # when the corresponding tool flag is ON for this chat.
             primary_url = urls_in_last[0]
             spoken_mode = _video_spoken_intent(_intent_low)
-            use_video = spoken_mode and _is_video_url(primary_url)
+            is_video = _is_video_url(primary_url)
+            # Video links: never fall through to browse_url for content questions.
+            # If intent matched → use that mode; if intent missed but URL is clearly
+            # a video and the user is asking about the linked message, default summary.
+            if is_video and not spoken_mode:
+                # Link-intent / "about the quoted video" without exact phrase match
+                _li = _intent_low
+                if any(
+                    w in _li
+                    for w in (
+                        "kya",
+                        "what",
+                        "about",
+                        "summary",
+                        "summar",
+                        "batao",
+                        "batain",
+                        "explain",
+                        "samjha",
+                        "content",
+                        "video",
+                        "reel",
+                    )
+                ):
+                    spoken_mode = "summary"
+            use_video = bool(spoken_mode and is_video)
             can_transcribe = _tool_allowed_for_chat(chat_id, "transcribe_video")
             can_browse = _tool_allowed_for_chat(chat_id, "browse_url")
 
@@ -733,29 +839,31 @@ def run_agent(
                     "tool_call_id": _forced_call_id,
                     "content": _forced_obs_str,
                 })
-                # transcribe_video already refined for WhatsApp — skip another
-                # Groq synthesis call (saves 1–2 requests + avoids 429 storms).
-                if not str(_forced_observation).startswith("Tool error"):
-                    direct = _last_tool_obs_for_user(messages)
-                    if direct and len(direct) >= 40:
-                        print(
-                            "[AGENT] force transcribe_video → direct OBS reply "
-                            "(no synthesis call)"
-                        )
-                        logging.getLogger("mojo.agent").info(
-                            "DIRECT_OBS_REPLY mode=%s chars=%s",
-                            spoken_mode,
-                            len(direct),
-                        )
-                        return direct
+                # Always prefer the tool observation as the user-facing reply —
+                # both success (refined summary) and honest failures (private IG,
+                # bot-check, etc.). Avoids a second LLM call inventing rate-limits.
+                direct = _last_tool_obs_for_user(messages)
+                if direct and len(direct) >= 30:
+                    print(
+                        "[AGENT] force transcribe_video → direct OBS reply "
+                        f"(chars={len(direct)}, starts={direct[:40]!r})"
+                    )
+                    logging.getLogger("mojo.agent").info(
+                        "DIRECT_OBS_REPLY mode=%s chars=%s",
+                        spoken_mode,
+                        len(direct),
+                    )
+                    return direct
                 messages.append({
                     "role": "system",
                     "content": (
                         f"You already ran transcribe_video on {primary_url} "
                         f"(mode={spoken_mode}). Answer from that tool result only in "
-                        "ONE message. Present the content almost as-is. Do NOT invent a "
-                        "rate-limit / request-limit excuse. Do NOT call transcribe_video "
-                        "or browse_url again this turn. Do NOT promise parts later."
+                        "ONE message. Present the content almost as-is. If the tool "
+                        "reported an error (private video, download failed, etc.), "
+                        "relay that honestly in 1–2 lines. Do NOT invent a rate-limit / "
+                        "request-limit / 'fetch nahi hua' / 'thodi der baad' excuse. "
+                        "Do NOT call transcribe_video or browse_url again this turn."
                     ),
                 })
                 tools_for_next = None  # synthesis only — no tool schema payload
