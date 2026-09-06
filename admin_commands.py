@@ -43,6 +43,7 @@ KNOWN_TOOLS = [
     "note_down",         # owner-only at executor
     "transcribe_video",
     "link_preview",      # title/caption/author without ASR
+    "image_describe",    # vision caption; no OneDrive write
 ]
 
 OWNER_ONLY_TOOLS = frozenset({

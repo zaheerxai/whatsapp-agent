@@ -485,11 +485,11 @@ def _build_system_prompt(
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
 10. When summarizing a website from browse_url: 2–3 plain lines max. No numbered sections, no markdown.
 11. VOICE: If the turn includes "[Voice note transcript]" or "[Cached recent voice-note transcript]", answer from that text. For "kya bola" / "voice note me kya" / "what did I say" use the transcript — never browse a website and never claim no voice exists when a transcript is present.
-11b. NOTE DOWN: If the user says note down / note karlo / onedrive me note / save this (voice, text, or image OCR):
-   - DEFAULT: call note_down with the FULL content WORD-FOR-WORD (quoted message, transcript, or image text). Do NOT truncate with "…" or summarize.
-   - ONLY summarize / key-point the content if the user explicitly asked for summary/khulasa/key points/bullets.
-   - Do NOT claim "saved" / "noted" unless the note_down tool actually returned success.
-   - Do NOT ask "kis cheez ko note karna hai?" when quoted/OCR content is already present.
+11b. NOTE DOWN vs IMAGE DESCRIBE:
+   - note down / note karlo / onedrive me note / save this → note_down with FULL content WORD-FOR-WORD (quoted text, transcript, or image OCR). No "…" truncation. Summarize ONLY if user asked summary/khulasa/key points.
+   - ye photo kya hai / what is in this image / describe → describe only (image_describe / vision). Do NOT write OneDrive.
+   - Never claim "saved"/"noted" unless note_down returned success.
+   - Do not ask "kis cheez ko note karna hai?" when quoted/OCR content is already present.
 
 === URL / WEB FACTS (NO HALLUCINATION) ===
 12. Call browse_url ONLY when the CURRENT message has a URL (force_urls / priority note) OR the user clearly asks about a link/site ("details iska", "what is this about" with a link context, "fetch latest repo"). Never browse just because the last topic was a website.
@@ -843,43 +843,11 @@ def run_agent(
                 return m.group(1).strip()
             return None
 
-        def _is_note_intent(text: str) -> bool:
-            low = (text or "").lower()
-            return any(
-                p in low
-                for p in (
-                    "note down",
-                    "note kar",
-                    "note karlo",
-                    "note kar lo",
-                    "note kar do",
-                    "onedrive me note",
-                    "one drive me note",
-                    "save this",
-                    "save karlo",
-                    "ye note",
-                    "isko note",
-                    "note this",
-                )
-            )
-
-        def _user_wants_condensed_note(text: str) -> bool:
-            low = (text or "").lower()
-            return any(
-                p in low
-                for p in (
-                    "summary",
-                    "summarize",
-                    "summarise",
-                    "khulasa",
-                    "key points",
-                    "keypoints",
-                    "bullets",
-                    "main points",
-                    "short me",
-                    "mukhtasir",
-                )
-            )
+        from note_intent import (
+            is_note_intent as _is_note_intent,
+            wants_condensed_note as _user_wants_condensed_note,
+            content_fingerprint as _note_fp,
+        )
 
         _intent_src = latest_user_text or extra_user_note or ""
         if not _intent_src:
@@ -914,7 +882,7 @@ def run_agent(
                     )
                 if "Permission denied" in obs_s:
                     return "Note down sirf bot owner ke liye available hai."
-                # Fall through to agent with observation if soft failure
+                # Soft failure: fingerprint only in history (never sliced body)
                 messages.append({
                     "role": "assistant",
                     "content": None,
@@ -924,7 +892,10 @@ def run_agent(
                         "function": {
                             "name": "note_down",
                             "arguments": json.dumps(
-                                {"content": body[:500] + ("…" if len(body) > 500 else "")}
+                                {
+                                    "content_ref": _note_fp(body),
+                                    "status": "attempted",
+                                }
                             ),
                         },
                     }],
@@ -938,7 +909,8 @@ def run_agent(
                     "role": "system",
                     "content": (
                         "note_down already ran. Tell the user the result in 1 short line. "
-                        "Do not invent a successful save if the tool failed."
+                        "Do not invent a successful save if the tool failed. "
+                        "Do not invent or truncate note body text."
                     ),
                 })
 

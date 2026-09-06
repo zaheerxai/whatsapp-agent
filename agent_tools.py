@@ -399,6 +399,31 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "image_describe",
+            "description": (
+                "Describe a photo/image the user sent or quoted: scene, visible text, objects. "
+                "Use for 'ye photo kya hai', 'what is in this image', 'describe this pic'. "
+                "Does NOT write to OneDrive. Prefer this over note_down when the user only "
+                "wants to understand the image. Vision runs on the media path when an image "
+                "is attached or quoted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": (
+                            "Optional focus: text_ocr | scene | objects | all. Default all."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "note_down",
             "description": (
                 "Save or append a note to the owner's OneDrive journal (Mojo_Notes.txt). "
@@ -1259,6 +1284,16 @@ def _tool_python_exec(args: dict, ctx: dict) -> str:
         return "Executed successfully (no return value)."
     except Exception as e:
         return f"Error: {e}"
+
+def _tool_image_describe(args: dict, ctx: dict) -> str:
+    """Describe path is media-native; tool is a schema hook + honest fallback."""
+    focus = (args.get("focus") or "all").strip().lower()
+    return (
+        "image_describe runs when the user sends or quotes an image on the media path "
+        f"(focus={focus}). No image bytes in this text-only tool call — ask them to "
+        "send/quote the photo, or use note_down only if they want it saved to OneDrive."
+    )
+
 
 def _tool_note_down(args: dict, ctx: dict) -> str:
     # 1. Strict Owner Check (sender_id LID or sender_num phone)
@@ -2968,9 +3003,15 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "file_list_onedrive": _tool_file_list_onedrive,
     "python_exec": _tool_python_exec,
     "note_down": _tool_note_down,
+    "image_describe": _tool_image_describe,
     "transcribe_video": _tool_transcribe_video,
     "link_preview": _tool_link_preview,
 }
+
+
+# Tools that already enforce OWNER_SENDER_ID inside the executor.
+# Owner may use these from any chat even if the group tool flag is OFF.
+_OWNER_GATED_TOOLS = frozenset({"note_down", "python_exec", "send_message_to"})
 
 
 def execute_tool(name: str, arguments: dict, ctx: dict) -> str:
@@ -2978,15 +3019,28 @@ def execute_tool(name: str, arguments: dict, ctx: dict) -> str:
     if not fn:
         return f"Unknown tool: {name}"
     # Admin tool flags (default OFF). Fail closed if control plane unavailable.
-    # Owner-only tools keep their existing executor checks as a second layer.
+    # Owner-gated tools: if the caller is the owner, allow even when the chat
+    # flag is OFF (owner journal / exec / proactive send are personal).
     try:
         import admin_commands as _ac
         chat_id = (ctx or {}).get("chat_id") or ""
         if name in getattr(_ac, "KNOWN_TOOLS", ()) and chat_id:
             if not _ac.is_tool_enabled(chat_id, name):
-                return (
-                    f"Tool '{name}' is disabled for this chat. "
-                    "Ask the bot owner to enable it if needed."
+                is_owner = False
+                if name in _OWNER_GATED_TOOLS and _OWNER_SENDER_ID:
+                    sid = str((ctx or {}).get("sender_id") or "")
+                    snum = str((ctx or {}).get("sender_num") or "")
+                    is_owner = sid == str(_OWNER_SENDER_ID) or snum == str(
+                        _OWNER_SENDER_ID
+                    )
+                if not is_owner:
+                    return (
+                        f"Tool '{name}' is disabled for this chat. "
+                        "Ask the bot owner to enable it if needed."
+                    )
+                print(
+                    f"[execute_tool] owner bypass chat-flag OFF for {name} "
+                    f"chat={chat_id}"
                 )
     except Exception as e:
         print(f"[execute_tool] permission check failed for {name}: {e}")

@@ -1514,7 +1514,9 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 )
             return None
 
-        # B. Visual media (Gemini vision) — note-down gets OCR + real tool call
+        # B. Visual media (Gemini vision)
+        # - note intent → OCR (+ optional raise) → note_down → single confirmation
+        # - otherwise → describe only (no OneDrive write)
         elif media_kind in ("image", "sticker", "user_created_sticker", "gif", "video", "document"):
 
             if "sticker" in media_kind:
@@ -1529,56 +1531,43 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             with open(tmp_path, "rb") as f:
                 media_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-            caption = (text_content or "").strip()
-            # Strip reaction wrapper if present so intent detection still works
-            caption_for_intent = re.sub(
-                r"\[User is reacting to your previous message[^\]]*\]",
-                " ",
-                caption,
-                flags=re.I,
+            from note_intent import (
+                is_note_intent,
+                wants_condensed_note,
+                strip_caption_noise,
             )
-            caption_for_intent = re.sub(
-                r"User caption:\s*", " ", caption_for_intent, flags=re.I
-            ).strip()
-            low_cap = caption_for_intent.lower()
 
-            note_intent = any(
-                p in low_cap
-                for p in (
-                    "note down",
-                    "note kar",
-                    "note karlo",
-                    "note kar lo",
-                    "note kar do",
-                    "note kar dena",
-                    "onedrive me note",
-                    "one drive me note",
-                    "save this",
-                    "save kar",
-                    "save karlo",
-                    "ye note",
-                    "isko note",
-                    "is ko note",
-                    "note this",
-                    "journal",
-                )
+            caption = (text_content or "").strip()
+            caption_for_intent = strip_caption_noise(caption)
+            note_intent = is_note_intent(caption_for_intent)
+            want_summary = wants_condensed_note(caption_for_intent)
+            log.info(
+                "IMAGE_NOTE_INTENT match=%s condensed=%s caption=%r",
+                note_intent,
+                want_summary,
+                caption_for_intent[:80],
             )
-            # User asked for condensed form?
-            want_summary = any(
-                p in low_cap
-                for p in (
-                    "summary",
-                    "summarize",
-                    "summarise",
-                    "khulasa",
-                    "key points",
-                    "keypoints",
-                    "bullets",
-                    "main points",
-                    "short me",
-                    "mukhtasir",
+
+            def _vision_call(system: str, user_text: str, max_tok: int):
+                return client_gemini.chat.completions.create(
+                    model=GEMINI_MODEL,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": user_text},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{mime};base64,{media_b64}"
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                    max_tokens=max_tok,
                 )
-            )
 
             if note_intent and media_kind in (
                 "image", "sticker", "user_created_sticker", "gif", "video"
@@ -1589,6 +1578,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                         "User asked for a SUMMARY / key points. Output a clear structured "
                         "summary only — no chatty intro, no 'here is', no 'noted'."
                     )
+                    max_tok = 1200
                 else:
                     extract_sys = (
                         "OCR / extract ALL readable text and meaningful content from this "
@@ -1596,35 +1586,36 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                         "numbers, and wording. Do NOT summarize, shorten, or omit points. "
                         "Do NOT add commentary, intro, or 'noted'. Output only the extracted content."
                     )
+                    max_tok = 2048
                 try:
-                    gemini_response = client_gemini.chat.completions.create(
-                        model=GEMINI_MODEL,
-                        messages=[
-                            {"role": "system", "content": extract_sys},
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": (
-                                            caption_for_intent
-                                            or "Extract all text/content from this image."
-                                        ),
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:{mime};base64,{media_b64}"
-                                        },
-                                    },
-                                ],
-                            },
-                        ],
-                        max_tokens=4096,
+                    gemini_response = _vision_call(
+                        extract_sys,
+                        caption_for_intent
+                        or "Extract all text/content from this image.",
+                        max_tok,
                     )
-                    extracted = (
-                        gemini_response.choices[0].message.content or ""
-                    ).strip()
+                    choice = gemini_response.choices[0]
+                    extracted = (choice.message.content or "").strip()
+                    finish = getattr(choice, "finish_reason", None) or ""
+                    # Raise budget only if model hit token ceiling on a full OCR
+                    if (
+                        not want_summary
+                        and str(finish).lower() in ("length", "max_tokens", "other")
+                        and len(extracted) > 1500
+                    ):
+                        log.info(
+                            "IMAGE_OCR truncated finish=%s — retry max_tokens=4096",
+                            finish,
+                        )
+                        gemini_response = _vision_call(
+                            extract_sys,
+                            caption_for_intent
+                            or "Extract all text/content from this image.",
+                            4096,
+                        )
+                        extracted = (
+                            gemini_response.choices[0].message.content or ""
+                        ).strip()
                 except Exception as e:
                     log.error("IMAGE_NOTE_OCR_ERROR %s", e)
                     return (
@@ -1634,7 +1625,6 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 if not extracted or len(extracted) < 8:
                     return "Image se readable content nahi mila — note save nahi hua."
 
-                # Real OneDrive note via tool (owner check inside)
                 try:
                     from agent_tools import execute_tool
 
@@ -1656,47 +1646,31 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     len(extracted),
                     str(obs)[:120],
                 )
+                # Single reply only — do not fall through to describe path
                 if "Permission denied" in str(obs):
                     return "Note down sirf bot owner ke liye available hai."
                 if str(obs).startswith("Failed") or str(obs).startswith("Empty"):
                     return f"Note save nahi hua: {obs}"
-                return (
-                    f"OneDrive (MojoAgent) mein note save ho gaya ✅ "
-                    f"({len(extracted)} chars)."
-                )
+                if "Successfully saved" in str(obs) or "save ho" in str(obs).lower():
+                    return (
+                        f"OneDrive (MojoAgent) mein note save ho gaya ✅ "
+                        f"({len(extracted)} chars)."
+                    )
+                return str(obs)
 
-            # Default: describe / answer (no fake "noted" without tool)
+            # Describe only (image_describe behaviour) — never claim journal save
             user_prompt = (
                 caption_for_intent
                 if caption_for_intent
-                else "What is in this media?"
+                else "What is in this photo? Describe scene, text, and notable objects."
             )
-            gemini_response = client_gemini.chat.completions.create(
-                model=GEMINI_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Mojo. Someone sent or replied to an image/sticker/GIF/video. "
-                            "Answer from the media + their caption. Keep it WhatsApp-short. "
-                            "Do NOT claim you saved/noted anything to OneDrive or a journal "
-                            "unless a note tool actually ran (it did not on this path)."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": user_prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime};base64,{media_b64}"
-                                },
-                            },
-                        ],
-                    },
-                ],
+            describe_sys = (
+                "You are Mojo. Describe this image/sticker/GIF/video for WhatsApp: "
+                "scene, visible text (brief), objects, and anything relevant to the "
+                "user caption. Keep it short (3–8 lines). "
+                "Do NOT claim you saved/noted anything to OneDrive or a journal."
             )
+            gemini_response = _vision_call(describe_sys, user_prompt, 800)
             return gemini_response.choices[0].message.content
 
         else:
