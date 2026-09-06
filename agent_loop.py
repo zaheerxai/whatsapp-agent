@@ -485,7 +485,11 @@ def _build_system_prompt(
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
 10. When summarizing a website from browse_url: 2–3 plain lines max. No numbered sections, no markdown.
 11. VOICE: If the turn includes "[Voice note transcript]" or "[Cached recent voice-note transcript]", answer from that text. For "kya bola" / "voice note me kya" / "what did I say" use the transcript — never browse a website and never claim no voice exists when a transcript is present.
-11b. NOTE DOWN + QUOTE: If the user says "note down" / "note kar lo" / "ye cheez note" (voice or text) AND a "[Quoted Message]:" block is present in the same turn, call note_down with that quoted content immediately. Do NOT ask "kis cheez ko note karna hai?" when the quoted text is already provided.
+11b. NOTE DOWN: If the user says note down / note karlo / onedrive me note / save this (voice, text, or image OCR):
+   - DEFAULT: call note_down with the FULL content WORD-FOR-WORD (quoted message, transcript, or image text). Do NOT truncate with "…" or summarize.
+   - ONLY summarize / key-point the content if the user explicitly asked for summary/khulasa/key points/bullets.
+   - Do NOT claim "saved" / "noted" unless the note_down tool actually returned success.
+   - Do NOT ask "kis cheez ko note karna hai?" when quoted/OCR content is already present.
 
 === URL / WEB FACTS (NO HALLUCINATION) ===
 12. Call browse_url ONLY when the CURRENT message has a URL (force_urls / priority note) OR the user clearly asks about a link/site ("details iska", "what is this about" with a link context, "fetch latest repo"). Never browse just because the last topic was a website.
@@ -816,8 +820,129 @@ def run_agent(
             "is_group": is_group,
         }
 
-        # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
+        # --- Force note_down (verbatim) when user asks to note + content is present ---
         import re as _re
+
+        def _extract_note_body(text: str) -> Optional[str]:
+            """Pull quoted message / document / image-OCR block for note_down."""
+            if not text:
+                return None
+            m = _re.search(
+                r"\[Quoted Message\]:\s*(.+)$",
+                text,
+                flags=_re.I | _re.S,
+            )
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+            m = _re.search(
+                r"\[(?:Document|Image content|Voice note transcript|Cached recent voice-note transcript)[^\]]*\]:\s*(.+)$",
+                text,
+                flags=_re.I | _re.S,
+            )
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+            return None
+
+        def _is_note_intent(text: str) -> bool:
+            low = (text or "").lower()
+            return any(
+                p in low
+                for p in (
+                    "note down",
+                    "note kar",
+                    "note karlo",
+                    "note kar lo",
+                    "note kar do",
+                    "onedrive me note",
+                    "one drive me note",
+                    "save this",
+                    "save karlo",
+                    "ye note",
+                    "isko note",
+                    "note this",
+                )
+            )
+
+        def _user_wants_condensed_note(text: str) -> bool:
+            low = (text or "").lower()
+            return any(
+                p in low
+                for p in (
+                    "summary",
+                    "summarize",
+                    "summarise",
+                    "khulasa",
+                    "key points",
+                    "keypoints",
+                    "bullets",
+                    "main points",
+                    "short me",
+                    "mukhtasir",
+                )
+            )
+
+        _intent_src = latest_user_text or extra_user_note or ""
+        if not _intent_src:
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    _intent_src = m.get("content") or ""
+                    break
+        if (
+            _is_note_intent(_intent_src)
+            and _tool_allowed_for_chat(chat_id, "note_down")
+        ):
+            body = _extract_note_body(_intent_src)
+            if body and not _user_wants_condensed_note(_intent_src):
+                # Verbatim force — no LLM rewrite that truncates
+                print(
+                    f"[AGENT] force note_down verbatim chars={len(body)}"
+                )
+                try:
+                    obs = execute_tool(
+                        "note_down", {"content": body}, tool_ctx
+                    )
+                except Exception as _ne:
+                    obs = f"Tool error: {_ne}"
+                obs_s = str(obs)
+                if "Successfully saved" in obs_s:
+                    logging.getLogger("mojo.agent").info(
+                        "DIRECT_NOTE_DOWN chars=%s", len(body)
+                    )
+                    return (
+                        f"OneDrive (MojoAgent) mein note save ho gaya ✅ "
+                        f"({len(body)} chars)."
+                    )
+                if "Permission denied" in obs_s:
+                    return "Note down sirf bot owner ke liye available hai."
+                # Fall through to agent with observation if soft failure
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_forced_note_0",
+                        "type": "function",
+                        "function": {
+                            "name": "note_down",
+                            "arguments": json.dumps(
+                                {"content": body[:500] + ("…" if len(body) > 500 else "")}
+                            ),
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": "call_forced_note_0",
+                    "content": obs_s,
+                })
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "note_down already ran. Tell the user the result in 1 short line. "
+                        "Do not invent a successful save if the tool failed."
+                    ),
+                })
+
+        # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
         urls_in_last = list(force_urls or [])
         if not urls_in_last:
             last_user = latest_user_text or ""

@@ -1514,36 +1514,188 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 )
             return None
 
-        # B. Visual & Document Media (Gemini)
+        # B. Visual media (Gemini vision) — note-down gets OCR + real tool call
         elif media_kind in ("image", "sticker", "user_created_sticker", "gif", "video", "document"):
-            
+
             if "sticker" in media_kind:
                 mime = "image/webp"
             elif media_kind in ("gif", "video"):
                 mime = "video/mp4"
             elif media_kind == "document":
-                mime = "application/pdf" 
+                mime = "application/pdf"
             else:
                 mime = "image/jpeg"
 
             with open(tmp_path, "rb") as f:
                 media_b64 = base64.b64encode(f.read()).decode("utf-8")
-            
-            user_prompt = text_content if (text_content and text_content.strip()) else "What is in this media?"
-            
+
+            caption = (text_content or "").strip()
+            # Strip reaction wrapper if present so intent detection still works
+            caption_for_intent = re.sub(
+                r"\[User is reacting to your previous message[^\]]*\]",
+                " ",
+                caption,
+                flags=re.I,
+            )
+            caption_for_intent = re.sub(
+                r"User caption:\s*", " ", caption_for_intent, flags=re.I
+            ).strip()
+            low_cap = caption_for_intent.lower()
+
+            note_intent = any(
+                p in low_cap
+                for p in (
+                    "note down",
+                    "note kar",
+                    "note karlo",
+                    "note kar lo",
+                    "note kar do",
+                    "note kar dena",
+                    "onedrive me note",
+                    "one drive me note",
+                    "save this",
+                    "save kar",
+                    "save karlo",
+                    "ye note",
+                    "isko note",
+                    "is ko note",
+                    "note this",
+                    "journal",
+                )
+            )
+            # User asked for condensed form?
+            want_summary = any(
+                p in low_cap
+                for p in (
+                    "summary",
+                    "summarize",
+                    "summarise",
+                    "khulasa",
+                    "key points",
+                    "keypoints",
+                    "bullets",
+                    "main points",
+                    "short me",
+                    "mukhtasir",
+                )
+            )
+
+            if note_intent and media_kind in (
+                "image", "sticker", "user_created_sticker", "gif", "video"
+            ):
+                if want_summary:
+                    extract_sys = (
+                        "Extract the content of this image for a journal note. "
+                        "User asked for a SUMMARY / key points. Output a clear structured "
+                        "summary only — no chatty intro, no 'here is', no 'noted'."
+                    )
+                else:
+                    extract_sys = (
+                        "OCR / extract ALL readable text and meaningful content from this "
+                        "image WORD-FOR-WORD for a journal note. Preserve headings, bullets, "
+                        "numbers, and wording. Do NOT summarize, shorten, or omit points. "
+                        "Do NOT add commentary, intro, or 'noted'. Output only the extracted content."
+                    )
+                try:
+                    gemini_response = client_gemini.chat.completions.create(
+                        model=GEMINI_MODEL,
+                        messages=[
+                            {"role": "system", "content": extract_sys},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            caption_for_intent
+                                            or "Extract all text/content from this image."
+                                        ),
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{mime};base64,{media_b64}"
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                        max_tokens=4096,
+                    )
+                    extracted = (
+                        gemini_response.choices[0].message.content or ""
+                    ).strip()
+                except Exception as e:
+                    log.error("IMAGE_NOTE_OCR_ERROR %s", e)
+                    return (
+                        "Image se text nahi nikal saka — dobara bhejo ya text paste karo."
+                    )
+
+                if not extracted or len(extracted) < 8:
+                    return "Image se readable content nahi mila — note save nahi hua."
+
+                # Real OneDrive note via tool (owner check inside)
+                try:
+                    from agent_tools import execute_tool
+
+                    obs = execute_tool(
+                        "note_down",
+                        {"content": extracted},
+                        {
+                            "chat_id": chat_id,
+                            "sender_id": sender_id,
+                            "sender_num": sender_num,
+                        },
+                    )
+                except Exception as e:
+                    log.error("IMAGE_NOTE_TOOL_ERROR %s", e)
+                    return f"Note save fail hua: {e}"
+
+                log.info(
+                    "IMAGE_NOTE_DOWN chars=%s obs=%s",
+                    len(extracted),
+                    str(obs)[:120],
+                )
+                if "Permission denied" in str(obs):
+                    return "Note down sirf bot owner ke liye available hai."
+                if str(obs).startswith("Failed") or str(obs).startswith("Empty"):
+                    return f"Note save nahi hua: {obs}"
+                return (
+                    f"OneDrive (MojoAgent) mein note save ho gaya ✅ "
+                    f"({len(extracted)} chars)."
+                )
+
+            # Default: describe / answer (no fake "noted" without tool)
+            user_prompt = (
+                caption_for_intent
+                if caption_for_intent
+                else "What is in this media?"
+            )
             gemini_response = client_gemini.chat.completions.create(
                 model=GEMINI_MODEL,
                 messages=[
-                    {"role": "system", "content": (
-                        "You are Mojo, the AI assistant for Mojo AI Agency. Someone sent "
-                        "or replied to an image, sticker, GIF, video, or document. Extract details, "
-                        "describe it, or react naturally based on the user's prompt. Keep it WhatsApp-short."
-                    )},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{media_b64}"}}
-                    ]}
-                ]
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Mojo. Someone sent or replied to an image/sticker/GIF/video. "
+                            "Answer from the media + their caption. Keep it WhatsApp-short. "
+                            "Do NOT claim you saved/noted anything to OneDrive or a journal "
+                            "unless a note tool actually ran (it did not on this path)."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{media_b64}"
+                                },
+                            },
+                        ],
+                    },
+                ],
             )
             return gemini_response.choices[0].message.content
 
@@ -2656,26 +2808,56 @@ def _process_message_inner(client, message):
 
     has_quote = bool(ctx and (getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)))
 
+    # Substantive caption = real task (note/remind/ask), NOT a soft media reaction.
+    _cap_low = (text_content or "").lower()
+    _substantive_caption = any(
+        p in _cap_low
+        for p in (
+            "note",
+            "remind",
+            "yaad",
+            "save",
+            "onedrive",
+            "summar",
+            "kya hai",
+            "what is",
+            "batao",
+            "batana",
+            "explain",
+            "translate",
+            "ocr",
+            "read",
+            "likh",
+        )
+    )
+
     # Group: participant is often bot LID — if LID unknown, match quoted text to our last replies
     if (
         not is_reply_to_bot
         and is_group
         and has_quote
         and media_kind in REACTION_MEDIA
+        and not _substantive_caption
     ):
         if quoted_text and quoted_matches_recent_bot_reply(chat_id, quoted_text):
             is_reply_to_bot = True
             log.info("REACTION quote matched recent bot reply via chat_history")
         elif not quoted_text:
-            # WhatsApp media reactions often drop quote text and participant.
-            # If the quote is opaque, check if the bot was the last to speak.
-            # (hist[-1] is the user's current media message since insert_chat_message ran above)
+            # Opaque quote + no real caption command → maybe sticker reaction.
+            # Do NOT use this when user quoted an image with "note karlo" etc.
             recent = fetch_chat_history(chat_id, 3)
             if len(recent) >= 2 and recent[-2].get("role") == "assistant":
                 is_reply_to_bot = True
-                # Inject the bot's text back in so the LLM knows what they are reacting to!
                 quoted_text = recent[-2].get("content", "")
-                log.info("REACTION inferred from immediate previous bot message due to empty quote payload")
+                log.info(
+                    "REACTION inferred from immediate previous bot message "
+                    "due to empty quote payload"
+                )
+    elif _substantive_caption and media_kind in REACTION_MEDIA:
+        log.info(
+            "SKIP_REACTION_INFER substantive caption on media quote: %r",
+            (text_content or "")[:80],
+        )
 
     native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
     text_hit = False

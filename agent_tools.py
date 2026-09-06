@@ -401,17 +401,22 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "note_down",
             "description": (
-                "Save or append a note to the owner's OneDrive journal. "
-                "Use whenever the user says 'note down'. If they ask for specific formatting "
-                "(e.g., 'concise', 'bullets', 'Urdu'), format the text exactly as requested "
-                "BEFORE calling this tool. Only the owner can use this."
+                "Save or append a note to the owner's OneDrive journal (Mojo_Notes.txt). "
+                "Call whenever the user says note down / note karlo / onedrive me note / save this. "
+                "DEFAULT: pass the content WORD-FOR-WORD (full quoted text, full OCR, full "
+                "transcript). Do NOT summarize, shorten, or add ellipsis (…) unless the user "
+                "explicitly asked for summary / khulasa / key points / bullets. "
+                "Only the bot owner can use this."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "The finalized, perfectly formatted text to save."
+                        "description": (
+                            "Full note body to save. Verbatim by default. "
+                            "Only condensed if user asked summary/key points."
+                        ),
                     },
                 },
                 "required": ["content"],
@@ -1256,9 +1261,9 @@ def _tool_python_exec(args: dict, ctx: dict) -> str:
         return f"Error: {e}"
 
 def _tool_note_down(args: dict, ctx: dict) -> str:
-    # 1. Strict Owner Check
+    # 1. Strict Owner Check (sender_id LID or sender_num phone)
     if not _OWNER_SENDER_ID or (
-        str(ctx.get("sender_id")) != str(_OWNER_SENDER_ID)
+        str(ctx.get("sender_id") or "") != str(_OWNER_SENDER_ID)
         and str(ctx.get("sender_num") or "") != str(_OWNER_SENDER_ID)
     ):
         return "Permission denied: Only the bot owner can use the note down feature."
@@ -1267,9 +1272,11 @@ def _tool_note_down(args: dict, ctx: dict) -> str:
     if not content:
         return "Empty note. Nothing was saved."
 
+    # Strip model ellipsis truncation markers if the tail is clearly cut
+    if content.endswith("…") or content.endswith("..."):
+        print("[note_down] warning: content ends with ellipsis — model may have truncated")
+
     try:
-        # 2. Format with Date, Time, and 3-line gap
-        # Assuming we use the UTC time context or we can adapt to PKT
         now_str = datetime.now(timezone.utc).strftime("%A, %Y-%m-%d %I:%M %p UTC")
         formatted_entry = f"{now_str}\n{content}\n\n\n"
 
@@ -1278,24 +1285,28 @@ def _tool_note_down(args: dict, ctx: dict) -> str:
         remote_path = f"{remote_folder}/{file_name}"
         local_temp = os.path.join(tempfile.gettempdir(), file_name)
 
-        # 3. Try downloading existing file to append (file_ops.py)
         existing_content = ""
         try:
-            if _file_ops.onedrive_configured():
+            if _file_ops and _file_ops.onedrive_configured():
                 dl_path = _file_ops.download_from_onedrive(remote_path, local_temp)
                 with open(dl_path, "r", encoding="utf-8") as f:
                     existing_content = f.read()
         except Exception:
-            pass # File likely doesn't exist yet, we will create a new one
+            pass
 
-        # 4. Append and write back locally
         new_content = existing_content + formatted_entry
         _file_ops.write_text_file(new_content, file_name, tempfile.gettempdir())
+        _file_ops.upload_to_onedrive(
+            local_temp, remote_folder=remote_folder, remote_name=file_name
+        )
 
-        # 5. Upload back to OneDrive
-        _file_ops.upload_to_onedrive(local_temp, remote_folder=remote_folder, remote_name=file_name)
-        
-        return "Successfully saved to OneDrive folder MojoAgent."
+        nchars = len(content)
+        nlines = content.count("\n") + 1
+        print(f"[note_down] saved chars={nchars} lines={nlines}")
+        return (
+            f"Successfully saved to OneDrive folder MojoAgent "
+            f"({nchars} chars, {nlines} lines)."
+        )
     except Exception as e:
         return f"Failed to save note: {e}"
 
