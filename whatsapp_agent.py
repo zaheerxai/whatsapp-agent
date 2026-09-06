@@ -3012,11 +3012,19 @@ def _process_message_inner(client, message):
                             {
                                 "role": "system",
                                 "content": (
-                                    "In ONE short line, state the communicative intent / "
-                                    "visible text of this WhatsApp sticker or reaction image "
-                                    "(e.g. 'sach batao / tell the truth', 'thanks', "
-                                    "'yeh na karo / don't do that', 'laughing'). "
-                                    "No essay, no celebrity names, no scene description."
+                                    "You read WhatsApp stickers used as REACTIONS.\n"
+                                    "Output EXACTLY two lines:\n"
+                                    "TEXT: <any words/letters visible on the sticker, "
+                                    "transliterate Urdu/Hindi to Roman if needed, or NONE>\n"
+                                    "INTENT: <one of: thanks | laugh | facepalm | disbelief | "
+                                    "agree | disagree | love | sad | angry | teasing | "
+                                    "got_it | tell_truth | stop_that | shrug | other> "
+                                    "+ 3–8 word gloss\n"
+                                    "Examples:\n"
+                                    "TEXT: MIL GAYI\nINTENT: got_it — playful 'found it / done'\n"
+                                    "TEXT: Sach batao\nINTENT: tell_truth — dare to be honest\n"
+                                    "TEXT: NONE\nINTENT: facepalm — embarrassed / 'really?'\n"
+                                    "No celebrity names. No long description."
                                 ),
                             },
                             {
@@ -3024,7 +3032,7 @@ def _process_message_inner(client, message):
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": "Reaction meaning?",
+                                        "text": "Read this reaction sticker.",
                                     },
                                     {
                                         "type": "image_url",
@@ -3035,14 +3043,14 @@ def _process_message_inner(client, message):
                                 ],
                             },
                         ],
-                        max_tokens=60,
+                        max_tokens=80,
                     )
                     sticker_meaning = (
                         _vis.choices[0].message.content or ""
                     ).strip()
                     log.info(
                         "REACTION_STICKER_MEANING %r",
-                        sticker_meaning[:120],
+                        sticker_meaning[:200],
                     )
                 except Exception as _ve:
                     log.warning("REACTION_LIGHT_VISION_FAIL %s", _ve)
@@ -3058,22 +3066,34 @@ def _process_message_inner(client, message):
                 if sticker_meaning:
                     _user_rx = (
                         f"{text_content}\n\n"
-                        f"[Sticker/image reaction meaning]: {sticker_meaning}"
+                        f"[Sticker reaction read]:\n{sticker_meaning}\n"
+                        "Use TEXT + INTENT as the primary signal for how to reply."
                     )
                 _rx_sys = (
-                    "You are Mojo on WhatsApp — witty, warm, playful.\n"
-                    "The user reacted to YOUR previous message with a sticker/image/GIF.\n"
-                    "You get: (1) the message they quoted, (2) sticker meaning/text when available.\n\n"
-                    "Reply style:\n"
-                    "- 1–3 short WhatsApp lines, often Roman Urdu + light emoji.\n"
-                    "- Be FUN and context-aware. Play along with the sticker "
-                    "(e.g. 'Sach batao' → jokingly insist it's true + offer next step; "
-                    "'bahut shukriya' → warm you're-welcome tied to what you did; "
-                    "'yeh na karo' → light humor).\n"
-                    "- Continue the chat when natural (one short follow-up is good).\n"
+                    "You are Mojo on WhatsApp — witty, warm, playful, precise.\n"
+                    "The user reacted to YOUR previous message with a sticker.\n"
+                    "Inputs: (A) your previous message they quoted, "
+                    "(B) sticker TEXT + INTENT from vision.\n\n"
+                    "How to reply:\n"
+                    "1. React to INTENT first (what the sticker means as feedback).\n"
+                    "2. Tie it to the quoted previous message content.\n"
+                    "3. 1–3 short Roman Urdu / mixed lines + light emoji.\n"
+                    "4. One short follow-up only if it fits the thread.\n\n"
+                    "Examples of correct behaviour:\n"
+                    "- INTENT facepalm + you joked they were 'chalak' → "
+                    "own the tease lightly, don't praise the sticker art.\n"
+                    "- TEXT 'MIL GAYI' / got_it → acknowledge 'ha mil gaya' / "
+                    "playful agreement — NOT 'shukriya'.\n"
+                    "- TEXT 'Sach batao' → insist it's true with humor + next step.\n"
+                    "- TEXT thanks / shukriya → brief you're-welcome about what you did.\n\n"
+                    "HARD BANS:\n"
+                    "- Do NOT say the sticker is 'mast' / cute / describe the drawing.\n"
+                    "- Do NOT default to 'Koi aur kaam ho to batao, ready hoon' "
+                    "unless the prior message was actually offering more work.\n"
+                    "- Do NOT invent gratitude if INTENT is not thanks.\n"
                     "- Do NOT essay-describe artwork or name celebrities.\n"
-                    "- Do NOT claim new tool actions or note saves in this reply.\n"
-                    "- Never reply with only a single emoji when you have context."
+                    "- Do NOT claim new tool/note actions.\n"
+                    "- Never reply with only one emoji when you have context."
                 )
                 _rx = client_ai.chat.completions.create(
                     model=MODEL_NAME,
@@ -3082,15 +3102,28 @@ def _process_message_inner(client, message):
                         {"role": "user", "content": _user_rx},
                     ],
                     max_tokens=220,
-                    temperature=0.85,
+                    temperature=0.75,
                 )
                 ai_answer = (_rx.choices[0].message.content or "").strip()
-                if not ai_answer or ai_answer in ("👍", "🙏", "😂", "✅", "😊"):
+                # Reject hollow / wrong-template replies
+                _low_ans = (ai_answer or "").lower()
+                _bad_rx = (
+                    not ai_answer
+                    or ai_answer in ("👍", "🙏", "😂", "✅", "😊")
+                    or (
+                        "sticker" in _low_ans
+                        and any(
+                            w in _low_ans
+                            for w in ("mast", "cute", "pyari", "zabardast sticker")
+                        )
+                    )
+                )
+                if _bad_rx:
                     _hint = (sticker_meaning or "").strip()
                     if _hint:
-                        ai_answer = f"Haha got it — {_hint[:80]} 😄"
+                        ai_answer = f"Haha samajh gaya — {_hint[:100].replace(chr(10), ' ')} 😄"
                     elif (quoted_text or "").strip():
-                        ai_answer = "Haha theek hai 😄 Aur kuch chahiye?"
+                        ai_answer = "Haha theek hai 😄"
                     else:
                         ai_answer = "Haha theek hai 😄"
         except Exception as _re:
