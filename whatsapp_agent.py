@@ -1554,10 +1554,6 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 caption_for_intent,
                 flags=re.I,
             ).strip()
-            # Pure reaction path should not reach here, but guard anyway
-            if is_reaction_to_bot and not caption_for_intent:
-                log.info("IMAGE_PATH skip — pure reaction, no user caption")
-                return None
             note_intent = is_note_intent(caption_for_intent)
             want_summary = wants_condensed_note(caption_for_intent)
             log.info(
@@ -1678,7 +1674,35 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     )
                 return str(obs)
 
-            # Describe only (image_describe behaviour) — never claim journal save
+            # Reaction to bot's message with sticker/image/GIF (working classic path):
+            # see the media + quoted prior reply and respond naturally / fun.
+            if is_reaction_to_bot:
+                user_prompt = caption if caption else (
+                    "User reacted with this sticker/image to your previous message."
+                )
+                describe_sys = (
+                    "You are Mojo on WhatsApp — witty, warm, playful.\n"
+                    "The user is REACTING to your previous message with this "
+                    "sticker/image/GIF (their caption/context is in the user message).\n"
+                    "Read any text ON the sticker and the emotion, then reply in 1–3 "
+                    "short WhatsApp lines (often Roman Urdu + light emoji) that:\n"
+                    "- play along with the sticker meaning (e.g. CHUP → playful hush; "
+                    "Sach batao → insist it's true; facepalm → light tease-back; "
+                    "MIL GAYI → playful got-it),\n"
+                    "- stay tied to what you previously said,\n"
+                    "- can offer one short follow-up if it fits.\n"
+                    "Do NOT write an art essay or name celebrities. "
+                    "Do NOT say the sticker is 'mast/cute'. "
+                    "Do NOT claim you saved notes or ran tools. "
+                    "Do NOT output placeholders like TEXT or /Romanized text."
+                )
+                gemini_response = _vision_call(describe_sys, user_prompt, 280)
+                out = (gemini_response.choices[0].message.content or "").strip()
+                if not out or out in ("👍", "🙏", "😂") or "romanized" in out.lower():
+                    return "Haha theek hai 😄"
+                return out
+
+            # Plain describe (not a reaction, not a note)
             user_prompt = (
                 caption_for_intent
                 if caption_for_intent
@@ -2908,14 +2932,8 @@ def _process_message_inner(client, message):
     else:
         log.info("PRIVATE_MESSAGE from=%s", sender_number)
 
-    # Pure media reaction (sticker/image/gif reply to bot with no user task caption)
-    # must stay a SHORT reaction reply — never full vision OCR/describe.
-    _pure_media_reaction = (
-        is_media_reaction_to_bot
-        and media_kind in REACTION_MEDIA
-        and not _substantive_caption
-    )
-
+    # Classic reaction path: inject prior-reply context, then handle_media_message
+    # vision (same mechanics that worked for "Sach batao" style replies).
     if is_media_reaction_to_bot:
         q = (quoted_text or "").strip()
         kind_label = {
@@ -2923,11 +2941,12 @@ def _process_message_inner(client, message):
             "image": "image",
             "gif": "GIF",
         }.get(media_kind, media_kind or "media")
-        _q_ctx = q[:1200] + ("…" if len(q) > 1200 else "")
+        _q_ctx = q[:800] + ("…" if len(q) > 800 else "")
         reaction_note = (
-            f"[User is reacting to your previous message with a {kind_label}.]\n"
-            f"[Your previous message they quoted]:\n{_q_ctx or '(context unavailable)'}\n"
-            "Respond as a natural, fun reaction — WhatsApp style."
+            f"[User is reacting to your previous message with a {kind_label}. "
+            f"Treat this as their reaction/feedback to what you said"
+            + (f': "{_q_ctx}"' if _q_ctx else "")
+            + ". Respond naturally to the reaction — short, in-character, same language vibe.]"
         )
         if _user_cap:
             text_content = f"{reaction_note}\n\nUser caption: {_user_cap}"
@@ -2976,159 +2995,6 @@ def _process_message_inner(client, message):
         tz_reply = maybe_set_timezone(db_sender_id, text_content)
         if tz_reply:
             ai_answer = tz_reply
-
-    if not ai_answer and _pure_media_reaction:
-        # Fun reaction: prior-reply context + light sticker meaning (not art essay)
-        log.info(
-            "PURE_MEDIA_REACTION kind=%s light_vision+context fun_reply",
-            media_kind,
-        )
-        sticker_meaning = ""
-        tmp_rx = None
-        try:
-            with _timed("2. reaction light vision + fun reply"):
-                mime = {
-                    "sticker": "image/webp",
-                    "image": "image/jpeg",
-                    "gif": "video/mp4",
-                }.get(media_kind, "image/jpeg")
-                suffix = {
-                    "sticker": ".webp",
-                    "image": ".jpg",
-                    "gif": ".mp4",
-                }.get(media_kind, ".bin")
-                try:
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                        tmp_rx = tmp.name
-                    msg_to_dl = (
-                        target_media_msg if target_media_msg else message.Message
-                    )
-                    client.download_any(msg_to_dl, path=tmp_rx)
-                    with open(tmp_rx, "rb") as f:
-                        media_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    _vis = client_gemini.chat.completions.create(
-                        model=GEMINI_MODEL,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You read WhatsApp stickers used as REACTIONS.\n"
-                                    "Output EXACTLY two lines:\n"
-                                    "TEXT: <any words/letters visible on the sticker, "
-                                    "transliterate Urdu/Hindi to Roman if needed, or NONE>\n"
-                                    "INTENT: <one of: thanks | laugh | facepalm | disbelief | "
-                                    "agree | disagree | love | sad | angry | teasing | "
-                                    "got_it | tell_truth | stop_that | shrug | other> "
-                                    "+ 3–8 word gloss\n"
-                                    "Examples:\n"
-                                    "TEXT: MIL GAYI\nINTENT: got_it — playful 'found it / done'\n"
-                                    "TEXT: Sach batao\nINTENT: tell_truth — dare to be honest\n"
-                                    "TEXT: NONE\nINTENT: facepalm — embarrassed / 'really?'\n"
-                                    "No celebrity names. No long description."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Read this reaction sticker.",
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:{mime};base64,{media_b64}"
-                                        },
-                                    },
-                                ],
-                            },
-                        ],
-                        max_tokens=80,
-                    )
-                    sticker_meaning = (
-                        _vis.choices[0].message.content or ""
-                    ).strip()
-                    log.info(
-                        "REACTION_STICKER_MEANING %r",
-                        sticker_meaning[:200],
-                    )
-                except Exception as _ve:
-                    log.warning("REACTION_LIGHT_VISION_FAIL %s", _ve)
-                    sticker_meaning = ""
-                finally:
-                    if tmp_rx and os.path.exists(tmp_rx):
-                        try:
-                            os.remove(tmp_rx)
-                        except OSError:
-                            pass
-
-                _user_rx = text_content
-                if sticker_meaning:
-                    _user_rx = (
-                        f"{text_content}\n\n"
-                        f"[Sticker reaction read]:\n{sticker_meaning}\n"
-                        "Use TEXT + INTENT as the primary signal for how to reply."
-                    )
-                _rx_sys = (
-                    "You are Mojo on WhatsApp — witty, warm, playful, precise.\n"
-                    "The user reacted to YOUR previous message with a sticker.\n"
-                    "Inputs: (A) your previous message they quoted, "
-                    "(B) sticker TEXT + INTENT from vision.\n\n"
-                    "How to reply:\n"
-                    "1. React to INTENT first (what the sticker means as feedback).\n"
-                    "2. Tie it to the quoted previous message content.\n"
-                    "3. 1–3 short Roman Urdu / mixed lines + light emoji.\n"
-                    "4. One short follow-up only if it fits the thread.\n\n"
-                    "Examples of correct behaviour:\n"
-                    "- INTENT facepalm + you joked they were 'chalak' → "
-                    "own the tease lightly, don't praise the sticker art.\n"
-                    "- TEXT 'MIL GAYI' / got_it → acknowledge 'ha mil gaya' / "
-                    "playful agreement — NOT 'shukriya'.\n"
-                    "- TEXT 'Sach batao' → insist it's true with humor + next step.\n"
-                    "- TEXT thanks / shukriya → brief you're-welcome about what you did.\n\n"
-                    "HARD BANS:\n"
-                    "- Do NOT say the sticker is 'mast' / cute / describe the drawing.\n"
-                    "- Do NOT default to 'Koi aur kaam ho to batao, ready hoon' "
-                    "unless the prior message was actually offering more work.\n"
-                    "- Do NOT invent gratitude if INTENT is not thanks.\n"
-                    "- Do NOT essay-describe artwork or name celebrities.\n"
-                    "- Do NOT claim new tool/note actions.\n"
-                    "- Never reply with only one emoji when you have context."
-                )
-                _rx = client_ai.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": _rx_sys},
-                        {"role": "user", "content": _user_rx},
-                    ],
-                    max_tokens=220,
-                    temperature=0.75,
-                )
-                ai_answer = (_rx.choices[0].message.content or "").strip()
-                # Reject hollow / wrong-template replies
-                _low_ans = (ai_answer or "").lower()
-                _bad_rx = (
-                    not ai_answer
-                    or ai_answer in ("👍", "🙏", "😂", "✅", "😊")
-                    or (
-                        "sticker" in _low_ans
-                        and any(
-                            w in _low_ans
-                            for w in ("mast", "cute", "pyari", "zabardast sticker")
-                        )
-                    )
-                )
-                if _bad_rx:
-                    _hint = (sticker_meaning or "").strip()
-                    if _hint:
-                        ai_answer = f"Haha samajh gaya — {_hint[:100].replace(chr(10), ' ')} 😄"
-                    elif (quoted_text or "").strip():
-                        ai_answer = "Haha theek hai 😄"
-                    else:
-                        ai_answer = "Haha theek hai 😄"
-        except Exception as _re:
-            log.warning("REACTION_REPLY_FAIL %s — contextual fallback", _re)
-            ai_answer = "Haha theek hai 😄"
 
     if not ai_answer:
         if media_kind:
