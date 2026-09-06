@@ -1538,14 +1538,34 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             )
 
             caption = (text_content or "").strip()
+            # Prefer real user caption; strip reaction wrappers and quoted bot text
+            # so a sticker reaction quoting "note save ho gaya" is NOT note_intent.
             caption_for_intent = strip_caption_noise(caption)
+            # Drop injected [Quoted Message] blocks from intent matching
+            caption_for_intent = re.split(
+                r"\[Quoted Message\]:",
+                caption_for_intent,
+                maxsplit=1,
+                flags=re.I,
+            )[0].strip()
+            caption_for_intent = re.sub(
+                r"\[User is reacting to your previous message[^\]]*\]",
+                " ",
+                caption_for_intent,
+                flags=re.I,
+            ).strip()
+            # Pure reaction path should not reach here, but guard anyway
+            if is_reaction_to_bot and not caption_for_intent:
+                log.info("IMAGE_PATH skip — pure reaction, no user caption")
+                return None
             note_intent = is_note_intent(caption_for_intent)
             want_summary = wants_condensed_note(caption_for_intent)
             log.info(
-                "IMAGE_NOTE_INTENT match=%s condensed=%s caption=%r",
+                "IMAGE_NOTE_INTENT match=%s condensed=%s caption=%r reaction=%s",
                 note_intent,
                 want_summary,
                 caption_for_intent[:80],
+                is_reaction_to_bot,
             )
 
             def _vision_call(system: str, user_text: str, max_tok: int):
@@ -2782,26 +2802,34 @@ def _process_message_inner(client, message):
 
     has_quote = bool(ctx and (getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)))
 
-    # Substantive caption = real task (note/remind/ask), NOT a soft media reaction.
-    _cap_low = (text_content or "").lower()
-    _substantive_caption = any(
-        p in _cap_low
-        for p in (
-            "note",
-            "remind",
-            "yaad",
-            "save",
-            "onedrive",
-            "summar",
-            "kya hai",
-            "what is",
-            "batao",
-            "batana",
-            "explain",
-            "translate",
-            "ocr",
-            "read",
-            "likh",
+    # Substantive caption = USER-TYPED task only (original_text).
+    # NEVER scan text_content — that includes [Quoted Message] bot text which
+    # often contains words like "note" / "OneDrive" and falsely blocked reactions.
+    from note_intent import is_note_intent as _ni_note, intent_head as _ni_head
+
+    _user_cap = (original_text or "").strip()
+    _user_cap_head = _ni_head(_user_cap)
+    _substantive_caption = bool(_user_cap_head) and (
+        _ni_note(_user_cap)
+        or any(
+            p in _user_cap_head
+            for p in (
+                "remind",
+                "yaad",
+                "summar",
+                "kya hai",
+                "what is",
+                "batao",
+                "batana",
+                "explain",
+                "translate",
+                "ocr",
+                "read this",
+                "likh",
+                "describe",
+                "photo kya",
+                "image kya",
+            )
         )
     )
 
@@ -2817,8 +2845,7 @@ def _process_message_inner(client, message):
             is_reply_to_bot = True
             log.info("REACTION quote matched recent bot reply via chat_history")
         elif not quoted_text:
-            # Opaque quote + no real caption command → maybe sticker reaction.
-            # Do NOT use this when user quoted an image with "note karlo" etc.
+            # Opaque quote + no user task caption → soft media reaction.
             recent = fetch_chat_history(chat_id, 3)
             if len(recent) >= 2 and recent[-2].get("role") == "assistant":
                 is_reply_to_bot = True
@@ -2829,8 +2856,8 @@ def _process_message_inner(client, message):
                 )
     elif _substantive_caption and media_kind in REACTION_MEDIA:
         log.info(
-            "SKIP_REACTION_INFER substantive caption on media quote: %r",
-            (text_content or "")[:80],
+            "SKIP_REACTION_INFER user task caption on media: %r",
+            _user_cap_head[:80],
         )
 
     native = is_bot_natively_mentioned(ctx, BOT_PN, BOT_LID)
@@ -2881,6 +2908,14 @@ def _process_message_inner(client, message):
     else:
         log.info("PRIVATE_MESSAGE from=%s", sender_number)
 
+    # Pure media reaction (sticker/image/gif reply to bot with no user task caption)
+    # must stay a SHORT reaction reply — never full vision OCR/describe.
+    _pure_media_reaction = (
+        is_media_reaction_to_bot
+        and media_kind in REACTION_MEDIA
+        and not _substantive_caption
+    )
+
     if is_media_reaction_to_bot:
         q = (quoted_text or "").strip()
         kind_label = {
@@ -2892,10 +2927,11 @@ def _process_message_inner(client, message):
             f"[User is reacting to your previous message with a {kind_label}. "
             f"Treat this as their reaction/feedback to what you said"
             + (f': "{q[:300]}"' if q else "")
-            + ". Respond naturally to the reaction — short, in-character, same language vibe.]"
+            + ". Respond naturally to the reaction — short, in-character, same language vibe. "
+            "Do NOT describe the sticker/image art in detail unless they asked what it shows.]"
         )
-        if text_content.strip():
-            text_content = f"{reaction_note}\n\nUser caption: {text_content}"
+        if _user_cap:
+            text_content = f"{reaction_note}\n\nUser caption: {_user_cap}"
         else:
             text_content = reaction_note
 
@@ -2941,6 +2977,37 @@ def _process_message_inner(client, message):
         tz_reply = maybe_set_timezone(db_sender_id, text_content)
         if tz_reply:
             ai_answer = tz_reply
+
+    if not ai_answer and _pure_media_reaction:
+        # Short reaction only — no sticker download / vision describe
+        log.info(
+            "PURE_MEDIA_REACTION kind=%s skip_vision short_reply",
+            media_kind,
+        )
+        try:
+            with _timed("2. reaction reply (text only)"):
+                _rx_sys = (
+                    "You are Mojo on WhatsApp. The user reacted to your last message "
+                    "with a sticker/image/GIF. Reply in ONE short line, same language "
+                    "vibe as the chat (often Roman Urdu). Acknowledge the reaction "
+                    "naturally. Do NOT describe the sticker artwork. Do NOT claim you "
+                    "saved notes or ran tools."
+                )
+                _rx = client_ai.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": _rx_sys},
+                        {"role": "user", "content": text_content},
+                    ],
+                    max_tokens=80,
+                    temperature=0.7,
+                )
+                ai_answer = (_rx.choices[0].message.content or "").strip()
+                if not ai_answer:
+                    ai_answer = "👍"
+        except Exception as _re:
+            log.warning("REACTION_REPLY_FAIL %s — fallback emoji", _re)
+            ai_answer = "👍"
 
     if not ai_answer:
         if media_kind:
