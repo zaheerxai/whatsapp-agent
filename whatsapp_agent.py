@@ -1677,65 +1677,45 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     )
                 return str(obs)
 
-            # =====================================================================
-            # 2. VISUAL MEDIA ROUTING (Reactions & Regular Images)
-            # =====================================================================
-            # If we reach here, it's not a note to be saved. We use Gemini to describe
-            # the visual content, then hand it off to the main Groq agent loop for the reply.
-            
-            reaction_context = ""
-            if is_reaction_to_bot:
-                reaction_context = f"[User is reacting to your previous message with a {media_kind}.]"
-            
-            # Use caption_for_intent to avoid double-injecting [Quoted Message] noise
-            base_text = caption_for_intent if caption_for_intent else ""
-            
-            if reaction_context and base_text:
-                user_prompt = f"{base_text}\n\n{reaction_context}"
-            elif reaction_context:
-                user_prompt = reaction_context
-            elif base_text:
-                user_prompt = base_text
-            else:
-                user_prompt = f"What is in this {media_kind}?"
 
-            describe_sys = (
-                "You are an expert visual analyzer. Describe this media clearly and concisely. "
-                "If it's a sticker or GIF, explain the emotion, meme, text, or vibe it represents. "
-                "Do NOT write a conversational reply. Output ONLY the visual description."
+            # -----------------------------------------------------------------
+            # Classic visual path (UNCHANGED from last known-good reaction replies)
+            # Full text_content is the user prompt — includes reaction_note + prior
+            # bot message when this is a sticker/image reaction to the bot.
+            # Note-intent path above already returned if applicable.
+            # -----------------------------------------------------------------
+            user_prompt = (
+                text_content
+                if (text_content and text_content.strip())
+                else "What is in this media?"
             )
-            
-            try:
-                gemini_response = _vision_call(describe_sys, user_prompt, 800)
-                media_description = (gemini_response.choices[0].message.content or "").strip()
-            except Exception as e:
-                log.error("IMAGE_DESCRIBE_ERROR %s", e)
-                return "🖼️ Media describe fail ho gaya abhi."
+            gemini_response = client_gemini.chat.completions.create(
+                model=GEMINI_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Mojo, the AI assistant for Mojo AI Agency. Someone sent "
+                            "or replied to an image, sticker, GIF, video, or document. Extract details, "
+                            "describe it, or react naturally based on the user's prompt. Keep it WhatsApp-short."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{media_b64}"
+                                },
+                            },
+                        ],
+                    },
+                ],
+            )
+            return gemini_response.choices[0].message.content
 
-            # Build the final context string for Groq
-            context_str = f"[Visual Media Detection]: {media_description}"
-            if reaction_context:
-                context_str = f"{reaction_context}\n\n{context_str}"
-            if base_text:
-                context_str = f'User caption: "{base_text}"\n\n{context_str}'
-                
-            insert_chat_message(chat_id, "visual_media", "user", context_str)
-            
-            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
-                from agent_loop import run_agent
-                is_group = "g.us" in (chat_id or "")
-                return run_agent(
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    sender_num=sender_num,
-                    history_limit=history_limit,
-                    is_group=is_group,
-                    msg_time=msg_time,
-                    extra_user_note=context_str,
-                )
-            
-            # Fallback if ai_chat is disabled
-            return media_description
 
         else:
             return None
