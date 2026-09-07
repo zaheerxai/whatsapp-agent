@@ -1585,6 +1585,9 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     max_tokens=max_tok,
                 )
 
+            # =====================================================================
+            # 1. OCR / NOTE EXTRACTION PATH
+            # =====================================================================
             if note_intent and media_kind in (
                 "image", "sticker", "user_created_sticker", "gif", "video"
             ):
@@ -1674,46 +1677,65 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     )
                 return str(obs)
 
-            # Reaction to bot's message with sticker/image/GIF (working classic path):
-            # see the media + quoted prior reply and respond naturally / fun.
+            # =====================================================================
+            # 2. VISUAL MEDIA ROUTING (Reactions & Regular Images)
+            # =====================================================================
+            # If we reach here, it's not a note to be saved. We use Gemini to describe
+            # the visual content, then hand it off to the main Groq agent loop for the reply.
+            
+            reaction_context = ""
             if is_reaction_to_bot:
-                user_prompt = caption if caption else (
-                    "User reacted with this sticker/image to your previous message."
-                )
-                describe_sys = (
-                    "You are Mojo on WhatsApp — witty, warm, playful.\n"
-                    "The user is REACTING to your previous message with this "
-                    "sticker/image/GIF (their caption/context is in the user message).\n"
-                    "Read any text ON the sticker and the emotion, then RESPOND DIRECTLY in 1–3 "
-                    "short WhatsApp lines (often Roman Urdu + light emoji).\n"
-                    "Play along with the sticker meaning, stay tied to what you previously said, "
-                    "and offer one short follow-up if it fits.\n\n"
-                    "CRITICAL RULES:\n"
-                    "- ONLY output the exact text of your reply. Do NOT output 'Options:', bullet points, or multiple choices.\n"
-                    "- Respond EXACTLY as Mojo in a single continuous conversational message.\n"
-                    "- Do NOT write an art essay or name celebrities. Do NOT say the sticker is 'mast/cute'.\n"
-                    "- Do NOT claim you saved notes or ran tools. Do NOT output placeholders like TEXT or /Romanized text."
-                )
-                gemini_response = _vision_call(describe_sys, user_prompt, 280)
-                out = (gemini_response.choices[0].message.content or "").strip()
-                if not out or out in ("👍", "🙏", "😂") or "romanized" in out.lower():
-                    return "Haha theek hai 😄"
-                return out
+                reaction_context = f"[User is reacting to your previous message with a {media_kind}.]"
+            
+            # Use caption_for_intent to avoid double-injecting [Quoted Message] noise
+            base_text = caption_for_intent if caption_for_intent else ""
+            
+            if reaction_context and base_text:
+                user_prompt = f"{base_text}\n\n{reaction_context}"
+            elif reaction_context:
+                user_prompt = reaction_context
+            elif base_text:
+                user_prompt = base_text
+            else:
+                user_prompt = f"What is in this {media_kind}?"
 
-            # Plain describe (not a reaction, not a note)
-            user_prompt = (
-                caption_for_intent
-                if caption_for_intent
-                else "What is in this photo? Describe scene, text, and notable objects."
-            )
             describe_sys = (
-                "You are Mojo. Describe this image/sticker/GIF/video for WhatsApp: "
-                "scene, visible text (brief), objects, and anything relevant to the "
-                "user caption. Keep it short (3–8 lines). "
-                "Do NOT claim you saved/noted anything to OneDrive or a journal."
+                "You are an expert visual analyzer. Describe this media clearly and concisely. "
+                "If it's a sticker or GIF, explain the emotion, meme, text, or vibe it represents. "
+                "Do NOT write a conversational reply. Output ONLY the visual description."
             )
-            gemini_response = _vision_call(describe_sys, user_prompt, 800)
-            return gemini_response.choices[0].message.content
+            
+            try:
+                gemini_response = _vision_call(describe_sys, user_prompt, 800)
+                media_description = (gemini_response.choices[0].message.content or "").strip()
+            except Exception as e:
+                log.error("IMAGE_DESCRIBE_ERROR %s", e)
+                return "🖼️ Media describe fail ho gaya abhi."
+
+            # Build the final context string for Groq
+            context_str = f"[Visual Media Detection]: {media_description}"
+            if reaction_context:
+                context_str = f"{reaction_context}\n\n{context_str}"
+            if base_text:
+                context_str = f'User caption: "{base_text}"\n\n{context_str}'
+                
+            insert_chat_message(chat_id, "visual_media", "user", context_str)
+            
+            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
+                from agent_loop import run_agent
+                is_group = "g.us" in (chat_id or "")
+                return run_agent(
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_num=sender_num,
+                    history_limit=history_limit,
+                    is_group=is_group,
+                    msg_time=msg_time,
+                    extra_user_note=context_str,
+                )
+            
+            # Fallback if ai_chat is disabled
+            return media_description
 
         else:
             return None
