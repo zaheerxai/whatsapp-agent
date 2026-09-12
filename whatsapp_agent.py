@@ -115,12 +115,29 @@ supabase: Client = create_client(supabase_url, supabase_key)
 LOCAL_SESSION_FILE = "whatsapp_session.db"
 SESSION_BUCKET = "wa-sessions"
 SESSION_OBJECT = "whatsapp_session.db"
+# Change-detected uploads: default 30 min (was 5). Override with SESSION_UPLOAD_SEC.
+SESSION_UPLOAD_INTERVAL_SEC = int(os.environ.get("SESSION_UPLOAD_SEC", "1800"))
 
 # Set once at startup. True = local testing (different number) → never upload.
 IS_LOCAL_MODE = False
 
+# Last successful upload fingerprint (size + mtime). Avoids re-uploading unchanged DB.
+_last_session_upload = {"size": None, "mtime": None}
+_session_upload_lock = threading.Lock()
+
+
+def _session_file_stat():
+    """Return (size, mtime) for the local session file, or None if missing."""
+    try:
+        st = os.stat(LOCAL_SESSION_FILE)
+        return (st.st_size, st.st_mtime)
+    except OSError:
+        return None
+
+
 def _download_session_from_bucket():
-    """Download session DB from Supabase Storage if it exists."""
+    """Download session DB from Supabase Storage if it exists.
+    Only called at boot before the client is running — never while connected."""
     try:
         data = supabase.storage.from_(SESSION_BUCKET).download(SESSION_OBJECT)
         with open(LOCAL_SESSION_FILE, "wb") as f:
@@ -131,23 +148,63 @@ def _download_session_from_bucket():
         print(f"[SESSION] No existing session in bucket (or download failed): {e}")
         return False
 
-def _upload_session_to_bucket():
-    """Upload current local session file to Supabase Storage (upsert).
-    NEVER runs in local testing mode."""
+
+def _upload_session_to_bucket(force: bool = False) -> dict:
+    """
+    Upload local session file to Supabase Storage (upsert).
+
+    Change detection: skip when size + mtime match the last successful upload
+    unless force=True (used by /uploadsession and graceful shutdown).
+
+    NEVER runs in local testing mode.
+    Returns a small status dict for callers / admin commands.
+    """
     if IS_LOCAL_MODE:
-        return
+        return {"ok": False, "skipped": True, "reason": "local_mode"}
     if not os.path.exists(LOCAL_SESSION_FILE):
-        return
-    try:
-        with open(LOCAL_SESSION_FILE, "rb") as f:
-            supabase.storage.from_(SESSION_BUCKET).upload(
-                path=SESSION_OBJECT,
-                file=f,
-                file_options={"content-type": "application/octet-stream", "upsert": "true"}
+        return {"ok": False, "skipped": True, "reason": "no_local_file"}
+
+    stat = _session_file_stat()
+    if not stat:
+        return {"ok": False, "skipped": True, "reason": "stat_failed"}
+
+    size, mtime = stat
+    with _session_upload_lock:
+        if (
+            not force
+            and _last_session_upload["size"] == size
+            and _last_session_upload["mtime"] == mtime
+        ):
+            print(f"[SESSION] Unchanged ({size} bytes) — skip upload")
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "unchanged",
+                "bytes": size,
+            }
+
+        try:
+            with open(LOCAL_SESSION_FILE, "rb") as f:
+                supabase.storage.from_(SESSION_BUCKET).upload(
+                    path=SESSION_OBJECT,
+                    file=f,
+                    file_options={
+                        "content-type": "application/octet-stream",
+                        "upsert": "true",
+                    },
+                )
+            _last_session_upload["size"] = size
+            _last_session_upload["mtime"] = mtime
+            print(
+                f"[SESSION] Uploaded session to bucket "
+                f"'{SESSION_BUCKET}/{SESSION_OBJECT}' ({size} bytes"
+                f"{', forced' if force else ''})"
             )
-        print(f"[SESSION] Uploaded session to bucket '{SESSION_BUCKET}/{SESSION_OBJECT}'")
-    except Exception as e:
-        print(f"[SESSION] Upload failed: {e}")
+            return {"ok": True, "skipped": False, "bytes": size, "forced": force}
+        except Exception as e:
+            print(f"[SESSION] Upload failed: {e}")
+            return {"ok": False, "skipped": False, "error": str(e), "bytes": size}
+
 
 def get_session_path():
     """
@@ -166,6 +223,22 @@ def get_session_path():
     print("[SESSION] No local session file → ephemeral/Render mode, checking bucket...")
     _download_session_from_bucket()
     return LOCAL_SESSION_FILE
+
+
+def get_session_upload_status() -> dict:
+    """Status for /sessionstatus admin command."""
+    stat = _session_file_stat()
+    return {
+        "local_mode": IS_LOCAL_MODE,
+        "path": LOCAL_SESSION_FILE,
+        "exists": stat is not None,
+        "bytes": stat[0] if stat else 0,
+        "mtime": stat[1] if stat else None,
+        "last_upload_bytes": _last_session_upload["size"],
+        "last_upload_mtime": _last_session_upload["mtime"],
+        "interval_sec": SESSION_UPLOAD_INTERVAL_SEC,
+        "bucket": f"{SESSION_BUCKET}/{SESSION_OBJECT}",
+    }
 
 def _resolve_git_sha() -> str:
     """Best-effort running commit for /health (deploy verification)."""
@@ -255,19 +328,73 @@ def start_health_server():
     t = threading.Thread(target=run, daemon=True)
     t.start()
 
-def start_session_uploader(interval_seconds=300):
-    """Periodically upload the session file. Skips entirely in local mode."""
+def start_session_uploader(interval_seconds=None):
+    """
+    Periodically upload the session file only when it has changed
+    (size + mtime fingerprint). Skips entirely in local mode.
+
+    Default interval: SESSION_UPLOAD_INTERVAL_SEC (env SESSION_UPLOAD_SEC, default 1800 = 30 min).
+    Also registers SIGTERM/SIGINT handlers so Render deploys get a final forced upload.
+    """
+    if interval_seconds is None:
+        interval_seconds = SESSION_UPLOAD_INTERVAL_SEC
+
     if IS_LOCAL_MODE:
         print("[SESSION] Local mode — session uploader not started")
         return
 
     def loop():
         while True:
-            time.sleep(interval_seconds)
-            _upload_session_to_bucket()
-    t = threading.Thread(target=loop, daemon=True)
+            time.sleep(max(60, int(interval_seconds)))
+            try:
+                _upload_session_to_bucket(force=False)
+            except Exception as e:
+                print(f"[SESSION] uploader loop error: {e}")
+
+    t = threading.Thread(target=loop, name="session-uploader", daemon=True)
     t.start()
-    print(f"[SESSION] Background uploader started (every {interval_seconds}s)")
+    print(
+        f"[SESSION] Background uploader started "
+        f"(every {interval_seconds}s, change-detected only)"
+    )
+    _install_session_shutdown_hooks()
+
+
+def _install_session_shutdown_hooks():
+    """Force-upload session once on SIGTERM/SIGINT (Render sends SIGTERM on deploy)."""
+    import signal
+    import atexit
+
+    _shutting_down = {"done": False}
+
+    def _final_upload(signum=None, frame=None):
+        if _shutting_down["done"]:
+            return
+        _shutting_down["done"] = True
+        try:
+            print("[SESSION] Shutdown hook — forcing session upload…")
+            _upload_session_to_bucket(force=True)
+        except Exception as e:
+            print(f"[SESSION] Shutdown upload failed: {e}")
+
+    # atexit runs on normal exit; signals cover Render deploy / kill
+    atexit.register(_final_upload)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev = signal.getsignal(sig)
+
+            def _handler(s, f, _prev=prev):
+                _final_upload(s, f)
+                # Chain previous handler if it was a callable
+                if callable(_prev) and _prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                    try:
+                        _prev(s, f)
+                    except Exception:
+                        pass
+
+            signal.signal(sig, _handler)
+        except Exception as e:
+            print(f"[SESSION] Could not install handler for {sig}: {e}")
 
 def start_self_ping(interval_seconds=600):
     """Optional self-ping (backup). Only useful on Render when RENDER_EXTERNAL_URL is set."""
@@ -2203,7 +2330,8 @@ agent_loop.init_agent(
 
 # Start health endpoint + session uploader + optional self-ping
 start_health_server()
-start_session_uploader(interval_seconds=300)   # every 5 min is safe
+# Change-detected session backup (default 30 min). Idle → zero session egress.
+start_session_uploader()
 start_self_ping(interval_seconds=600)         # optional, every 10 min
 
 # Full agent log → local file only (daily rotate). OneDrive upload is on-demand via /uploadlog.
@@ -3087,7 +3215,8 @@ if __name__ == "__main__":
     try:
         client.connect()
         refresh_bot_identities(client)
-        # Persist the session as soon as we are connected (covers first QR scan too)
-        _upload_session_to_bucket()
+        # Persist the session as soon as we are connected (covers first QR scan too).
+        # force=True so the fingerprint is seeded even if size/mtime look "new".
+        _upload_session_to_bucket(force=True)
     except Exception as e:
         log.critical(f"CRITICAL ERROR on startup: {e}")

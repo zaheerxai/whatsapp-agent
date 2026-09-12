@@ -621,6 +621,51 @@ def cmd_exportlog(args):
 
 
 @command(
+    "uploadsession",
+    "Usage: /uploadsession — force-upload WhatsApp session DB to Supabase Storage now "
+    "(bypasses change-detection). Use before a manual deploy if you want the latest keys saved.",
+)
+def cmd_uploadsession(args):
+    try:
+        import whatsapp_agent as wa
+        result = wa._upload_session_to_bucket(force=True)
+        if result.get("skipped") and result.get("reason") == "local_mode":
+            return "Local mode — session uploads are disabled."
+        if result.get("skipped") and result.get("reason") == "no_local_file":
+            return "No local session file found."
+        if not result.get("ok"):
+            return f"Upload failed: {result.get('error') or result}"
+        kb = (result.get("bytes") or 0) / 1024
+        return f"✅ Session uploaded to Supabase ({kb:.1f} KB, forced)."
+    except Exception as e:
+        return f"Upload failed: {e}"
+
+
+@command(
+    "sessionstatus",
+    "Usage: /sessionstatus — local session file size, last upload fingerprint, interval.",
+)
+def cmd_sessionstatus(args):
+    try:
+        import whatsapp_agent as wa
+        st = wa.get_session_upload_status()
+        kb = (st.get("bytes") or 0) / 1024
+        last_b = st.get("last_upload_bytes")
+        last_kb = f"{last_b / 1024:.1f} KB" if last_b is not None else "never"
+        lines = [
+            f"Local mode: {st.get('local_mode')}",
+            f"Path: {st.get('path')} ({'exists' if st.get('exists') else 'missing'})",
+            f"Size: {kb:.1f} KB",
+            f"Last uploaded size: {last_kb}",
+            f"Interval: {st.get('interval_sec')}s (change-detected)",
+            f"Bucket: {st.get('bucket')}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"sessionstatus failed: {e}"
+
+
+@command(
     "uploadlog",
     "Usage: /uploadlog [yesterday] — upload current local agent log to OneDrive "
     "(mojo_agent_live.log). Optional 'yesterday' also uploads prior day's rotated file. "
