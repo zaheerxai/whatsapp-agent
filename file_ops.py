@@ -164,9 +164,135 @@ def list_onedrive_folder(remote_folder: Optional[str] = None) -> list[dict]:
     folder = (remote_folder or _folder()).strip("/")
     access = _onedrive_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder}:/children"
-    r = requests.get(url, headers={"Authorization": f"Bearer {access}"}, timeout=30)
-    r.raise_for_status()
-    return r.json().get("value") or []
+    items: list[dict] = []
+    while url:
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {access}"},
+            timeout=60,
+            params={"$top": 200} if ":" in url and "children" in url else None,
+        )
+        r.raise_for_status()
+        body = r.json()
+        items.extend(body.get("value") or [])
+        url = body.get("@odata.nextLink")
+    return items
+
+
+def ensure_onedrive_folder(remote_folder: str) -> dict:
+    """
+    Ensure a folder path exists under drive root (creates intermediate folders).
+    Returns the Graph folder item for the leaf.
+    """
+    remote_folder = (remote_folder or "").strip().strip("/")
+    if not remote_folder:
+        raise ValueError("remote_folder required")
+    access = _onedrive_access_token()
+    headers = {
+        "Authorization": f"Bearer {access}",
+        "Content-Type": "application/json",
+    }
+    parts = [p for p in remote_folder.split("/") if p]
+    parent_path = ""
+    leaf_meta: dict = {}
+    for part in parts:
+        current = f"{parent_path}/{part}" if parent_path else part
+        # Does it exist?
+        probe = requests.get(
+            f"https://graph.microsoft.com/v1.0/me/drive/root:/{current}",
+            headers={"Authorization": f"Bearer {access}"},
+            timeout=30,
+        )
+        if probe.status_code == 200:
+            leaf_meta = probe.json()
+            parent_path = current
+            continue
+        # Create under parent (or root)
+        if parent_path:
+            create_url = (
+                f"https://graph.microsoft.com/v1.0/me/drive/root:/{parent_path}:/children"
+            )
+        else:
+            create_url = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+        body = {
+            "name": part,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }
+        cr = requests.post(create_url, headers=headers, json=body, timeout=30)
+        if cr.status_code in (200, 201):
+            leaf_meta = cr.json()
+        elif cr.status_code == 409:
+            # Race: already exists
+            again = requests.get(
+                f"https://graph.microsoft.com/v1.0/me/drive/root:/{current}",
+                headers={"Authorization": f"Bearer {access}"},
+                timeout=30,
+            )
+            again.raise_for_status()
+            leaf_meta = again.json()
+        else:
+            cr.raise_for_status()
+        parent_path = current
+        print(f"[file_ops] ensured folder → {current}")
+    return leaf_meta
+
+
+def list_onedrive_recursive(
+    remote_folder: str,
+    extensions: Optional[set] = None,
+    max_items: int = 500,
+) -> list[dict]:
+    """
+    Depth-first list of files under remote_folder.
+    Each item: {name, path, size, id, webUrl, lastModifiedDateTime}.
+    """
+    remote_folder = (remote_folder or "").strip().strip("/")
+    access = _onedrive_access_token()
+    out: list[dict] = []
+    stack = [remote_folder]
+
+    while stack and len(out) < max_items:
+        folder = stack.pop()
+        try:
+            children = list_onedrive_folder(folder)
+        except Exception as e:
+            print(f"[file_ops] list failed for {folder}: {e}")
+            continue
+        for item in children:
+            name = item.get("name") or ""
+            is_folder = "folder" in item
+            # Graph path: prefer parentReference.path + name
+            parent_ref = item.get("parentReference") or {}
+            parent_path = parent_ref.get("path") or ""
+            # parent path looks like /drive/root:/Documents/aimojo
+            if ":/" in parent_path:
+                rel_parent = parent_path.split(":/", 1)[-1]
+            else:
+                rel_parent = folder
+            full_path = f"{rel_parent}/{name}".strip("/") if rel_parent else name
+
+            if is_folder:
+                stack.append(full_path)
+                continue
+            if extensions:
+                ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+                if ext not in extensions:
+                    continue
+            out.append(
+                {
+                    "name": name,
+                    "path": full_path,
+                    "remote_path": full_path,
+                    "size": item.get("size"),
+                    "id": item.get("id"),
+                    "webUrl": item.get("webUrl"),
+                    "lastModifiedDateTime": item.get("lastModifiedDateTime"),
+                }
+            )
+            if len(out) >= max_items:
+                break
+    return out
 
 
 # ---------------------------------------------------------------------------

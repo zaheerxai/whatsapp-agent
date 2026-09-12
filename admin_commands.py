@@ -743,6 +743,135 @@ def cmd_uploadimg(args):
         "Optional: /uploadimg my_screenshot"
     )
 
+@command(
+    "ingest",
+    "Usage: /ingest agency | onedrive [subfolder] | file <local-or-onedrive-path> | status\n"
+    "Seeds RAG from business_info.txt, walks Documents/aimojo, or ingests one path.",
+)
+def cmd_ingest(args):
+    """Owner-only RAG ingestion control plane."""
+    try:
+        import knowledge_rag as kr
+    except Exception as e:
+        return f"knowledge_rag import failed: {e}"
+
+    raw = (args or "").strip()
+    parts = raw.split(None, 1)
+    mode = (parts[0] if parts else "status").lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if mode in ("status", "kbstatus", ""):
+        return cmd_kbstatus("")
+
+    if mode == "agency":
+        result = kr.ingest_agency_business_info()
+        return _format_ingest_result("agency", result)
+
+    if mode in ("onedrive", "od", "aimojo", "tree"):
+        sub = rest.strip().strip("/")
+        # Convenience: /ingest onedrive docs → Documents/aimojo/docs
+        result = kr.ingest_onedrive_knowledge_tree(subfolder=sub)
+        lines = [
+            f"OneDrive root: {result.get('root')}/{result.get('subfolder')}",
+            f"Scanned: {result.get('scanned')} | ingested: {result.get('ingested')} | "
+            f"unchanged: {result.get('unchanged')}",
+        ]
+        errs = result.get("errors") or []
+        if errs:
+            lines.append(f"Errors ({len(errs)} shown):")
+            for e in errs[:5]:
+                lines.append(f"  - {e.get('remote') or e.get('path')}: {e.get('error')}")
+        return "\n".join(lines)
+
+    if mode in ("file", "path"):
+        if not rest:
+            return "Usage: /ingest file <Documents/aimojo/...> or local path"
+        path = rest.strip().strip('"').strip("'")
+        # Prefer OneDrive if path looks remote
+        if path.startswith("Documents/") or path.startswith("onedrive:"):
+            path = path.replace("onedrive:", "", 1)
+            result = kr.ingest_onedrive_path(path)
+        elif os.path.isfile(path):
+            result = kr.ingest_local_file(path)
+        else:
+            # Try as OneDrive path under knowledge root
+            result = kr.ingest_onedrive_path(path)
+        return _format_ingest_result(path, result)
+
+    if mode == "ensure":
+        result = kr.ensure_onedrive_knowledge_tree()
+        if result.get("ok"):
+            return (
+                "OneDrive knowledge tree ready:\n"
+                + "\n".join(f"  - {f}" for f in (result.get("folders") or []))
+            )
+        return f"Failed: {result.get('error')}"
+
+    return (
+        "Usage:\n"
+        "  /ingest agency          — seed from business_info.txt (+ mirror to OneDrive)\n"
+        "  /ingest onedrive [sub]  — walk Documents/aimojo[/sub]\n"
+        "  /ingest file <path>     — one local or OneDrive path\n"
+        "  /ingest ensure          — create Documents/aimojo/{agency,docs,chats}\n"
+        "  /ingest status          — same as /kbstatus"
+    )
+
+
+def _format_ingest_result(label: str, result: dict) -> str:
+    status = result.get("status")
+    if status == "ok":
+        lines = [
+            f"✅ Ingested {label}",
+            f"document_id: {result.get('document_id')}",
+            f"chunks: {result.get('chunks')} | version: {result.get('source_version')}",
+        ]
+        if result.get("onedrive_mirror"):
+            lines.append(f"OneDrive mirror: {result['onedrive_mirror']}")
+        if result.get("onedrive_mirror_error"):
+            lines.append(f"(mirror warn: {result['onedrive_mirror_error']})")
+        return "\n".join(lines)
+    if status == "unchanged":
+        return f"Unchanged (same content hash): {label} → {result.get('document_id')}"
+    if status == "skipped":
+        return f"Skipped {label}: {result.get('reason')}"
+    return f"Failed {label}: {result.get('error') or result}"
+
+
+@command(
+    "kbstatus",
+    "Usage: /kbstatus — RAG schema readiness, document/chunk counts, embedding model, OneDrive root.",
+)
+def cmd_kbstatus(args):
+    try:
+        import knowledge_rag as kr
+
+        st = kr.kb_status()
+        lines = [
+            f"Schema ready: {st.get('schema_ready')}",
+            f"Embedding: {st.get('embedding_provider')} / {st.get('embedding_model')} "
+            f"(dim={st.get('embedding_dim')})",
+            f"OneDrive configured: {st.get('onedrive_configured')}",
+            f"Knowledge root: {st.get('onedrive_root')}",
+        ]
+        if st.get("schema_ready"):
+            lines.append(f"Documents: {st.get('documents')} | Chunks: {st.get('chunks')}")
+            by = st.get("by_source_type") or {}
+            if by:
+                lines.append(
+                    "By source_type: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(by.items()))
+                )
+        else:
+            lines.append(
+                "→ Run sql/rag_schema.sql in Supabase SQL editor, then /ingest agency"
+            )
+        if st.get("count_error"):
+            lines.append(f"Count error: {st['count_error']}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"kbstatus failed: {e}"
+
+
 @command("help", "Lists all available commands.")
 def cmd_help(args):
     lines = ["Available admin commands:"]

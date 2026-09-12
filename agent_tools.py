@@ -116,10 +116,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "search_knowledge",
             "description": (
-                "Search Mojo AI Agency knowledge base + permanent chat notes. "
+                "Search Mojo AI Agency knowledge base (hybrid RAG over agency docs + "
+                "OneDrive Documents/aimojo) and permanent chat notes. "
                 "Use for questions about services, portfolio, founder, pricing process, "
-                "or any standing rules/facts saved for this chat. Always call this before "
-                "answering business or 'what can you do' questions."
+                "uploaded docs/exports, or standing rules/facts for this chat. "
+                "Always call this before answering business or 'what can you do' questions."
             ),
             "parameters": {
                 "type": "object",
@@ -369,11 +370,18 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "file_list_onedrive",
-            "description": "List recent files uploaded by the agent to OneDrive (if configured).",
+            "description": (
+                "List files in the OneDrive knowledge base (Documents/aimojo by default). "
+                "Optional folder: agency | docs | chats or a full path under the knowledge root."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "default": 10},
+                    "folder": {
+                        "type": "string",
+                        "description": "Subfolder under Documents/aimojo (agency, docs, chats) or full path",
+                    },
+                    "limit": {"type": "integer", "default": 50},
                 },
                 "required": [],
             },
@@ -535,17 +543,46 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 def _tool_search_knowledge(args: dict, ctx: dict) -> str:
-    query = (args.get("query") or "").strip().lower()
+    query = (args.get("query") or "").strip()
     top_k = min(int(args.get("top_k") or 5), 10)
     if not query:
         return "Empty query."
 
-    chunks: List[str] = []
+    chat_id = (ctx or {}).get("chat_id")
+    notes: List[str] = []
+    try:
+        notes = _get_group_memory(chat_id) or [] if chat_id else []
+    except Exception as e:
+        notes = []
+        print(f"[search_knowledge] group_memory error: {e}")
 
-    # 1. Business knowledge – simple paragraph split + keyword score
+    # Prefer hybrid RAG when schema + embeddings are available
+    try:
+        import knowledge_rag as kr
+
+        if kr.schema_ready():
+            result = kr.search(
+                query,
+                top_k=top_k,
+                chat_id=chat_id,
+                include_chat_notes=True,
+                group_notes=notes,
+            )
+            # If RAG returned real hits (not the init / empty messages), use them
+            if result and not result.startswith("RAG knowledge base not initialised"):
+                if not result.startswith("No relevant knowledge found"):
+                    return result
+                # Fall through to keyword FAQ if RAG miss — still useful for
+                # un-ingested business_info.txt during first deploy.
+    except Exception as e:
+        print(f"[search_knowledge] RAG path failed: {e}")
+
+    # Keyword fallback (original behaviour) — agency FAQ + chat notes
+    q_low = query.lower()
+    chunks: List[str] = []
     paras = [p.strip() for p in re.split(r"\n\s*\n", _BUSINESS_KNOWLEDGE) if p.strip()]
     scored = []
-    tokens = set(re.findall(r"\w+", query))
+    tokens = set(re.findall(r"\w+", q_low))
     for p in paras:
         p_low = p.lower()
         score = sum(1 for t in tokens if t in p_low)
@@ -555,16 +592,11 @@ def _tool_search_knowledge(args: dict, ctx: dict) -> str:
     for _, p in scored[:top_k]:
         chunks.append(f"[Agency] {p}")
 
-    # 2. Group memory notes
-    try:
-        notes = _get_group_memory(ctx["chat_id"]) or []
-        for note in notes:
-            if any(t in note.lower() for t in tokens) or not tokens:
-                chunks.append(f"[Chat note] {note}")
-                if len(chunks) >= top_k + 3:
-                    break
-    except Exception as e:
-        chunks.append(f"(memory lookup error: {e})")
+    for note in notes:
+        if any(t in note.lower() for t in tokens) or not tokens:
+            chunks.append(f"[Chat note] {note}")
+            if len(chunks) >= top_k + 3:
+                break
 
     if not chunks:
         return "No relevant knowledge found. Answer from general knowledge or use web_search."
@@ -1242,11 +1274,38 @@ def _tool_send_message_to(args: dict, ctx: dict) -> str:
 def _tool_file_list_onedrive(args: dict, ctx: dict) -> str:
     if not _file_ops or not getattr(_file_ops, "onedrive_configured", lambda: False)():
         return "OneDrive is not configured."
-    # Minimal stub — full listing would need Graph list API; keep honest
-    return (
-        "OneDrive is configured. Use admin /uploadimg or the export log commands "
-        "for file operations. Full directory listing is not exposed via tools yet."
-    )
+    folder = (args.get("folder") or args.get("path") or "").strip().strip("/")
+    try:
+        import knowledge_rag as kr
+
+        root = kr.knowledge_root()
+        if folder:
+            target = folder if folder.startswith(root) else f"{root}/{folder}".rstrip("/")
+        else:
+            target = root
+        files = _file_ops.list_onedrive_recursive(target, max_items=80)
+        if not files:
+            children = _file_ops.list_onedrive_folder(target)
+            if not children:
+                return (
+                    f"OneDrive folder empty or missing: {target}\n"
+                    "Owner can run /ingest ensure then drop files under "
+                    f"{root}/agency or {root}/docs."
+                )
+            lines = [f"Folder: {target} ({len(children)} items)"]
+            for it in children[:40]:
+                kind = "dir" if "folder" in it else "file"
+                lines.append(f"- [{kind}] {it.get('name')}")
+            return "\n".join(lines)
+        lines = [f"Knowledge files under {target} ({len(files)}):"]
+        for f in files[:50]:
+            size = f.get("size") or 0
+            lines.append(f"- {f.get('path')} ({size} B)")
+        if len(files) > 50:
+            lines.append(f"… +{len(files) - 50} more")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"OneDrive list failed: {e}"
 
 
 def _tool_python_exec(args: dict, ctx: dict) -> str:

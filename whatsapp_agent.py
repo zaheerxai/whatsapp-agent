@@ -2313,6 +2313,22 @@ agent_tools.init_tools(
     generate_reminder_confirmation=generate_reminder_confirmation,
 )
 
+# RAG knowledge base (pgvector + OneDrive Documents/aimojo)
+try:
+    import knowledge_rag
+
+    knowledge_rag.init(
+        supabase,
+        file_ops_module=file_ops,
+        extract_document_text_fn=extract_document_text,
+    )
+    print(
+        f"[RAG] knowledge_rag ready schema={knowledge_rag.schema_ready()} "
+        f"root={knowledge_rag.knowledge_root()}"
+    )
+except Exception as _rag_err:
+    print(f"[RAG] knowledge_rag init skipped: {_rag_err}")
+
 agent_loop.init_agent(
     client_ai=client_ai,
     client_gemini=client_gemini,
