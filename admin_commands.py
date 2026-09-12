@@ -619,6 +619,77 @@ def cmd_exportlog(args):
     import whatsapp_agent as wa
     return wa.export_chat_log_to_onedrive(n)
 
+
+@command(
+    "uploadlog",
+    "Usage: /uploadlog [yesterday] — upload current local agent log to OneDrive "
+    "(mojo_agent_live.log). Optional 'yesterday' also uploads prior day's rotated file. "
+    "No auto-sync; run this when you want the file on OneDrive.",
+)
+def cmd_uploadlog(args):
+    """Owner-only (admin command path). Pushes local log on demand — stops bandwidth burn."""
+    include_yesterday = bool(args and "yesterday" in args.strip().lower())
+    try:
+        import mojo_logging
+        import file_ops
+
+        if not file_ops.onedrive_configured():
+            return "OneDrive not configured (missing ONEDRIVE_CLIENT_ID / ONEDRIVE_REFRESH_TOKEN)."
+
+        result = mojo_logging.upload_current_log(
+            file_ops,
+            include_yesterday=include_yesterday,
+        )
+        kb = (result.get("bytes") or 0) / 1024
+        lines = [
+            f"✅ Log uploaded → OneDrive/{result['remote_folder']}/{result['remote_name']}",
+            f"Size: {kb:.1f} KB | day: {result.get('day')}",
+        ]
+        if result.get("webUrl"):
+            lines.append(f"Link: {result['webUrl']}")
+        if result.get("yesterday"):
+            y = result["yesterday"]
+            lines.append(
+                f"Also uploaded yesterday: {y.get('remote_name')} "
+                f"({(y.get('bytes') or 0) / 1024:.1f} KB)"
+            )
+        if result.get("yesterday_error"):
+            lines.append(f"(yesterday skip: {result['yesterday_error']})")
+        return "\n".join(lines)
+    except FileNotFoundError as e:
+        return f"No local log file yet: {e}"
+    except Exception as e:
+        return f"Upload failed: {e}"
+
+
+@command(
+    "logstatus",
+    "Usage: /logstatus — show local agent log size, current day, and any rotated files.",
+)
+def cmd_logstatus(args):
+    try:
+        import mojo_logging
+
+        st = mojo_logging.get_log_status()
+        kb = (st.get("bytes") or 0) / 1024
+        lines = [
+            f"Local log: {st.get('path')}",
+            f"Size: {kb:.1f} KB | day (UTC): {st.get('day')}",
+            f"Remote name on /uploadlog: {st.get('remote_name')}",
+            "Auto OneDrive sync: OFF (on-demand only)",
+        ]
+        dated = st.get("dated") or []
+        if dated:
+            lines.append("Rotated (local):")
+            for d in dated:
+                lines.append(f"  - {d['name']}: {d['bytes'] / 1024:.1f} KB")
+        else:
+            lines.append("No rotated day files yet.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"logstatus failed: {e}"
+
+
 @command("uploadimg", "Usage: send or reply to an image with /uploadimg [optional_name] — uploads to OneDrive")
 def cmd_uploadimg(args):
     # Real work is done in process_message (needs media). This is only for /help + text-only misuse.

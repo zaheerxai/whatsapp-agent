@@ -2206,10 +2206,11 @@ start_health_server()
 start_session_uploader(interval_seconds=300)   # every 5 min is safe
 start_self_ping(interval_seconds=600)         # optional, every 10 min
 
-# Full agent log → local file + periodic overwrite to OneDrive/MojoAgent/mojo_agent_live.log
+# Full agent log → local file only (daily rotate). OneDrive upload is on-demand via /uploadlog.
 import mojo_logging
 mojo_logging.setup_logging()
-mojo_logging.start_onedrive_log_sync(file_ops, interval_sec=90)
+# Continuous OneDrive log sync removed (was burning Service-Initiated bandwidth).
+# Use admin command /uploadlog when you want the current local log on OneDrive.
 
 
 def send_reaction(message, chat_id, emoji):
