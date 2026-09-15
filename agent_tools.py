@@ -1433,8 +1433,8 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 
 
 def _cache_key(url: str, language: str, timestamps: bool) -> str:
-    # v2: bust entries that cached YouTube description as "transcript"
-    return f"v2|{url.strip().lower()}|{language or 'auto'}|{int(bool(timestamps))}"
+    # v3: bust entries that cached refine-hallucinated YouTube description
+    return f"v3|{url.strip().lower()}|{language or 'auto'}|{int(bool(timestamps))}"
 
 
 def _cache_get(key: str) -> Optional[str]:
@@ -1723,9 +1723,9 @@ def _clean_raw_transcript(text: str) -> str:
 
 def _looks_like_youtube_description(text: str) -> bool:
     """
-    True when a 'transcript' is actually the YouTube description / promo blurb.
+    True when text is YouTube description / promo, or a refine hallucination of it.
     """
-    if not text or len(text.strip()) < 80:
+    if not text or len(text.strip()) < 40:
         return False
     body = text.strip()
     if body.lower().startswith("source:"):
@@ -1734,16 +1734,32 @@ def _looks_like_youtube_description(text: str) -> bool:
         body = body.split("\n", 1)[-1].strip()
     low = body.lower()
 
-    # Common description header triggers
-    if low.startswith("about this video") or low.startswith("in this video") or low.startswith("description:"):
+    # Any one hard marker = description (Codanics promo specifically)
+    hard = (
+        "codanics.com",
+        "codanics",
+        "registration form",
+        "whatsapp.com/channel",
+        "python's chilla",
+        "python ka chilla",
+        "looking forward to seeing you in the course",
+        "thank you for your interest in the course",
+        "assalamu alaikum future founders",
+        "build ai agents — from zero to hero",
+        "earn millions 💰",
+    )
+    if any(h in low for h in hard):
+        return True
+
+    if low.startswith("about this video") or low.startswith("description:"):
         return True
 
     promo_hits = 0
     markers = (
         "subscribe", "like and", "click the link", "registration form",
-        "whatsapp.com", "codanics", "follow us", "stay updated",
-        "don't forget to", "playlist?list=", "course", "mentorship",
-        "social media", "instagram", "facebook", "twitter"
+        "whatsapp.com", "follow us", "stay updated",
+        "don't forget to", "playlist?list=", "mentorship",
+        "best regards", "welcome back to day", "earn millions",
     )
     for m in markers:
         if m in low:
@@ -1765,8 +1781,84 @@ def _looks_like_youtube_description(text: str) -> bool:
         return True
     if link_count >= 2 and not has_speech_cues:
         return True
-
     return False
+
+
+def _render_speech_transcript(
+    raw: str,
+    out_lang: str = "auto",
+    hard_cap: int = 7000,
+) -> str:
+    """
+    mode=transcript from real speech — NO free-form rewrite.
+
+    Free-form refine was replacing Supadata's 20k Hindi speech with the
+    YouTube description (2591 chars). Only clean / transliterate / translate.
+    """
+    cleaned = _clean_raw_transcript(raw or "")
+    if not cleaned or _looks_like_youtube_description(cleaned):
+        return ""
+
+    chunks: List[str] = []
+    step = 4500
+    for i in range(0, len(cleaned), step):
+        chunks.append(cleaned[i : i + step])
+    if len(chunks) > 3:
+        chunks = chunks[:2] + [chunks[-1]]
+
+    if _client_ai is None or not _MODEL_NAME:
+        return cleaned[:hard_cap]
+
+    want_en = out_lang in ("en", "english")
+    if want_en:
+        sys = (
+            "You are a literal translator. Translate the SPOKEN transcript into "
+            "clear English. Keep meaning and order. Do NOT summarize. "
+            "Do NOT add course ads, subscribe CTAs, links, or 'Best regards'. "
+            "Output ONLY the translation of the speech below."
+        )
+    else:
+        sys = (
+            "Transliterate / keep the SPOKEN transcript in Roman Urdu (Latin letters). "
+            "If already Latin, clean lightly. Do NOT summarize. "
+            "Do NOT add course ads, subscribe CTAs, links, or 'Best regards'. "
+            "Output ONLY the speech text."
+        )
+
+    parts: List[str] = []
+    for idx, ch in enumerate(chunks):
+        try:
+            resp = _client_ai.chat.completions.create(
+                model=_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": sys},
+                    {
+                        "role": "user",
+                        "content": f"Speech part {idx + 1}/{len(chunks)}:\n\n{ch}",
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=1800,
+            )
+            piece = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"[transcribe_video] speech render chunk {idx} failed: {e}")
+            piece = ch
+        if piece and not _looks_like_youtube_description(piece):
+            parts.append(piece)
+        elif not _looks_like_youtube_description(ch):
+            parts.append(ch)
+
+    out = "\n\n".join(parts).strip()
+    if not out or _looks_like_youtube_description(out):
+        out = cleaned
+    if len(out) > hard_cap:
+        out = (
+            out[:hard_cap].rstrip()
+            + "\n\n(transcript long hai — specific hissa chahiye to batao)"
+        )
+    return out
+
 
 def _accept_transcript_candidate(text: Optional[str], source: str) -> Optional[str]:
     """Reject description-like blobs so cascade continues to real captions/ASR."""
@@ -3055,8 +3147,9 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
 
     def _pack(source: str, body: str) -> str:
         """
-        Clean + one refine pass → compact WhatsApp-ready text for the requested mode.
-        Agent presents this almost as-is.
+        Pack speech into user-facing text for the requested mode.
+        mode=transcript uses speech-preserving render (same raw as summary).
+        mode=summary/key_points still uses compact refine.
         """
         title = ""
         raw_body = body or ""
@@ -3064,8 +3157,6 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             first, _, rest = raw_body.partition("\n")
             title = first.replace("Title:", "", 1).strip()
             raw_body = rest.lstrip("\n")
-        # Do not feed marketing titles into refine — models may regurgitate
-        # the YouTube description instead of the spoken transcript.
         if title and _looks_like_youtube_description(f"Title: {title}\n{title}"):
             title = ""
         if _looks_like_youtube_description(raw_body):
@@ -3078,56 +3169,37 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         out_lang = "auto"
         if language in ("en", "english"):
             out_lang = "en"
-        refined = _refine_transcript_compact(
-            raw_body,
-            title=title,
-            mode=mode,
-            target_words=target_words,
-            output_lang=out_lang,
-        )
-        # If refine collapsed into promo/description but raw is real speech,
-        # keep speech (light-clean) rather than serving the description.
-        if _looks_like_youtube_description(refined) or _looks_like_youtube_description(
-            f"Title: {title}\n{refined}" if title else refined
-        ):
-            print(
-                f"[transcribe_video] refine produced description-like text "
-                f"source={source} — retrying strict speech-only refine"
+
+        if mode == "transcript":
+            # CRITICAL: do not free-form refine — that was turning Supadata's
+            # 20k Hindi speech into the YouTube description (2591 chars).
+            refined = _render_speech_transcript(raw_body, out_lang=out_lang)
+            if not refined or _looks_like_youtube_description(refined):
+                raise RuntimeError(
+                    f"speech_render_failed source={source} chars={len(raw_body)}"
+                )
+            msg = (
+                f"[transcribe_video] speech_render source={source} "
+                f"raw={len(raw_body)} out={len(refined)}"
             )
-            refined2 = _refine_transcript_compact(
+            print(msg)
+            try:
+                logging.getLogger("mojo").info(msg)
+            except Exception:
+                pass
+        else:
+            refined = _refine_transcript_compact(
                 raw_body,
-                title="",
+                title=title,
                 mode=mode,
                 target_words=target_words,
                 output_lang=out_lang,
             )
-            if _looks_like_youtube_description(refined2):
-                # Last resort: return cleaned raw (still better than promo)
-                cleaned = _clean_raw_transcript(raw_body)
-                if out_lang == "en" and _has_arabic_or_devanagari(cleaned):
-                    # one more forced translate without title context
-                    refined2 = _refine_transcript_compact(
-                        cleaned[:12000],
-                        title="",
-                        mode="transcript",
-                        target_words=None,
-                        output_lang="en",
-                    )
-                    if _looks_like_youtube_description(refined2):
-                        raise RuntimeError(
-                            f"refine_still_description source={source} "
-                            f"chars={len(refined2)}"
-                        )
-                    refined = refined2
-                else:
-                    if _looks_like_youtube_description(cleaned):
-                        raise RuntimeError(
-                            f"refine_still_description source={source} "
-                            f"chars={len(refined)}"
-                        )
-                    refined = cleaned[:5500]
-            else:
-                refined = refined2
+            if _looks_like_youtube_description(refined):
+                raise RuntimeError(
+                    f"refine_still_description source={source} chars={len(refined)}"
+                )
+
         meta = f"Source: {source} | mode={mode}"
         if target_words:
             meta += f" | target_words={target_words}"
