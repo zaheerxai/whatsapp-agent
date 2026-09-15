@@ -1737,6 +1737,9 @@ def _looks_like_youtube_description(text: str) -> bool:
     if not text or len(text.strip()) < 80:
         return False
     body = text.strip()
+    # Strip meta headers we may have prefixed
+    if body.lower().startswith("source:"):
+        body = body.split("\n", 1)[-1].strip()
     if body.startswith("Title:"):
         body = body.split("\n", 1)[-1].strip()
     low = body.lower()
@@ -1749,6 +1752,7 @@ def _looks_like_youtube_description(text: str) -> bool:
         "registration form",
         "whatsapp.com/channel",
         "codanics.com",
+        "codanics",
         "follow us",
         "stay updated",
         "don't forget to",
@@ -1764,26 +1768,31 @@ def _looks_like_youtube_description(text: str) -> bool:
         "what we covered in day",
         "complete free ai",
         "mentorship program",
+        "build ai agents",
+        "python's chilla",
+        "python ka chilla",
+        "earn millions",
     )
     for m in markers:
         if m in low:
             promo_hits += 1
 
     # Many outbound links + few dialogue cues → description
-    link_count = len(re.findall(r"https?://", body))
+    link_count = len(re.findall(r"https?://|www\.\w+", body))
     has_speech_cues = bool(
         re.search(
             r"\b(i mean|so basically|let us|let's|today we will|ab hum|"
-            r"dekhte hain|samjhte hain|example|for example)\b",
+            r"dekhte hain|samjhte hain|example|for example|"
+            r"pehla idea|doosra|number one|number two)\b",
             low,
         )
     ) or _has_arabic_or_devanagari(body)
 
-    if promo_hits >= 3:
+    if promo_hits >= 2:
         return True
-    if promo_hits >= 2 and link_count >= 2 and not has_speech_cues:
+    if promo_hits >= 1 and link_count >= 2 and not has_speech_cues:
         return True
-    if link_count >= 4 and not has_speech_cues and len(body) < 4000:
+    if link_count >= 3 and not has_speech_cues:
         return True
     return False
 
@@ -2586,6 +2595,127 @@ def _about_fallback_pack(url: str, mode: str) -> Optional[str]:
     return None
 
 
+def _try_ytdlp_subs(url: str, with_timestamps: bool) -> Optional[str]:
+    """
+    Fetch auto/manual subtitles via yt-dlp without downloading audio.
+    Prefer hi/ur tracks for South-Asian lectures; works when timedtext APIs
+    are blocked but yt-dlp player_client cascade still gets tracks.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
+
+    # Strip tracking
+    clean = url
+    if "youtu" in url.lower() and "?" in url:
+        base, _, qs = url.partition("?")
+        if "v=" in qs:
+            for part in qs.split("&"):
+                if part.startswith("v="):
+                    clean = f"{base}?{part}"
+                    break
+        else:
+            clean = base
+
+    clients_try = (
+        ["tv", "android", "ios", "web"],
+        ["android", "ios"],
+        ["tv"],
+    )
+    cookies = (os.getenv("YTDLP_COOKIES") or "").strip()
+
+    for clients in clients_try:
+        opts: Dict[str, Any] = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["hi.*", "ur.*", "en.*", "hi", "ur", "en"],
+            "subtitlesformat": "vtt/srv3/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "noplaylist": True,
+            "socket_timeout": 25,
+            "retries": 2,
+            "extractor_args": {"youtube": {"player_client": clients}},
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+            },
+        }
+        if cookies and os.path.isfile(cookies):
+            opts["cookiefile"] = cookies
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(clean, download=False)
+            if not info:
+                continue
+            # Prefer requested lang tracks from subtitles / automatic_captions
+            subs = info.get("subtitles") or {}
+            autos = info.get("automatic_captions") or {}
+            # Merge: prefer manual over auto for same lang
+            ordered_langs = []
+            for key in ("hi", "ur", "en", "en-US", "en-GB"):
+                for bag in (subs, autos):
+                    for lang in bag:
+                        if lang.lower().startswith(key.lower()) and lang not in ordered_langs:
+                            ordered_langs.append(lang)
+            for lang in list(subs.keys()) + list(autos.keys()):
+                if lang not in ordered_langs:
+                    ordered_langs.append(lang)
+
+            for lang in ordered_langs:
+                entries = (subs.get(lang) or autos.get(lang) or [])
+                if not entries:
+                    continue
+                # Prefer vtt / srv3
+                entries = sorted(
+                    entries,
+                    key=lambda e: (
+                        0 if (e.get("ext") or "") in ("vtt", "srv3", "ttml") else 1
+                    ),
+                )
+                sub_url = entries[0].get("url")
+                if not sub_url:
+                    continue
+                r = requests.get(
+                    sub_url,
+                    headers={"User-Agent": opts["http_headers"]["User-Agent"]},
+                    timeout=30,
+                )
+                if r.status_code != 200 or not (r.text or "").strip():
+                    continue
+                segs = _parse_ttml_or_vtt(r.text)
+                if not segs or len(segs) < 5:
+                    # raw text fallback
+                    text = re.sub(r"<[^>]+>", " ", r.text)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    if len(text) < 80:
+                        continue
+                    if _looks_like_youtube_description(text):
+                        continue
+                    print(
+                        f"[transcribe_video] yt-dlp subs OK lang={lang} "
+                        f"raw_chars={len(text)} clients={clients}"
+                    )
+                    return text
+                text = _format_segments(segs, with_timestamps)
+                if text and not _looks_like_youtube_description(text):
+                    print(
+                        f"[transcribe_video] yt-dlp subs OK lang={lang} "
+                        f"segs={len(segs)} clients={clients}"
+                    )
+                    return text
+        except Exception as e:
+            print(f"[transcribe_video] yt-dlp subs clients={clients} err={e}")
+            continue
+    return None
+
+
 def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
     """
     Download best audio, convert to mono 48k mp3.
@@ -2976,8 +3106,8 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 return None
             raise
 
-    # YouTube: prefer real caption tracks BEFORE youtube2text (which often
-    # returns the video description when tracks are missing for a given lang).
+    # YouTube: real caption tracks first. youtube2text is last — it often returns
+    # the video *description* when speech tracks are missing for a language.
     if yt_id:
         packed = _take(
             f"Piped captions (video {yt_id})",
@@ -2991,19 +3121,38 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         )
         if packed:
             return packed
+        # yt-dlp subtitle URL fetch (no audio) — better on cloud than Innertube
+        packed = _take(
+            "yt-dlp subtitles",
+            _try_ytdlp_subs(url, with_ts),
+        )
+        if packed:
+            return packed
 
     # Managed API (SUPADATA) — strong for YT + best for IG/FB/TikTok
     packed = _take("Supadata", _try_supadata(url, fetch_lang, with_ts))
     if packed:
         return packed
 
-    # youtube2text last among caption APIs (description pollution risk)
-    if yt_id or "youtu" in url.lower():
+    # youtube2text: only for summary/key_points, NEVER for full transcript mode
+    # (too often returns description which users mistake for speech).
+    if mode in ("summary", "key_points") and (yt_id or "youtu" in url.lower()):
         packed = _take(
             "youtube2text.org", _try_youtube2text(url, fetch_lang, with_ts)
         )
         if packed:
             return packed
+    elif mode == "transcript" and (yt_id or "youtu" in url.lower()):
+        print(
+            "[transcribe_video] skip youtube2text for mode=transcript "
+            "(description pollution risk) — going to ASR"
+        )
+        try:
+            logging.getLogger("mojo").info(
+                "skip youtube2text for mode=transcript — ASR next"
+            )
+        except Exception:
+            pass
 
     # --- 4. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
     asr_error_msg: Optional[str] = None
