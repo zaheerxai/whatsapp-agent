@@ -1628,77 +1628,68 @@ def _try_youtube2text(
 ) -> Optional[str]:
     """
     Fully free, cloud-working YouTube transcripts via youtube2text.org.
-    Verified on datacenter IPs for videos that Piped/yt-dlp/Innertube block.
     """
     key = _youtube2text_api_key()
     if not key:
         return None
 
-    # 1h+ videos need a high ceiling; 12k was truncating mid-sentence
-    params: Dict[str, Any] = {"url": url, "maxChars": "100000"}
     lang = (language or "auto").strip().lower()
-    if lang and lang not in ("auto", ""):
-        params["lang"] = lang
+    # Explicitly attempt Hindi/Urdu caption tracks if language is set to auto
+    langs_to_try = [lang] if lang not in ("auto", "") else ["hi", "ur", "en", "auto"]
 
     headers = {
         "x-api-key": key,
         "User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)",
         "Accept": "application/json",
     }
-    try:
-        r = requests.get(
-            "https://youtube2text.org/api/transcribe",
-            params=params,
-            headers=headers,
-            timeout=90,
-        )
-        if r.status_code == 401:
-            global _Y2T_KEY, _Y2T_KEY_TS
-            _Y2T_KEY, _Y2T_KEY_TS = None, 0.0
-            key2 = _youtube2text_api_key()
-            if not key2 or key2 == key:
-                print("[transcribe_video] youtube2text 401 unauthorized")
-                return None
-            headers["x-api-key"] = key2
+
+    for target_lang in langs_to_try:
+        params: Dict[str, Any] = {"url": url, "maxChars": "100000"}
+        if target_lang != "auto":
+            params["lang"] = target_lang
+
+        try:
             r = requests.get(
                 "https://youtube2text.org/api/transcribe",
                 params=params,
                 headers=headers,
-                timeout=60,
+                timeout=90,
             )
-        if r.status_code != 200:
-            print(
-                f"[transcribe_video] youtube2text HTTP {r.status_code}: {r.text[:160]}"
+            if r.status_code != 200:
+                continue
+
+            data = r.json() or {}
+            result = data.get("result") if isinstance(data.get("result"), dict) else data
+            content = (
+                (result or {}).get("content")
+                or (result or {}).get("transcript")
+                or (result or {}).get("text")
+                or data.get("content")
             )
-            return None
 
-        data = r.json() or {}
-        result = data.get("result") if isinstance(data.get("result"), dict) else data
-        content = (
-            (result or {}).get("content")
-            or (result or {}).get("transcript")
-            or (result or {}).get("text")
-            or data.get("content")
-        )
-        if not content or not str(content).strip():
-            print("[transcribe_video] youtube2text empty content")
-            return None
+            if not content or not str(content).strip():
+                continue
 
-        text = str(content).strip()
-        if text.startswith("[] "):
-            text = text[3:].strip()
-        text = _clean_raw_transcript(text)
-        title = (result or {}).get("title") or ""
-        print(
-            f"[transcribe_video] youtube2text OK chars={len(text)} "
-            f"title={(title or '')[:40]!r}"
-        )
-        if title:
-            return f"Title: {title}\n\n{text}"
-        return text
-    except Exception as e:
-        print(f"[transcribe_video] youtube2text error: {e}")
-        return None
+            text = str(content).strip()
+            if text.startswith("[] "):
+                text = text[3:].strip()
+
+            text = _clean_raw_transcript(text)
+
+            # Reject candidate if it is just video metadata/description
+            if _looks_like_youtube_description(text):
+                print(f"[transcribe_video] youtube2text returned description for lang={target_lang}, trying next")
+                continue
+
+            title = (result or {}).get("title") or ""
+            print(f"[transcribe_video] youtube2text OK (lang={target_lang}) chars={len(text)}")
+            return f"Title: {title}\n\n{text}" if title else text
+
+        except Exception as e:
+            print(f"[transcribe_video] youtube2text error for lang={target_lang}: {e}")
+            continue
+
+    return None
 
 
 def _clean_raw_transcript(text: str) -> str:
@@ -1728,74 +1719,50 @@ def _clean_raw_transcript(text: str) -> str:
 
 def _looks_like_youtube_description(text: str) -> bool:
     """
-    True when a 'transcript' is actually the YouTube description / promo blurb
-    (CTAs, subscribe lines, course links) rather than spoken captions.
-
-    youtube2text and some caption APIs occasionally return description when the
-    requested lang has no track (e.g. language=en on a Hindi-auto-caption video).
+    True when a 'transcript' is actually the YouTube description / promo blurb.
     """
     if not text or len(text.strip()) < 80:
         return False
     body = text.strip()
-    # Strip meta headers we may have prefixed
     if body.lower().startswith("source:"):
         body = body.split("\n", 1)[-1].strip()
     if body.startswith("Title:"):
         body = body.split("\n", 1)[-1].strip()
     low = body.lower()
 
+    # Common description header triggers
+    if low.startswith("about this video") or low.startswith("in this video") or low.startswith("description:"):
+        return True
+
     promo_hits = 0
     markers = (
-        "subscribe",
-        "like and",
-        "click the link",
-        "registration form",
-        "whatsapp.com/channel",
-        "codanics.com",
-        "codanics",
-        "follow us",
-        "stay updated",
-        "don't forget to",
-        "do not forget to",
-        "playlist?list=",
-        "assalamu alaikum future",
-        "welcome back to day",
-        "thank you for your interest in the course",
-        "looking forward to seeing you in the course",
-        "best regards",
-        "🔥",
-        "👉",
-        "what we covered in day",
-        "complete free ai",
-        "mentorship program",
-        "build ai agents",
-        "python's chilla",
-        "python ka chilla",
-        "earn millions",
+        "subscribe", "like and", "click the link", "registration form",
+        "whatsapp.com", "codanics", "follow us", "stay updated",
+        "don't forget to", "playlist?list=", "course", "mentorship",
+        "social media", "instagram", "facebook", "twitter"
     )
     for m in markers:
         if m in low:
             promo_hits += 1
 
-    # Many outbound links + few dialogue cues → description
     link_count = len(re.findall(r"https?://|www\.\w+", body))
     has_speech_cues = bool(
         re.search(
             r"\b(i mean|so basically|let us|let's|today we will|ab hum|"
             r"dekhte hain|samjhte hain|example|for example|"
-            r"pehla idea|doosra|number one|number two)\b",
+            r"pehla idea|doosra|number one|number two|aapka|kisi|karein)\b",
             low,
         )
     ) or _has_arabic_or_devanagari(body)
 
     if promo_hits >= 2:
         return True
-    if promo_hits >= 1 and link_count >= 2 and not has_speech_cues:
+    if promo_hits >= 1 and link_count >= 1 and not has_speech_cues:
         return True
-    if link_count >= 3 and not has_speech_cues:
+    if link_count >= 2 and not has_speech_cues:
         return True
-    return False
 
+    return False
 
 def _accept_transcript_candidate(text: Optional[str], source: str) -> Optional[str]:
     """Reject description-like blobs so cascade continues to real captions/ASR."""
@@ -1921,16 +1888,23 @@ def _refine_transcript_compact(
             "Hard limit: under 1400 characters. No long paragraphs. No code fences."
         )
         max_tok, hard_cap = 700, 1600
-    else:  # transcript — higher budget so "don't miss anything" asks stay useful
+    # Avoid middle slicing when full transcript mode is requested
+    if mode == "transcript":
         format_rule = (
             "MODE=transcript. Output the spoken content as clean readable text "
             "(paragraphs ok). Remove music tags and noise. Keep meaning faithful. "
-            "Cover the whole talk: list ideas and how they are implemented when present. "
-            "Hard limit: under 5500 characters. If truncated, end with "
-            "'(transcript long hai — specific hissa chahiye to batao)'. "
+            "Cover the full duration of the video. "
             "ONE message only. No code fences. No 'Key points' section."
         )
-        max_tok, hard_cap = 2200, 5800
+        max_tok, hard_cap = 3500, 8000
+        # Do not slice middle out of raw text if mode is full transcript
+    else:
+        if len(cleaned) > 18000:
+            cleaned = (
+                cleaned[:12000]
+                + "\n\n[...middle omitted for length...]\n\n"
+                + cleaned[-5000:]
+            )
 
     system = (
         "You prepare video transcripts for WhatsApp. Be faithful. No fluff.\n"
