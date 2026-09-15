@@ -2032,6 +2032,11 @@ def _try_piped_captions(
 
             text = _format_segments(segs, with_timestamps)
             if text:
+                # Add the rejection check here
+                text = _accept_transcript_candidate(text, f"piped_{host}")
+                if not text:
+                    continue  # It was a description, move to the next host!
+                    
                 print(
                     f"[transcribe_video] Piped OK {host} "
                     f"lang={chosen.get('code')} segs={len(segs)}"
@@ -2128,8 +2133,14 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
                 status = str(jdata.get("status") or "").lower()
                 parsed = _parse_content(jdata)
                 if parsed:
-                    print(f"[transcribe_video] Supadata job OK chars={len(parsed)}")
-                    return parsed
+                    # Add the rejection check here
+                    parsed = _accept_transcript_candidate(parsed, "supadata-poll")
+                    if parsed:
+                        print(f"[transcribe_video] Supadata job OK chars={len(parsed)}")
+                        return parsed
+                    else:
+                        print(f"[transcribe_video] Supadata job returned description, rejecting")
+                        return None
                 if status in ("failed", "error"):
                     print(f"[transcribe_video] Supadata job failed: {str(jdata)[:200]}")
                     return None
@@ -2170,10 +2181,15 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
                 return _poll_job(str(job_id))
             parsed = _parse_content(data)
             if parsed:
-                print(
+                # Add the rejection check here
+                parsed = _accept_transcript_candidate(parsed, f"supadata-{mode}")
+                if parsed:
+                    print(
                     f"[transcribe_video] Supadata mode={mode} OK chars={len(parsed)}"
-                )
-                return parsed
+                    )
+                    return parsed
+                else:
+                    return None
             print(
                 f"[transcribe_video] Supadata mode={mode} empty body keys="
                 f"{list(data.keys())[:12]}"
