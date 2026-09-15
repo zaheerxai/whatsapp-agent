@@ -124,6 +124,24 @@ _TRANSCRIPT_PHRASES = frozenset({
     "video me kya",
     "poora sunao",
     "word for word",
+    "word-to-word",
+    "what was said",
+    "what is said",
+    "dont miss",
+    "don't miss",
+    "do not miss",
+    "in depth",
+    "indepth",
+    "in-depth",
+    "each point",
+    "har point",
+    "every point",
+    "detailed what",
+    "full detail",
+    "sab kuch batao",
+    "everything covered",
+    "covered in the",
+    "covered in this",
 })
 
 _KEY_POINTS_PHRASES = frozenset({
@@ -184,7 +202,11 @@ _SUMMARY_PHRASES = frozenset({
     "samjhao",
     "samjha do",
     "tell me about",
+    "tell me in depth",
     "about this",
+    "about all",
+    "ideas and",
+    "implementation",
     "batana",
     "bata na",
     "bata do",
@@ -201,6 +223,13 @@ _SUMMARY_PHRASES = frozenset({
     "check karo",
     "dekhna",
     "dekho isko",
+})
+
+# Tokens that signal the residual is about video *content* (not a side command)
+_VIDEO_CONTENT_TOKENS = frozenset({
+    "video", "reel", "youtube", "yt", "clip", "lecture", "session",
+    "episode", "tutorial", "webinar", "day", "ideas", "implementation",
+    "said", "bola", "kaha", "spoken", "caption", "transcript",
 })
 
 # Vague "about" — prefer link_preview (caption) over full ASR when possible
@@ -294,6 +323,10 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
 
     Does NOT itself decide force — caller must also check is_video_url and
     _is_blocked_force_command. Safe for unit tests.
+
+    Long detailed asks ("in depth… what was said… don't miss anything") MUST
+    still force transcript/summary — previously only ≤6-token residuals forced,
+    so browse_url ran instead and the model only saw the YouTube title/desc.
     """
     t = _strip_intent_noise(text_low).lower()
     if not t:
@@ -303,6 +336,31 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
         return "transcript"
     if any(w in t for w in _KEY_POINTS_PHRASES):
         return "key_points"
+
+    # Detail / completeness language → transcript (before generic summary phrases
+    # like "implementation" / "tell me about" that would otherwise win).
+    if any(
+        m in t
+        for m in (
+            "in depth",
+            "indepth",
+            "in-depth",
+            "detailed",
+            "in detail",
+            "what was said",
+            "dont miss",
+            "don't miss",
+            "do not miss",
+            "each point",
+            "har point",
+            "every point",
+            "full detail",
+            "sab kuch",
+            "everything covered",
+        )
+    ):
+        return "transcript"
+
     if any(w in t for w in _SUMMARY_PHRASES):
         return "summary"
 
@@ -312,8 +370,33 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
         return "summary"
     if all(tok in _GREETING_TOKENS for tok in tokens):
         return None
-    # Short non-greeting residual (≤6 tokens) → summary, unless blocked command
-    if len(tokens) <= 6 and not _is_blocked_force_command(t):
+    if _is_blocked_force_command(t):
+        return None
+    # Short non-greeting residual → summary
+    if len(tokens) <= 6:
+        return "summary"
+    # Longer residual: still force when it looks like a content ask about the video
+    # (otherwise force path falls through to browse_url → title only).
+    if any(tok in _VIDEO_CONTENT_TOKENS for tok in tokens):
+        if any(
+            m in t
+            for m in (
+                "detail",
+                "said",
+                "bola",
+                "kaha",
+                "miss",
+                "poora",
+                "full",
+                "everything",
+                "implementation",
+            )
+        ):
+            return "transcript"
+        return "summary"
+    # Substantial non-blocked ask with a video URL present (caller gates URL) —
+    # prefer summary over doing nothing / title-only browse.
+    if len(tokens) >= 8:
         return "summary"
     return None
 
@@ -1072,17 +1155,33 @@ def run_agent(
 
             elif use_video and can_transcribe:
                 tw = _parse_target_words(_intent_low)
+                # Caption language stays auto (Hindi auto-captions still fetch).
+                # English refine is requested via language=en when user asks "in english".
+                _lang = "auto"
+                _il = _intent_low or ""
+                if any(
+                    p in _il
+                    for p in (
+                        "in english",
+                        "english me",
+                        "english mein",
+                        "angrezi me",
+                        "angrezi mein",
+                        "translate to english",
+                    )
+                ):
+                    _lang = "en"
                 tool_args: Dict[str, Any] = {
                     "url": primary_url,
                     "mode": spoken_mode,
-                    "language": "auto",
+                    "language": _lang,
                     "timestamps": False,
                 }
                 if tw and spoken_mode == "summary":
                     tool_args["target_words"] = tw
                 print(
                     f"[AGENT] force transcribe_video mode={spoken_mode} "
-                    f"tw={tw} for: {primary_url}"
+                    f"lang={_lang} tw={tw} for: {primary_url}"
                 )
                 _forced_obs_str = _force_tool(
                     "transcribe_video", tool_args, "call_forced_transcribe_0"

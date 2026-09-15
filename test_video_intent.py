@@ -39,6 +39,24 @@ CASES = [
     ("ye file delete karo", None, True, False, True),
     ("poora transcript do", "transcript", False, False, True),
     ("thanks", None, False, False, False),
+    # Long detailed asks must force (was broken: only ≤6 tokens → browse title only)
+    (
+        "tell me in depth about all ideas and implementation of them covered "
+        "in the day 12 video in english, each point detailed what was said "
+        "dont miss anything",
+        "transcript",
+        False,
+        False,
+        True,
+    ),
+    (
+        "explain the video ideas and implementation in detail",
+        "transcript",
+        False,
+        False,
+        True,
+    ),
+    ("ye video me kya ideas hain", "transcript", False, False, True),
 ]
 
 VIDEO_URLS = [
@@ -86,3 +104,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    

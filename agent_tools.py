@@ -1731,6 +1731,7 @@ def _refine_transcript_compact(
     title: str = "",
     mode: str = "transcript",
     target_words: Optional[int] = None,
+    output_lang: str = "auto",
 ) -> str:
     """
     One cheap LLM pass → WhatsApp-ready text.
@@ -1740,6 +1741,7 @@ def _refine_transcript_compact(
       - summary: overview (honours target_words when set)
       - key_points: bullet list only
 
+    output_lang: auto | en | roman_urdu — user may ask "in english".
     Keeps agent context small (no 50k dump → no 413 / token burn).
     """
     if not raw or not raw.strip():
@@ -1748,6 +1750,7 @@ def _refine_transcript_compact(
     mode = (mode or "transcript").strip().lower()
     if mode not in ("transcript", "summary", "key_points"):
         mode = "transcript"
+    out_lang = (output_lang or "auto").strip().lower()
 
     tw = None
     if target_words is not None:
@@ -1770,16 +1773,28 @@ def _refine_transcript_compact(
             + cleaned[-5000:]
         )
 
-    script_rule = (
-        "OUTPUT SCRIPT: Roman Urdu only (Latin letters). "
-        "Transliterate any Hindi/Urdu/Devanagari/Arabic script. "
-        "Do NOT output Devanagari or Arabic letters at all."
-    )
-    if not _has_arabic_or_devanagari(cleaned):
+    if out_lang in ("en", "english"):
         script_rule = (
-            "OUTPUT SCRIPT: keep Latin script (English or Roman Urdu as in source). "
-            "Do not switch to Devanagari/Arabic."
+            "OUTPUT LANGUAGE: English only. Translate Hindi/Urdu/Roman-Urdu speech "
+            "into clear English. Latin letters only."
         )
+    elif out_lang in ("roman_urdu", "ur", "urdu"):
+        script_rule = (
+            "OUTPUT SCRIPT: Roman Urdu only (Latin letters). "
+            "Transliterate any Hindi/Urdu/Devanagari/Arabic script. "
+            "Do NOT output Devanagari or Arabic letters at all."
+        )
+    else:
+        script_rule = (
+            "OUTPUT SCRIPT: Roman Urdu only (Latin letters). "
+            "Transliterate any Hindi/Urdu/Devanagari/Arabic script. "
+            "Do NOT output Devanagari or Arabic letters at all."
+        )
+        if not _has_arabic_or_devanagari(cleaned):
+            script_rule = (
+                "OUTPUT SCRIPT: keep Latin script (English or Roman Urdu as in source). "
+                "Do not switch to Devanagari/Arabic."
+            )
 
     if mode == "summary":
         if tw:
@@ -1808,17 +1823,16 @@ def _refine_transcript_compact(
             "Hard limit: under 1400 characters. No long paragraphs. No code fences."
         )
         max_tok, hard_cap = 700, 1600
-    else:  # transcript
+    else:  # transcript — higher budget so "don't miss anything" asks stay useful
         format_rule = (
             "MODE=transcript. Output the spoken content as clean readable text "
             "(paragraphs ok). Remove music tags and noise. Keep meaning faithful. "
-            "If the source is very long, cover the whole talk in compressed but still "
-            "speech-like form (not a meta-summary). "
-            "Hard limit: under 3200 characters. If truncated, end with "
+            "Cover the whole talk: list ideas and how they are implemented when present. "
+            "Hard limit: under 5500 characters. If truncated, end with "
             "'(transcript long hai — specific hissa chahiye to batao)'. "
             "ONE message only. No code fences. No 'Key points' section."
         )
-        max_tok, hard_cap = 1400, 3500
+        max_tok, hard_cap = 2200, 5800
 
     system = (
         "You prepare video transcripts for WhatsApp. Be faithful. No fluff.\n"
@@ -2794,8 +2808,16 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             first, _, rest = raw_body.partition("\n")
             title = first.replace("Title:", "", 1).strip()
             raw_body = rest.lstrip("\n")
+        # Prefer English refine when user asked "in english" / language=en
+        out_lang = "auto"
+        if language in ("en", "english"):
+            out_lang = "en"
         refined = _refine_transcript_compact(
-            raw_body, title=title, mode=mode, target_words=target_words
+            raw_body,
+            title=title,
+            mode=mode,
+            target_words=target_words,
+            output_lang=out_lang,
         )
         meta = f"Source: {source} | mode={mode}"
         if target_words:
