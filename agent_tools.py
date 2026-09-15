@@ -1417,6 +1417,10 @@ _YT_ID_RE = re.compile(
 _TRANSCRIPT_CACHE: Dict[str, tuple] = {}
 _TRANSCRIPT_CACHE_TTL = 3600  # 1 hour
 _TRANSCRIPT_CACHE_MAX = 24
+# Raw speech text by video_id — shared across modes (summary + transcript)
+# so a successful caption/ASR fetch is reused instead of falling back to description.
+_RAW_SPEECH_CACHE: Dict[str, tuple] = {}  # id -> (text, exp)
+_RAW_SPEECH_TTL = 3600
 # Safety caps for cloud (Render) — avoid huge downloads / Groq 25 MB limit
 _MAX_ASR_SECONDS = 45 * 60  # 45 min hard cap
 _TARGET_AUDIO_BITRATE = "48k"  # mono speech is fine at 48 kbps
@@ -3018,6 +3022,37 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
 
     yt_id = _extract_youtube_id(url)
 
+    def _raw_cache_get() -> Optional[str]:
+        if not yt_id:
+            return None
+        entry = _RAW_SPEECH_CACHE.get(yt_id)
+        if not entry:
+            return None
+        text, exp = entry
+        if time.time() > exp:
+            _RAW_SPEECH_CACHE.pop(yt_id, None)
+            return None
+        if _looks_like_youtube_description(text):
+            _RAW_SPEECH_CACHE.pop(yt_id, None)
+            return None
+        return text
+
+    def _raw_cache_set(text: str, source: str) -> None:
+        if not yt_id or not text or _looks_like_youtube_description(text):
+            return
+        if len(text) < 120:
+            return
+        _RAW_SPEECH_CACHE[yt_id] = (text, time.time() + _RAW_SPEECH_TTL)
+        msg = (
+            f"[transcribe_video] RAW_CACHE store id={yt_id} "
+            f"source={source} chars={len(text)}"
+        )
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
+
     def _pack(source: str, body: str) -> str:
         """
         Clean + one refine pass → compact WhatsApp-ready text for the requested mode.
@@ -3029,7 +3064,17 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             first, _, rest = raw_body.partition("\n")
             title = first.replace("Title:", "", 1).strip()
             raw_body = rest.lstrip("\n")
-        # Prefer English refine when user asked "in english" / language=en
+        # Do not feed marketing titles into refine — models may regurgitate
+        # the YouTube description instead of the spoken transcript.
+        if title and _looks_like_youtube_description(f"Title: {title}\n{title}"):
+            title = ""
+        if _looks_like_youtube_description(raw_body):
+            raise RuntimeError(
+                f"raw_is_description source={source} chars={len(raw_body)}"
+            )
+        # Persist real speech for other modes (transcript ↔ summary)
+        _raw_cache_set(raw_body, source)
+
         out_lang = "auto"
         if language in ("en", "english"):
             out_lang = "en"
@@ -3040,13 +3085,49 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             target_words=target_words,
             output_lang=out_lang,
         )
-        # Refine can still echo promo if raw was borderline — reject again
+        # If refine collapsed into promo/description but raw is real speech,
+        # keep speech (light-clean) rather than serving the description.
         if _looks_like_youtube_description(refined) or _looks_like_youtube_description(
-            f"Title: {title}\n{refined}"
+            f"Title: {title}\n{refined}" if title else refined
         ):
-            raise RuntimeError(
-                f"refine_still_description source={source} chars={len(refined)}"
+            print(
+                f"[transcribe_video] refine produced description-like text "
+                f"source={source} — retrying strict speech-only refine"
             )
+            refined2 = _refine_transcript_compact(
+                raw_body,
+                title="",
+                mode=mode,
+                target_words=target_words,
+                output_lang=out_lang,
+            )
+            if _looks_like_youtube_description(refined2):
+                # Last resort: return cleaned raw (still better than promo)
+                cleaned = _clean_raw_transcript(raw_body)
+                if out_lang == "en" and _has_arabic_or_devanagari(cleaned):
+                    # one more forced translate without title context
+                    refined2 = _refine_transcript_compact(
+                        cleaned[:12000],
+                        title="",
+                        mode="transcript",
+                        target_words=None,
+                        output_lang="en",
+                    )
+                    if _looks_like_youtube_description(refined2):
+                        raise RuntimeError(
+                            f"refine_still_description source={source} "
+                            f"chars={len(refined2)}"
+                        )
+                    refined = refined2
+                else:
+                    if _looks_like_youtube_description(cleaned):
+                        raise RuntimeError(
+                            f"refine_still_description source={source} "
+                            f"chars={len(refined)}"
+                        )
+                    refined = cleaned[:5500]
+            else:
+                refined = refined2
         meta = f"Source: {source} | mode={mode}"
         if target_words:
             meta += f" | target_words={target_words}"
@@ -3082,19 +3163,44 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         ok = _accept_transcript_candidate(candidate, source)
         if not ok:
             return None
+        msg = (
+            f"[transcribe_video] ACCEPT {source} chars={len(ok)} "
+            f"head={ok[:100]!r}"
+        )
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
         try:
             return _pack(source, ok)
         except RuntimeError as e:
-            if "refine_still_description" in str(e):
-                print(f"[transcribe_video] REJECT after refine {source}: {e}")
+            if "description" in str(e):
+                print(f"[transcribe_video] REJECT after pack {source}: {e}")
                 try:
                     logging.getLogger("mojo").info(
-                        "REJECT after refine %s: %s", source, e
+                        "REJECT after pack %s: %s", source, e
                     )
                 except Exception:
                     pass
                 return None
             raise
+
+    # Reuse raw speech captured by a prior summary/transcript call on this video
+    cached_raw = _raw_cache_get()
+    if cached_raw:
+        msg = (
+            f"[transcribe_video] RAW_CACHE hit id={yt_id} "
+            f"chars={len(cached_raw)} mode={mode}"
+        )
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
+        packed = _take(f"raw_cache({yt_id})", cached_raw)
+        if packed:
+            return packed
 
     # YouTube: real caption tracks first. youtube2text is last — it often returns
     # the video *description* when speech tracks are missing for a language.
