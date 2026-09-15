@@ -39,6 +39,10 @@ from supabase import create_client, Client
 import admin_commands
 import file_ops
 
+# Local file logging as early as possible (captures boot noise). Ephemeral on Render Free.
+import mojo_logging
+mojo_logging.setup_logging()
+
 import time as _time
 
 def _timed(label):
@@ -2350,11 +2354,6 @@ start_health_server()
 start_session_uploader()
 start_self_ping(interval_seconds=600)         # optional, every 10 min
 
-# Full agent log → local file only (daily rotate). OneDrive upload is on-demand via /uploadlog.
-import mojo_logging
-mojo_logging.setup_logging()
-# Continuous OneDrive log sync removed (was burning Service-Initiated bandwidth).
-# Use admin command /uploadlog when you want the current local log on OneDrive.
 
 
 def send_reaction(message, chat_id, emoji):

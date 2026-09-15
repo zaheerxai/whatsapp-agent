@@ -678,6 +678,9 @@ def cmd_uploadlog(args):
         import mojo_logging
         import file_ops
 
+        # Ensure file handler is live even if module-level setup was skipped
+        mojo_logging.setup_logging()
+
         if not file_ops.onedrive_configured():
             return "OneDrive not configured (missing ONEDRIVE_CLIENT_ID / ONEDRIVE_REFRESH_TOKEN)."
 
@@ -690,6 +693,13 @@ def cmd_uploadlog(args):
             f"✅ Log uploaded → OneDrive/{result['remote_folder']}/{result['remote_name']}",
             f"Size: {kb:.1f} KB | day: {result.get('day')}",
         ]
+        if result.get("empty"):
+            lines.append(
+                "Note: local log was empty (process just started or free-tier disk was wiped)."
+            )
+        lines.append(
+            "Note: Render Free has no persistent disk — local logs only cover this process uptime."
+        )
         if result.get("webUrl"):
             lines.append(f"Link: {result['webUrl']}")
         if result.get("yesterday"):
@@ -702,9 +712,14 @@ def cmd_uploadlog(args):
             lines.append(f"(yesterday skip: {result['yesterday_error']})")
         return "\n".join(lines)
     except FileNotFoundError as e:
-        return f"No local log file yet: {e}"
+        return (
+            f"No local log file yet.\n{e}\n"
+            "Tip: free-tier /tmp is wiped on restart. Wait for the bot to log something, "
+            "then try /uploadlog again. Use /logstatus to check."
+        )
     except Exception as e:
         return f"Upload failed: {e}"
+
 
 
 @command(
@@ -715,6 +730,7 @@ def cmd_logstatus(args):
     try:
         import mojo_logging
 
+        mojo_logging.setup_logging()
         st = mojo_logging.get_log_status()
         kb = (st.get("bytes") or 0) / 1024
         lines = [
@@ -722,17 +738,19 @@ def cmd_logstatus(args):
             f"Size: {kb:.1f} KB | day (UTC): {st.get('day')}",
             f"Remote name on /uploadlog: {st.get('remote_name')}",
             "Auto OneDrive sync: OFF (on-demand only)",
+            "Storage: ephemeral on Render Free (/tmp wiped on restart/spin-down/deploy)",
         ]
         dated = st.get("dated") or []
         if dated:
-            lines.append("Rotated (local):")
+            lines.append("Rotated (local, this process only):")
             for d in dated:
                 lines.append(f"  - {d['name']}: {d['bytes'] / 1024:.1f} KB")
         else:
-            lines.append("No rotated day files yet.")
+            lines.append("No rotated day files yet (normal after restart on free tier).")
         return "\n".join(lines)
     except Exception as e:
         return f"logstatus failed: {e}"
+
 
 
 @command("uploadimg", "Usage: send or reply to an image with /uploadimg [optional_name] — uploads to OneDrive")

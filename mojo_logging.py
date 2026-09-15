@@ -1,14 +1,16 @@
 """
 mojo_logging.py — Local application log with daily rotation + on-demand OneDrive upload.
 
-Design (bandwidth-safe):
+Design (bandwidth-safe, free-tier aware):
 - All logging is local only. No background upload thread.
-- Local file starts clean every calendar day (UTC date for determinism on cloud).
+- Local file lives under /tmp (or MOJO_LOG_DIR). On Render Free this is
+  ephemeral — wiped on every restart / spin-down / deploy. That is expected.
+- Local file starts clean every calendar day (UTC) while the process is up.
 - Size-based safety rotation still applies.
-- Owner runs /uploadlog (or /synclog) to push the current local log to OneDrive.
-- Remote file is always the same name (mojo_agent_live.log) → overwrite.
-  If the user deletes/moves that remote file, the next /uploadlog creates a
-  brand-new file containing only the current local log (no old history).
+- Owner runs /uploadlog to push the *current process* local log to OneDrive.
+- Remote name is fixed (mojo_agent_live.log) → overwrite. If the user deletes
+  the remote file, the next /uploadlog creates a fresh one with current local
+  content only.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ _lock = threading.Lock()
 _started = False
 _log_path = os.path.join(LOG_DIR, LOG_NAME)
 _current_day: Optional[str] = None  # YYYY-MM-DD (UTC)
+_file_handler: Optional[logging.FileHandler] = None
 
 
 def _ensure_dir():
@@ -36,6 +39,31 @@ def _ensure_dir():
 
 def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _touch_log_file():
+    """Ensure the active log file exists on disk (empty is fine)."""
+    _ensure_dir()
+    if not os.path.isfile(_log_path):
+        with open(_log_path, "a", encoding="utf-8"):
+            pass
+
+
+def _reopen_file_handler():
+    """After rotation, point the FileHandler at a fresh stream for _log_path."""
+    global _file_handler
+    if _file_handler is None:
+        return
+    try:
+        _file_handler.close()
+    except Exception:
+        pass
+    try:
+        _touch_log_file()
+        _file_handler.baseFilename = os.path.abspath(_log_path)
+        _file_handler.stream = _file_handler._open()  # type: ignore[attr-defined]
+    except Exception as e:
+        print(f"[mojo_logging] reopen handler failed: {e}")
 
 
 def _rotate_daily_if_needed():
@@ -54,15 +82,14 @@ def _rotate_daily_if_needed():
     try:
         if os.path.isfile(_log_path) and os.path.getsize(_log_path) > 0:
             dated = os.path.join(LOG_DIR, f"mojo_agent.{_current_day}.log")
-            # Avoid clobbering an existing dated file from an earlier process
             if os.path.isfile(dated):
-                # Append current content into the dated file, then clear active
                 with open(_log_path, "rb") as src, open(dated, "ab") as dst:
                     dst.write(src.read())
                 os.remove(_log_path)
             else:
                 os.replace(_log_path, dated)
             print(f"[mojo_logging] Daily rotate → {os.path.basename(dated)}")
+            _reopen_file_handler()
         _current_day = today
     except Exception as e:
         print(f"[mojo_logging] daily rotate failed: {e}")
@@ -77,6 +104,7 @@ def _rotate_size_if_needed():
                 os.remove(bak)
             os.replace(_log_path, bak)
             print(f"[mojo_logging] Size rotate → {os.path.basename(bak)}")
+            _reopen_file_handler()
     except Exception as e:
         print(f"[mojo_logging] size rotate failed: {e}")
 
@@ -89,11 +117,16 @@ def _maybe_rotate():
 
 class _FlushFileHandler(logging.FileHandler):
     def emit(self, record):
-        # Rotate before writing so a new day always starts clean
         try:
             _maybe_rotate()
         except Exception:
             pass
+        # If stream was closed by rotation, reopen before write
+        if self.stream is None:
+            try:
+                self.stream = self._open()
+            except Exception:
+                pass
         super().emit(record)
         try:
             self.flush()
@@ -102,13 +135,16 @@ class _FlushFileHandler(logging.FileHandler):
 
 
 def setup_logging():
-    """Call once at startup. Local file only — no network."""
-    global _started, _current_day
+    """Call once at startup. Local file only — no network. Idempotent."""
+    global _started, _current_day, _file_handler
     if _started:
+        _touch_log_file()
         return _log_path
+
     _ensure_dir()
     _current_day = _today_utc()
     _rotate_size_if_needed()
+    _touch_log_file()
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -122,6 +158,7 @@ def setup_logging():
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     root.addHandler(fh)
+    _file_handler = fh
 
     # Console mirror
     if not any(
@@ -139,21 +176,28 @@ def setup_logging():
 
     _started = True
     logging.getLogger("mojo").info(
-        "Live log ready (local only, daily rotate): %s", _log_path
+        "Live log ready (local only, daily rotate, ephemeral on free tier): %s",
+        _log_path,
     )
     return _log_path
 
 
 def log_line(msg: str, level: int = logging.INFO):
+    if not _started:
+        setup_logging()
     logging.getLogger("mojo").log(level, msg)
 
 
 def get_log_path() -> str:
+    if not _started:
+        setup_logging()
     return _log_path
 
 
 def get_log_status() -> dict:
     """Return size / day info for the active local log (and any dated siblings)."""
+    if not _started:
+        setup_logging()
     _maybe_rotate()
     size = 0
     if os.path.isfile(_log_path):
@@ -173,6 +217,11 @@ def get_log_status() -> dict:
         "day": _current_day or _today_utc(),
         "remote_name": REMOTE_NAME,
         "dated": dated,
+        "started": _started,
+        "ephemeral_note": (
+            "On Render Free, /tmp is wiped on every restart/spin-down/deploy. "
+            "This file only holds logs from the current process lifetime."
+        ),
     }
 
 
@@ -188,17 +237,27 @@ def upload_current_log(
     - If the remote file was deleted/moved by the user, Graph creates a new
       file with only the bytes we send now (current local content).
     - Does NOT pull any remote history back into the local file.
+    - On free-tier Render, local content is only from the current process uptime.
     """
+    if not _started:
+        setup_logging()
+
     if not file_ops_module or not getattr(file_ops_module, "onedrive_configured", lambda: False)():
         raise RuntimeError("OneDrive not configured")
 
     _maybe_rotate()
+    _touch_log_file()
 
     if not os.path.isfile(_log_path):
-        raise FileNotFoundError(f"No local log yet at {_log_path}")
+        raise FileNotFoundError(
+            f"No local log at {_log_path}. "
+            "On Render Free the disk is ephemeral — logs only exist for the "
+            "current process. Send a few messages first, then /uploadlog again."
+        )
 
-    folder = (remote_folder or os.getenv("ONEDRIVE_FOLDER") or "MojoAgent").strip("/")
     size = os.path.getsize(_log_path)
+    # Allow empty file upload (still useful as a heartbeat) but flag it
+    folder = (remote_folder or os.getenv("ONEDRIVE_FOLDER") or "MojoAgent").strip("/")
 
     with _lock:
         meta = file_ops_module.upload_to_onedrive(
@@ -214,12 +273,13 @@ def upload_current_log(
         "webUrl": meta.get("webUrl"),
         "local_path": _log_path,
         "day": _current_day or _today_utc(),
+        "empty": size == 0,
     }
 
-    # Optional: also push yesterday's rotated file under a dated name
     if include_yesterday:
         try:
             from datetime import timedelta
+
             yday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
             ypath = os.path.join(LOG_DIR, f"mojo_agent.{yday}.log")
             if os.path.isfile(ypath):
@@ -233,6 +293,11 @@ def upload_current_log(
                     "bytes": ymeta.get("size"),
                     "webUrl": ymeta.get("webUrl"),
                 }
+            else:
+                result["yesterday_error"] = (
+                    f"No local rotated file for {yday} "
+                    "(expected on free tier after restart — only current process logs exist)"
+                )
         except Exception as e:
             result["yesterday_error"] = str(e)
 
@@ -245,10 +310,6 @@ def upload_current_log(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat stubs (old continuous sync is intentionally gone)
-# ---------------------------------------------------------------------------
-
 def start_onedrive_log_sync(file_ops_module, interval_sec: int = 90):
     """
     DEPRECATED. Continuous OneDrive sync removed to stop bandwidth burn.
@@ -259,5 +320,4 @@ def start_onedrive_log_sync(file_ops_module, interval_sec: int = 90):
         "[mojo_logging] start_onedrive_log_sync is a no-op. "
         "Auto-upload disabled — use /uploadlog for on-demand sync."
     )
-    # Still ensure local logging is ready
     setup_logging()
