@@ -1717,6 +1717,81 @@ def _clean_raw_transcript(text: str) -> str:
     return text.strip()
 
 
+def _looks_like_youtube_description(text: str) -> bool:
+    """
+    True when a 'transcript' is actually the YouTube description / promo blurb
+    (CTAs, subscribe lines, course links) rather than spoken captions.
+
+    youtube2text and some caption APIs occasionally return description when the
+    requested lang has no track (e.g. language=en on a Hindi-auto-caption video).
+    """
+    if not text or len(text.strip()) < 80:
+        return False
+    body = text.strip()
+    if body.startswith("Title:"):
+        body = body.split("\n", 1)[-1].strip()
+    low = body.lower()
+
+    promo_hits = 0
+    markers = (
+        "subscribe",
+        "like and",
+        "click the link",
+        "registration form",
+        "whatsapp.com/channel",
+        "codanics.com",
+        "follow us",
+        "stay updated",
+        "don't forget to",
+        "do not forget to",
+        "playlist?list=",
+        "assalamu alaikum future",
+        "welcome back to day",
+        "thank you for your interest in the course",
+        "looking forward to seeing you in the course",
+        "best regards",
+        "🔥",
+        "👉",
+        "what we covered in day",
+        "complete free ai",
+        "mentorship program",
+    )
+    for m in markers:
+        if m in low:
+            promo_hits += 1
+
+    # Many outbound links + few dialogue cues → description
+    link_count = len(re.findall(r"https?://", body))
+    has_speech_cues = bool(
+        re.search(
+            r"\b(i mean|so basically|let us|let's|today we will|ab hum|"
+            r"dekhte hain|samjhte hain|example|for example)\b",
+            low,
+        )
+    ) or _has_arabic_or_devanagari(body)
+
+    if promo_hits >= 3:
+        return True
+    if promo_hits >= 2 and link_count >= 2 and not has_speech_cues:
+        return True
+    if link_count >= 4 and not has_speech_cues and len(body) < 4000:
+        return True
+    return False
+
+
+def _accept_transcript_candidate(text: Optional[str], source: str) -> Optional[str]:
+    """Reject description-like blobs so cascade continues to real captions/ASR."""
+    if not text or not str(text).strip():
+        return None
+    if _looks_like_youtube_description(text):
+        print(
+            f"[transcribe_video] REJECT {source}: looks like YouTube description "
+            f"(chars={len(text)}) — trying next source"
+        )
+        return None
+    return text
+
+
 def _has_arabic_or_devanagari(text: str) -> bool:
     for ch in text[:4000]:
         o = ord(ch)
@@ -1902,7 +1977,9 @@ def _try_piped_captions(
     preferred: List[str] = []
     if lang and lang not in ("auto", ""):
         preferred.append(lang)
-    preferred.extend(["en", "en-US", "en-GB", "ur", "hi"])
+    # Hindi/Urdu auto-captions first when auto — English-only prefer often
+    # returned empty tracks and upstream APIs fell back to description text.
+    preferred.extend(["hi", "ur", "en", "en-US", "en-GB"])
 
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; MojoBot/1.0)",
@@ -2154,9 +2231,10 @@ def _try_youtube_captions(
 
     lang = (language or "auto").strip().lower()
     if lang in ("", "auto"):
-        preferred = ["en", "ur", "hi", "en-US", "en-GB"]
+        # Hindi/Urdu first — many Codanics / PK-IN lectures only have hi auto-captions
+        preferred = ["hi", "ur", "en", "en-US", "en-GB"]
     else:
-        preferred = [lang, "en", "ur", "hi"]
+        preferred = [lang, "hi", "ur", "en", "en-US"]
 
     try:
         ytt = YouTubeTranscriptApi()
@@ -2831,29 +2909,52 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     if is_ig or is_fb:
         url = _normalize_ig_fb_url(url)
 
+    # Caption FETCH language must stay auto/hi-capable.
+    # User "in english" only controls refine output_lang — if we pass language=en
+    # into caption APIs, Hindi-auto videos often return DESCRIPTION instead of speech.
+    fetch_lang = "auto"
+    if language in ("hi", "ur", "en", "en-US", "en-GB") and language not in ("en", "english"):
+        fetch_lang = language
+    # When user asked English output, still prefer auto so Hindi tracks are found.
+    print(
+        f"[transcribe_video] start url={url[:60]!r} mode={mode} "
+        f"fetch_lang={fetch_lang} refine_lang={language}"
+    )
+
+    def _take(source: str, candidate: Optional[str]) -> Optional[str]:
+        ok = _accept_transcript_candidate(candidate, source)
+        if ok:
+            return _pack(source, ok)
+        return None
+
     # --- 0. FREE cloud-working path: youtube2text.org (proven on blocked videos) ---
     if yt_id or "youtu" in url.lower():
-        text = _try_youtube2text(url, language, with_ts)
-        if text:
-            return _pack("youtube2text.org", text)
+        packed = _take("youtube2text.org", _try_youtube2text(url, fetch_lang, with_ts))
+        if packed:
+            return packed
 
     # --- 1. FREE: public Piped instances (YouTube captions) ---
     if yt_id:
-        text = _try_piped_captions(yt_id, language, with_ts)
-        if text:
-            return _pack(f"Piped captions (video {yt_id})", text)
+        packed = _take(
+            f"Piped captions (video {yt_id})",
+            _try_piped_captions(yt_id, fetch_lang, with_ts),
+        )
+        if packed:
+            return packed
 
     # --- 2. Managed API (SUPADATA_API_KEY) — best path for IG / FB / TikTok ---
-    # Prefer this BEFORE local yt-dlp on Instagram/Facebook (cloud IPs often blocked).
-    text = _try_supadata(url, language, with_ts)
-    if text:
-        return _pack("Supadata", text)
+    packed = _take("Supadata", _try_supadata(url, fetch_lang, with_ts))
+    if packed:
+        return packed
 
     # --- 3. Direct youtube-transcript-api (often blocked on cloud IPs) ---
     if yt_id:
-        text = _try_youtube_captions(yt_id, language, with_ts)
-        if text:
-            return _pack(f"YouTube captions (video {yt_id})", text)
+        packed = _take(
+            f"YouTube captions (video {yt_id})",
+            _try_youtube_captions(yt_id, fetch_lang, with_ts),
+        )
+        if packed:
+            return packed
 
     # --- 4. ASR path: yt-dlp → ffmpeg → Groq Whisper ---
     asr_error_msg: Optional[str] = None
@@ -2923,7 +3024,8 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 )
 
             try:
-                raw = _transcribe_with_groq(audio_path, language)
+                # Whisper: auto-detect speech language (Hindi OK); English is refine-only
+                raw = _transcribe_with_groq(audio_path, "auto")
             except Exception as e:
                 return f"Speech-to-text failed: {e}"
 
