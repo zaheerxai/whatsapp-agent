@@ -8,6 +8,7 @@ Permission-sensitive tools (send_message_to, python_exec) check OWNER_SENDER_ID.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -1428,7 +1429,8 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 
 
 def _cache_key(url: str, language: str, timestamps: bool) -> str:
-    return f"{url.strip().lower()}|{language or 'auto'}|{int(bool(timestamps))}"
+    # v2: bust entries that cached YouTube description as "transcript"
+    return f"v2|{url.strip().lower()}|{language or 'auto'}|{int(bool(timestamps))}"
 
 
 def _cache_get(key: str) -> Optional[str]:
@@ -1443,6 +1445,13 @@ def _cache_get(key: str) -> Optional[str]:
 
 
 def _cache_set(key: str, text: str) -> None:
+    # Never persist description/promo blobs
+    if text and _looks_like_youtube_description(text):
+        print(
+            f"[transcribe_video] skip cache_set — description-like "
+            f"(chars={len(text)})"
+        )
+        return
     if len(_TRANSCRIPT_CACHE) >= _TRANSCRIPT_CACHE_MAX:
         # Drop oldest by expiry
         oldest = min(_TRANSCRIPT_CACHE.items(), key=lambda kv: kv[1][1])
@@ -1784,10 +1793,15 @@ def _accept_transcript_candidate(text: Optional[str], source: str) -> Optional[s
     if not text or not str(text).strip():
         return None
     if _looks_like_youtube_description(text):
-        print(
+        msg = (
             f"[transcribe_video] REJECT {source}: looks like YouTube description "
             f"(chars={len(text)}) — trying next source"
         )
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
         return None
     return text
 
@@ -2871,7 +2885,16 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     )
     cached = _cache_get(cache_k)
     if cached:
-        return cached
+        # Stale process may hold description-as-transcript; never serve it
+        if _looks_like_youtube_description(cached):
+            print(
+                f"[transcribe_video] cache DROP description-like "
+                f"(chars={len(cached)}) key={cache_k[:80]!r}"
+            )
+            _TRANSCRIPT_CACHE.pop(cache_k, None)
+        else:
+            print(f"[transcribe_video] cache HIT chars={len(cached)}")
+            return cached
 
     yt_id = _extract_youtube_id(url)
 
@@ -2897,6 +2920,13 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             target_words=target_words,
             output_lang=out_lang,
         )
+        # Refine can still echo promo if raw was borderline — reject again
+        if _looks_like_youtube_description(refined) or _looks_like_youtube_description(
+            f"Title: {title}\n{refined}"
+        ):
+            raise RuntimeError(
+                f"refine_still_description source={source} chars={len(refined)}"
+            )
         meta = f"Source: {source} | mode={mode}"
         if target_words:
             meta += f" | target_words={target_words}"
@@ -2913,27 +2943,41 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     # User "in english" only controls refine output_lang — if we pass language=en
     # into caption APIs, Hindi-auto videos often return DESCRIPTION instead of speech.
     fetch_lang = "auto"
-    if language in ("hi", "ur", "en", "en-US", "en-GB") and language not in ("en", "english"):
+    if language in ("hi", "ur", "en", "en-US", "en-GB") and language not in (
+        "en",
+        "english",
+    ):
         fetch_lang = language
-    # When user asked English output, still prefer auto so Hindi tracks are found.
-    print(
+    start_msg = (
         f"[transcribe_video] start url={url[:60]!r} mode={mode} "
         f"fetch_lang={fetch_lang} refine_lang={language}"
     )
+    print(start_msg)
+    try:
+        logging.getLogger("mojo").info(start_msg)
+    except Exception:
+        pass
 
     def _take(source: str, candidate: Optional[str]) -> Optional[str]:
         ok = _accept_transcript_candidate(candidate, source)
-        if ok:
+        if not ok:
+            return None
+        try:
             return _pack(source, ok)
-        return None
+        except RuntimeError as e:
+            if "refine_still_description" in str(e):
+                print(f"[transcribe_video] REJECT after refine {source}: {e}")
+                try:
+                    logging.getLogger("mojo").info(
+                        "REJECT after refine %s: %s", source, e
+                    )
+                except Exception:
+                    pass
+                return None
+            raise
 
-    # --- 0. FREE cloud-working path: youtube2text.org (proven on blocked videos) ---
-    if yt_id or "youtu" in url.lower():
-        packed = _take("youtube2text.org", _try_youtube2text(url, fetch_lang, with_ts))
-        if packed:
-            return packed
-
-    # --- 1. FREE: public Piped instances (YouTube captions) ---
+    # YouTube: prefer real caption tracks BEFORE youtube2text (which often
+    # returns the video description when tracks are missing for a given lang).
     if yt_id:
         packed = _take(
             f"Piped captions (video {yt_id})",
@@ -2941,17 +2985,22 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         )
         if packed:
             return packed
+        packed = _take(
+            f"YouTube captions (video {yt_id})",
+            _try_youtube_captions(yt_id, fetch_lang, with_ts),
+        )
+        if packed:
+            return packed
 
-    # --- 2. Managed API (SUPADATA_API_KEY) — best path for IG / FB / TikTok ---
+    # Managed API (SUPADATA) — strong for YT + best for IG/FB/TikTok
     packed = _take("Supadata", _try_supadata(url, fetch_lang, with_ts))
     if packed:
         return packed
 
-    # --- 3. Direct youtube-transcript-api (often blocked on cloud IPs) ---
-    if yt_id:
+    # youtube2text last among caption APIs (description pollution risk)
+    if yt_id or "youtu" in url.lower():
         packed = _take(
-            f"YouTube captions (video {yt_id})",
-            _try_youtube_captions(yt_id, fetch_lang, with_ts),
+            "youtube2text.org", _try_youtube2text(url, fetch_lang, with_ts)
         )
         if packed:
             return packed
