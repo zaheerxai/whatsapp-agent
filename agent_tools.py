@@ -26,13 +26,12 @@ import requests
 # (scheduled reminder delivery). Previously each maintained its own copy of
 # this rule with different wording — this is the one place to edit it.
 # ---------------------------------------------------------------------------
-LANGUAGE_POLICY = """- Mirror the SCRIPT the person actually used in THIS message — not the topic, not the vibe, just what script they typed.
-  - They wrote in English -> reply in English.
-  - They wrote in Roman Urdu/Hindi (Latin letters — e.g. "kya haal hai", "paani peene ka reminder set kar do") -> reply in Roman Urdu/Hindi, same script.
-  - They wrote in native Urdu script (نستعلیق / Arabic letters) -> reply in Urdu script.
-  - They explicitly asked for Urdu script (e.g. "Urdu mein likho", "اردو میں جواب دو") -> reply in Urdu script even if their own message was typed in Roman.
-- Default for Urdu/Hindi speakers who haven't specified a script = Roman Urdu (Latin letters). Never switch to native Urdu script just because a topic or reminder subject feels "more Urdu" — only the person's own explicit script or request decides this, never your own judgment call.
-- Voice notes have no script the person "chose" — a voice transcript is treated as Roman Urdu by default unless the person has explicitly asked for Urdu script elsewhere in the conversation.
+LANGUAGE_POLICY = """- DEFAULT: Roman Urdu (Latin letters only). Never output Devanagari or Arabic/Urdu script unless the user explicitly asked for that script.
+- Explicit English ask ("in english", "english me", "angrezi", "english me refine") → reply in English.
+- Explicit native-script ask only ("urdu script", "hindi letters", "اردو میں لکھو", "देवनागरी") → that script.
+- "urdu me" / "hindi me" without the word script/letters/likhai → Roman Urdu (Latin), NOT native script.
+- Voice notes / ASR: Roman Urdu by default unless the user asked for English or native script in the same turn.
+- Tools (transcript, summary, notes): same rules — English only when asked; otherwise Roman Urdu Latin letters.
 """
 
 
@@ -1792,18 +1791,19 @@ def _render_speech_transcript(
     """
     mode=transcript from real speech — NO free-form rewrite.
 
-    Free-form refine was replacing Supadata's 20k Hindi speech with the
-    YouTube description. Only clean / transliterate / translate, covering
-    the full lecture (not first+last chunks only).
+    Language policy (shared with language_policy.py):
+      en → English Latin only
+      auto / roman_urdu → Roman Urdu Latin only (never leave Devanagari)
+      urdu_script / hindi_script → native scripts only when explicitly requested
     """
+    from language_policy import non_latin_ratio, has_non_latin_script
+
     cleaned = _clean_raw_transcript(raw or "")
     if not cleaned or _looks_like_youtube_description(cleaned):
         return ""
 
-    # Cover full speech. ~20k Hindi → ~5 chunks of 4k.
     step = 4000
     chunks = [cleaned[i : i + step] for i in range(0, len(cleaned), step)]
-    # Soft latency ceiling: max 6 chunks (~24k raw)
     if len(chunks) > 6:
         chunks = chunks[:4] + chunks[-2:]
         print(
@@ -1814,25 +1814,39 @@ def _render_speech_transcript(
     if _client_ai is None or not _MODEL_NAME:
         return cleaned[:hard_cap]
 
-    want_en = out_lang in ("en", "english")
-    if want_en:
+    lang = (out_lang or "auto").strip().lower()
+    if lang in ("en", "english"):
         sys = (
             "You are a literal translator. Translate the SPOKEN transcript into "
             "clear English. Keep meaning and order. Do NOT summarize or skip sections. "
             "Do NOT add course ads, subscribe CTAs, links, or 'Best regards'. "
+            "Do NOT output Hindi/Urdu script — English Latin letters only. "
             "Output ONLY the translation of the speech below."
         )
+        want_latin = True
+    elif lang in ("urdu_script", "ur"):
+        sys = (
+            "Translate the SPOKEN content into Urdu using Arabic/Nastaliq script. "
+            "Keep order. No course ads. Output ONLY the speech."
+        )
+        want_latin = False
+    elif lang in ("hindi_script", "hi"):
+        sys = (
+            "Translate the SPOKEN content into Hindi Devanagari script. "
+            "Keep order. No course ads. Output ONLY the speech."
+        )
+        want_latin = False
     else:
         sys = (
             "Transliterate the SPOKEN transcript into Roman Urdu (Latin letters only). "
             "Keep full content and order — do NOT summarize or skip sections. "
-            "If already Latin, clean lightly. "
+            "Never use Devanagari or Arabic letters. "
             "Do NOT add course ads, subscribe CTAs, links, or 'Best regards'. "
-            "Output ONLY the speech text."
+            "Output ONLY the speech text in Latin letters."
         )
+        want_latin = True
 
-    parts: List[str] = []
-    for idx, ch in enumerate(chunks):
+    def _call_chunk(ch: str, attempt: int = 0) -> str:
         try:
             resp = _client_ai.chat.completions.create(
                 model=_MODEL_NAME,
@@ -1840,30 +1854,66 @@ def _render_speech_transcript(
                     {"role": "system", "content": sys},
                     {
                         "role": "user",
-                        "content": f"Speech part {idx + 1}/{len(chunks)}:\n\n{ch}",
+                        "content": "Speech part:\n\n" + ch,
                     },
                 ],
                 temperature=0.1,
                 max_tokens=2200,
             )
-            piece = (resp.choices[0].message.content or "").strip()
+            return (resp.choices[0].message.content or "").strip()
         except Exception as e:
-            print(f"[transcribe_video] speech render chunk {idx} failed: {e}")
-            piece = ch
-        if piece and not _looks_like_youtube_description(piece):
+            err = str(e).lower()
+            if attempt < 3 and ("429" in err or "rate" in err or "too many" in err):
+                time.sleep(1.2 * (attempt + 1))
+                return _call_chunk(ch, attempt + 1)
+            print(f"[transcribe_video] speech render chunk failed: {e}")
+            return ""
+
+    parts: List[str] = []
+    for idx, ch in enumerate(chunks):
+        piece = _call_chunk(ch)
+        if piece and _looks_like_youtube_description(piece):
+            piece = ""
+        if piece and want_latin and non_latin_ratio(piece) > 0.25:
+            print(
+                f"[transcribe_video] chunk {idx} still non-Latin "
+                f"(ratio={non_latin_ratio(piece):.2f}) — retry"
+            )
+            piece2 = _call_chunk(ch)
+            if (
+                piece2
+                and non_latin_ratio(piece2) <= 0.25
+                and not _looks_like_youtube_description(piece2)
+            ):
+                piece = piece2
+            else:
+                piece = ""
+        if piece:
             parts.append(piece)
-        elif not _looks_like_youtube_description(ch):
-            parts.append(ch)
+        else:
+            print(f"[transcribe_video] speech_render skip chunk {idx} (empty/bad)")
 
     out = "\n\n".join(parts).strip()
     if not out or _looks_like_youtube_description(out):
+        if want_latin and has_non_latin_script(cleaned):
+            return (
+                "Transcript mil gaya lekin language convert fail / rate-limit. "
+                "Thori der baad dobara try karo (english/roman me)."
+            )
         out = cleaned
+    if want_latin and non_latin_ratio(out) > 0.35:
+        return (
+            "Transcript source Hindi/Urdu script me hai; Roman/English convert "
+            "abhi rate-limit ki wajah se complete nahi hua. 1 minute baad "
+            "'transcript dena english me' dobara bhejo."
+        )
     if len(out) > hard_cap:
         out = (
             out[:hard_cap].rstrip()
             + "\n\n(transcript long hai — specific hissa chahiye to batao)"
         )
     return out
+
 
 
 def _accept_transcript_candidate(text: Optional[str], source: str) -> Optional[str]:
@@ -3172,9 +3222,13 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         # Persist real speech for other modes (transcript ↔ summary)
         _raw_cache_set(raw_body, source)
 
-        out_lang = "auto"
+        out_lang = "roman_urdu"
         if language in ("en", "english"):
             out_lang = "en"
+        elif language in ("urdu_script", "ur"):
+            out_lang = "urdu_script"
+        elif language in ("hindi_script", "hi"):
+            out_lang = "hindi_script"
 
         if mode == "transcript":
             # CRITICAL: do not free-form refine — that was turning Supadata's

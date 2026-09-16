@@ -1162,21 +1162,25 @@ def run_agent(
             elif use_video and can_transcribe:
                 tw = _parse_target_words(_intent_low)
                 # Caption language stays auto (Hindi auto-captions still fetch).
-                # English refine is requested via language=en when user asks "in english".
-                _lang = "auto"
-                _il = _intent_low or ""
-                if any(
-                    p in _il
-                    for p in (
-                        "in english",
-                        "english me",
-                        "english mein",
-                        "angrezi me",
-                        "angrezi mein",
-                        "translate to english",
-                    )
-                ):
-                    _lang = "en"
+                # Shared language policy (default Roman Urdu; en only if explicit)
+                try:
+                    from language_policy import detect_output_lang, to_tool_language_arg
+                    _lang = to_tool_language_arg(detect_output_lang(_intent_low or ""))
+                except Exception:
+                    _lang = "auto"
+                    _il = _intent_low or ""
+                    if any(
+                        p in _il
+                        for p in (
+                            "in english",
+                            "english me",
+                            "english mein",
+                            "angrezi me",
+                            "angrezi mein",
+                            "translate to english",
+                        )
+                    ):
+                        _lang = "en"
                 tool_args: Dict[str, Any] = {
                     "url": primary_url,
                     "mode": spoken_mode,
