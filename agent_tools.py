@@ -1977,7 +1977,7 @@ def _refine_transcript_compact(
         except (TypeError, ValueError):
             tw = None
         if tw is not None:
-            tw = max(80, min(800, tw))
+            tw = max(80, min(2500, tw))
 
     cleaned = _clean_raw_transcript(raw)
     if _client_ai is None or not _MODEL_NAME:
@@ -2017,8 +2017,9 @@ def _refine_transcript_compact(
     if mode == "summary":
         if tw:
             # ~5 chars/word rough; leave headroom for title/sections
-            hard_cap = min(4500, max(1400, tw * 7))
-            max_tok = min(2200, max(700, int(tw * 1.6)))
+            # ~5-6 chars/word; 1500 words ≈ 9k chars, need room in model output
+            hard_cap = min(12000, max(1400, tw * 6))
+            max_tok = min(4500, max(700, int(tw * 1.8)))
             format_rule = (
                 f"MODE=summary. Aim for about {tw} words (not fewer than {int(tw*0.7)}). "
                 "Use clear section headings if useful. Cover the whole video fairly. "

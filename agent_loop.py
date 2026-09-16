@@ -131,9 +131,6 @@ _TRANSCRIPT_PHRASES = frozenset({
     "dont miss",
     "don't miss",
     "do not miss",
-    "in depth",
-    "indepth",
-    "in-depth",
     "each point",
     "har point",
     "every point",
@@ -154,6 +151,21 @@ _KEY_POINTS_PHRASES = frozenset({
     "bullet",
     "points nikal",
     "key takeaway",
+})
+
+_EXPLICIT_SUMMARY_PHRASES = frozenset({
+    "summary",
+    "summarise",
+    "summarize",
+    "summarise karo",
+    "summarize karo",
+    "khulasa",
+    "mukhtasir",
+    "short me batao",
+    "short mein batao",
+    "1.5k words",
+    "in 1.5k",
+    "in 1500",
 })
 
 _SUMMARY_PHRASES = frozenset({
@@ -322,24 +334,27 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
     """
     Return transcribe mode if user wants spoken/video content, else None.
 
-    Does NOT itself decide force — caller must also check is_video_url and
-    _is_blocked_force_command. Safe for unit tests.
-
-    Long detailed asks ("in depth… what was said… don't miss anything") MUST
-    still force transcript/summary — previously only ≤6-token residuals forced,
-    so browse_url ran instead and the model only saw the YouTube title/desc.
+    Priority:
+      1. Explicit summary / key_points (even with "in depth" / long word counts)
+      2. Explicit transcript / word-for-word
+      3. Detail language without "summarize" → transcript
+      4. Short residual → summary
     """
     t = _strip_intent_noise(text_low).lower()
     if not t:
         return "summary"
 
-    if any(w in t for w in _TRANSCRIPT_PHRASES):
-        return "transcript"
+    # Explicit "summarize" / word-count summary wins over "in depth"
+    # so "summarize in depth in 1.5k words" → summary, not transcript.
+    if any(w in t for w in _EXPLICIT_SUMMARY_PHRASES):
+        return "summary"
     if any(w in t for w in _KEY_POINTS_PHRASES):
         return "key_points"
 
-    # Detail / completeness language → transcript (before generic summary phrases
-    # like "implementation" / "tell me about" that would otherwise win).
+    if any(w in t for w in _TRANSCRIPT_PHRASES):
+        return "transcript"
+
+    # Detail language without summarize → full transcript of speech
     if any(
         m in t
         for m in (
@@ -1027,14 +1042,29 @@ def run_agent(
         _intent_low = _intent_text.lower()
 
         def _parse_target_words(text_low: str) -> Optional[int]:
-            m = _re.search(r"(\d{2,4})\s*[- ]?\s*words?", text_low)
+            # 1.5k / 2k / 1.5K words
+            m = _re.search(
+                r"(\d+(?:[.,]\d+)?)\s*[kK]\s*[- ]?\s*words?",
+                text_low,
+            )
+            if m:
+                try:
+                    n = int(float(m.group(1).replace(",", ".")) * 1000)
+                    return max(80, min(2500, n))
+                except ValueError:
+                    pass
+            # 1,500 words / 1500 words / 1500-word
+            m = _re.search(
+                r"(\d{1,3}(?:,\d{3})+|\d{2,4})\s*[- ]?\s*words?",
+                text_low,
+            )
             if not m:
                 m = _re.search(r"(\d{2,4})\s*word", text_low)
             if not m:
                 return None
             try:
-                n = int(m.group(1))
-                return max(80, min(800, n))
+                n = int(m.group(1).replace(",", ""))
+                return max(80, min(2500, n))
             except ValueError:
                 return None
 
@@ -1205,6 +1235,21 @@ def run_agent(
                         "call_forced_preview_1",
                     )
                 direct = _last_tool_obs_for_user(messages)
+                # Never serve YouTube description/promo as a transcript/summary
+                if direct:
+                    try:
+                        from agent_tools import _looks_like_youtube_description
+                        if _looks_like_youtube_description(direct):
+                            print(
+                                "[AGENT] DIRECT_OBS looks like YT description "
+                                f"(chars={len(direct)}) — discarding"
+                            )
+                            logging.getLogger("mojo.agent").info(
+                                "DIRECT_OBS_DROP description chars=%s", len(direct)
+                            )
+                            direct = None
+                    except Exception as _e:
+                        print(f"[AGENT] description gate skip: {_e}")
                 if direct and len(direct) >= 20:
                     print(
                         "[AGENT] force transcribe/preview → direct OBS reply "
