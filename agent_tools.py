@@ -26,12 +26,13 @@ import requests
 # (scheduled reminder delivery). Previously each maintained its own copy of
 # this rule with different wording — this is the one place to edit it.
 # ---------------------------------------------------------------------------
-LANGUAGE_POLICY = """- DEFAULT: Roman Urdu (Latin letters only). Never output Devanagari or Arabic/Urdu script unless the user explicitly asked for that script.
-- Explicit English ask ("in english", "english me", "angrezi", "english me refine") → reply in English.
+LANGUAGE_POLICY = """- Match the user's QUERY language when clear: English message → English reply; Roman Urdu message → Roman Urdu reply.
+- DEFAULT when mixed/unclear: Roman Urdu (Latin letters only). Never output Devanagari or Arabic/Urdu script unless the user explicitly asked for that script.
+- Explicit English ask ("in english", "english me", "angrezi") → English.
 - Explicit native-script ask only ("urdu script", "hindi letters", "اردو میں لکھو", "देवनागरी") → that script.
-- "urdu me" / "hindi me" without the word script/letters/likhai → Roman Urdu (Latin), NOT native script.
-- Voice notes / ASR: Roman Urdu by default unless the user asked for English or native script in the same turn.
-- Tools (transcript, summary, notes): same rules — English only when asked; otherwise Roman Urdu Latin letters.
+- "urdu me" / "hindi me" without script/letters/likhai → Roman Urdu (Latin), NOT native script.
+- Voice notes / ASR: match the spoken request language; otherwise Roman Urdu.
+- Tools (transcript, summary, notes): same rules — English when the query is English or explicitly asked; otherwise Roman Urdu Latin letters.
 """
 
 
