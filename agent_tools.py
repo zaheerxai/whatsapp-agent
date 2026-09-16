@@ -1787,24 +1787,29 @@ def _looks_like_youtube_description(text: str) -> bool:
 def _render_speech_transcript(
     raw: str,
     out_lang: str = "auto",
-    hard_cap: int = 7000,
+    hard_cap: int = 14000,
 ) -> str:
     """
     mode=transcript from real speech — NO free-form rewrite.
 
     Free-form refine was replacing Supadata's 20k Hindi speech with the
-    YouTube description (2591 chars). Only clean / transliterate / translate.
+    YouTube description. Only clean / transliterate / translate, covering
+    the full lecture (not first+last chunks only).
     """
     cleaned = _clean_raw_transcript(raw or "")
     if not cleaned or _looks_like_youtube_description(cleaned):
         return ""
 
-    chunks: List[str] = []
-    step = 4500
-    for i in range(0, len(cleaned), step):
-        chunks.append(cleaned[i : i + step])
-    if len(chunks) > 3:
-        chunks = chunks[:2] + [chunks[-1]]
+    # Cover full speech. ~20k Hindi → ~5 chunks of 4k.
+    step = 4000
+    chunks = [cleaned[i : i + step] for i in range(0, len(cleaned), step)]
+    # Soft latency ceiling: max 6 chunks (~24k raw)
+    if len(chunks) > 6:
+        chunks = chunks[:4] + chunks[-2:]
+        print(
+            f"[transcribe_video] speech_render trimmed to 6 chunks "
+            f"(raw was {len(cleaned)} chars)"
+        )
 
     if _client_ai is None or not _MODEL_NAME:
         return cleaned[:hard_cap]
@@ -1813,14 +1818,15 @@ def _render_speech_transcript(
     if want_en:
         sys = (
             "You are a literal translator. Translate the SPOKEN transcript into "
-            "clear English. Keep meaning and order. Do NOT summarize. "
+            "clear English. Keep meaning and order. Do NOT summarize or skip sections. "
             "Do NOT add course ads, subscribe CTAs, links, or 'Best regards'. "
             "Output ONLY the translation of the speech below."
         )
     else:
         sys = (
-            "Transliterate / keep the SPOKEN transcript in Roman Urdu (Latin letters). "
-            "If already Latin, clean lightly. Do NOT summarize. "
+            "Transliterate the SPOKEN transcript into Roman Urdu (Latin letters only). "
+            "Keep full content and order — do NOT summarize or skip sections. "
+            "If already Latin, clean lightly. "
             "Do NOT add course ads, subscribe CTAs, links, or 'Best regards'. "
             "Output ONLY the speech text."
         )
@@ -1838,7 +1844,7 @@ def _render_speech_transcript(
                     },
                 ],
                 temperature=0.1,
-                max_tokens=1800,
+                max_tokens=2200,
             )
             piece = (resp.choices[0].message.content or "").strip()
         except Exception as e:

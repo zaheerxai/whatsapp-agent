@@ -2,7 +2,8 @@
 agent_loop.py — ReAct-style tool-calling agent for Mojo.
 
 Replaces the old single-shot get_ai_response + keyword reminder routing.
-Hardened for Groq / Gemini tool-call format quirks.
+Hardened for Groq / Gemini too
+l-call format quirks.
 """
 
 from __future__ import annotations
@@ -41,8 +42,8 @@ MAX_TOOL_STEPS = 3  # was 5 — each step is a full Groq call + tool schemas
 MAX_HISTORY_MSGS = 12
 MAX_MSG_CHARS = 600
 MAX_OBS_CHARS = 3500
-# Transcript tool now returns a compact refined summary (~2k), not raw 50k text
-MAX_OBS_CHARS_TRANSCRIPT = 3500
+# Full lecture transcript delivery (was 3500 → cut mid-sentence after speech_render)
+MAX_OBS_CHARS_TRANSCRIPT = 14000
 # Cap completion size — WhatsApp replies are short; unbounded drafts burn quota
 MAX_COMPLETION_TOKENS = 1024
 MAX_COMPLETION_TOKENS_SHORT = 512
@@ -488,8 +489,13 @@ def _last_tool_obs_for_user(messages: List[dict], max_len: int = 3500) -> Option
         obs = obs.strip()
         if not obs:
             continue
-        if len(obs) > max_len:
-            obs = obs[:max_len].rstrip() + "…"
+        # Auto-raise cap when this OBS is a full transcript (not a short summary)
+        use_len = max_len
+        if max_len <= 3500 and len(obs) > 3500:
+            # Prefer full speech when available (transcribe_video mode=transcript)
+            use_len = max(max_len, MAX_OBS_CHARS_TRANSCRIPT)
+        if len(obs) > use_len:
+            obs = obs[:use_len].rstrip() + "…"
         return obs
     return None
 
