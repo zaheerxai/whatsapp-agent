@@ -2022,8 +2022,11 @@ def _refine_transcript_compact(
             max_tok = min(4500, max(700, int(tw * 1.8)))
             format_rule = (
                 f"MODE=summary. Aim for about {tw} words (not fewer than {int(tw*0.7)}). "
-                "Use clear section headings if useful. Cover the whole video fairly. "
-                "ONE complete message — do not say you will send more parts. "
+                "Structure with short section titles on their own lines, blank line between "
+                "sections, and '- ' bullets. "
+                "WhatsApp formatting only: use *bold* with single asterisks, never **double**. "
+                "No markdown headers (#), no tables, no --- rules. "
+                "ONE complete message — do not cut mid-sentence or promise more parts. "
                 f"Hard limit: under {hard_cap} characters. No code fences."
             )
         else:

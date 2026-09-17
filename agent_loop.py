@@ -642,86 +642,118 @@ def _needs_format_guide(
 
 
 def _format_whatsapp_reply(text: str) -> str:
-    """Post-synthesis sanitizer: GFM → WhatsApp native, strip illegal Markdown.
+    """Post-synthesis sanitizer: GFM → clean WhatsApp-native text.
 
-    - **bold** / __bold__ → *bold*
-    - strip ATX headers (###), pipe tables, bare HTML tags
-    - normalize * bold * spacing → *bold*
-    - hard-cap numbered list items at 5 (extra items flattened to plain lines)
-    - collapse 3+ blank lines
-    Safe on plain text; never raises.
+    WhatsApp supports: *bold*  _italic_  ~strike~  ```mono```
+    Does NOT support: ** **, ## headers, pipe tables, nested emphasis.
     """
     if not text or not isinstance(text, str):
         return text or ""
     t = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Strip fenced code language tags but keep content (WhatsApp has no lang)
+    # Horizontal rules / section dividers → blank line
+    t = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", t)
+    t = re.sub(r"\s*---+\s*", "\n\n", t)
+
+    # Strip fenced code language tags
     t = re.sub(r"```[\w+-]*\n", "```\n", t)
 
-    # GFM bold/italic → WhatsApp single-marker (non-greedy, no cross-line for **)
-    # Do ** before * so we don't leave stray asterisks
-    t = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"*\1*", t, flags=re.S)
-    t = re.sub(r"__(?!\s)(.+?)(?<!\s)__", r"_\1_", t, flags=re.S)
-    # Stray double markers left as singles
+    # Convert **bold** / __bold__ → *bold* (repeat until stable for nested leftovers)
+    for _ in range(3):
+        t2_ = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"*\1*", t, flags=re.S)
+        t2_ = re.sub(r"__(?!\s)(.+?)(?<!\s)__", r"_\1_", t2_, flags=re.S)
+        if t2_ == t:
+            break
+        t = t2_
+    # Stray leftover multi-asterisks
+    t = re.sub(r"\*{3,}", "*", t)
+    t = re.sub(r"_{3,}", "_", t)
     t = t.replace("****", "").replace("____", "")
 
-    # ATX headers → plain bold-ish line (drop # marks)
+    # ATX headers → bold line on its own
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"*\1*", t)
 
-    # Pipe tables → plain lines (drop separator rows, strip pipes)
+    # Glue fix: *Section**3.1 Title* → *Section*\n\n*3.1 Title*
+    t = re.sub(r"\*([^*\n]{2,80})\*\*+(\d+\.\d+[^*\n]*)\*", r"*\1*\n\n*\2*", t)
+    t = re.sub(r"\*([^*\n]{2,80})\*\*+([A-Z][^*\n]{2,60})\*", r"*\1*\n\n*\2*", t)
+    # *text**next without space
+    t = re.sub(r"\*([^*\n]+)\*\*([A-Za-z0-9])", r"*\1*\n\n*\2", t)
+
+    # Ensure blank line before numbered section headings like *3.1 Foo*
+    t = re.sub(r"(?<!\n)\n?(\*\d+\.\d+[^*\n]*\*)", r"\n\n\1", t)
+    t = re.sub(r"(?<!\n)\n?(\*\d+\.\s+[^*\n]+\*)", r"\n\n\1", t)
+    # "sentence.*Section title*" glued → break
+    t = re.sub(
+        r"([.!?])\*([A-Z0-9][^*\n]{2,60})\*",
+        r"\1\n\n*\2*",
+        t,
+    )
+
+    # word.*N. Section* (missing space after period)
+    t = re.sub(
+        r"(\w)\.(\*\d+[^*\n]*\*)",
+        r"\1.\n\n\2",
+        t,
+    )
+
+    # Pipe tables → plain lines
     lines_out: List[str] = []
     for line in t.split("\n"):
         s = line.strip()
         if re.match(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$", s):
-            continue  # markdown table separator
-        if s.count("|") >= 2 and s.startswith("|"):
+            continue
+        if s.count("|") >= 2 and (s.startswith("|") or s.endswith("|")):
             cells = [c.strip() for c in s.strip("|").split("|")]
             lines_out.append(" · ".join(c for c in cells if c))
             continue
         lines_out.append(line)
     t = "\n".join(lines_out)
 
-    # Bare HTML tags (rare from models)
-    t = re.sub(r"</?(?:b|strong|i|em|u|s|strike|code|pre|p|br|div|span)[^>]*>", "", t, flags=re.I)
-
-    # Labeled markdown links [label](url) → label (url)
+    # Bare HTML
+    t = re.sub(
+        r"</?(?:b|strong|i|em|u|s|strike|code|pre|p|br|div|span)[^>]*>",
+        "",
+        t,
+        flags=re.I,
+    )
     t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", t)
 
-    # Normalize spacing inside WhatsApp markers: * bold * → *bold*
+    # Tighten * bold * → *bold* (same-line only)
     def _tight(m: re.Match) -> str:
-        mark = m.group(1)
-        body = m.group(2).strip()
-        return f"{mark}{body}{mark}"
+        return f"{m.group(1)}{m.group(2).strip()}{m.group(1)}"
 
-    t = re.sub(r"([*_~])\s+(.+?)\s+\1", _tight, t)
+    t = re.sub(r"([*_~])\s+([^*\n_~]+?)\s+\1", _tight, t)
 
-    # Hard-cap numbered lists at 5 items (per contiguous block)
+    # Bullet lines starting with · mid-paragraph → own line with dash
+    t = re.sub(r"(?<!\n)·\s+", "\n- ", t)
+
+    # Numbered list soft-cap (keep more for long summaries — 12 not 5)
     capped: List[str] = []
     num_count = 0
     for line in t.split("\n"):
         m = re.match(r"^(\s*)(\d{1,2})\.\s+(.*)$", line)
         if m:
             num_count += 1
-            if num_count > 5:
-                # Flatten overflow to a plain dash line (still readable, not a 12-step essay)
+            if num_count > 12:
                 capped.append(f"{m.group(1)}- {m.group(3)}")
             else:
-                # Re-number sequentially 1..5 for cleanliness
                 capped.append(f"{m.group(1)}{num_count}. {m.group(3)}")
         else:
             if not line.strip():
-                num_count = 0  # blank line ends the list block
+                num_count = 0
             elif not re.match(r"^\s*([-*]|\d{1,2}\.)\s+", line):
                 num_count = 0
             capped.append(line)
     t = "\n".join(capped)
 
-    # Cap bullet density lightly: if >8 bullet lines in a row, leave as-is
-    # (formatter focuses on numbered-list fight with browse rule)
-
-    # Collapse excessive blank lines
+    # Collapse 3+ blank lines → 2; trim trailing spaces per line
+    t = "\n".join(ln.rstrip() for ln in t.split("\n"))
     t = re.sub(r"\n{3,}", "\n\n", t)
+    # Drop trailing ellipsis-only cut markers that look unfinished mid-word
+    t = re.sub(r"(\w)\.\.\.\s*$", r"\1.", t)
     return t.strip()
+
+
 
 
 def _reply(text: str) -> str:

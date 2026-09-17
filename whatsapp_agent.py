@@ -2540,6 +2540,60 @@ def urls_from_recent_history(chat_id, limit=12) -> list:
 
 
 # 4. WHATSAPP MESSAGE HANDLER (Using Decorators)
+
+# Dedup: WhatsApp sometimes delivers the same MessageEv twice nearly simultaneously.
+# Key = chat|msg_id (or chat|sender|text_hash fallback). TTL ~90s.
+_RECENT_MSG_IDS: dict = {}
+_RECENT_MSG_LOCK = threading.Lock()
+_RECENT_MSG_TTL = 90.0
+
+
+def _message_dedup_key(message) -> str:
+    """Stable key for an inbound WhatsApp message."""
+    try:
+        info = message.Info
+        mid = str(getattr(info, "ID", None) or getattr(info, "Id", None) or "")
+        src = getattr(info, "MessageSource", None)
+        chat = ""
+        sender = ""
+        if src is not None:
+            cj = getattr(src, "Chat", None)
+            chat = str(getattr(cj, "User", "") or "") + "@" + str(getattr(cj, "Server", "") or "")
+            sj = getattr(src, "Sender", None) or getattr(src, "sender", None)
+            sender = str(getattr(sj, "User", "") or "")
+        if mid:
+            return f"{chat}|{mid}"
+        # Fallback: short hash of text + sender + second bucket
+        import time as _t
+        body = ""
+        try:
+            body = (message.Message.conversation
+                    or (message.Message.extendedTextMessage.text
+                        if message.Message.extendedTextMessage else "")
+                    or "")[:200]
+        except Exception:
+            body = ""
+        return f"{chat}|{sender}|{hash(body)}|{int(_t.time()) // 5}"
+    except Exception:
+        return ""
+
+
+def _should_skip_duplicate(message) -> bool:
+    key = _message_dedup_key(message)
+    if not key:
+        return False
+    now = time.time()
+    with _RECENT_MSG_LOCK:
+        # purge old
+        dead = [k for k, exp in _RECENT_MSG_IDS.items() if exp < now]
+        for k in dead:
+            _RECENT_MSG_IDS.pop(k, None)
+        if key in _RECENT_MSG_IDS:
+            return True
+        _RECENT_MSG_IDS[key] = now + _RECENT_MSG_TTL
+    return False
+
+
 @client.event(MessageEv)
 def on_message(client: NewClient, message: MessageEv):
     # Instantly hand off the heavy lifting to a background thread — daemon=True so
@@ -2565,6 +2619,16 @@ def _jid_server(jid):
 
 def process_message(client, message):
     try:
+        if _should_skip_duplicate(message):
+            try:
+                import logging as _lg
+                _lg.getLogger("mojo").info(
+                    "DEDUP skip duplicate MessageEv key=%s",
+                    _message_dedup_key(message)[:80],
+                )
+            except Exception:
+                pass
+            return
         _process_message_inner(client, message)
     except Exception as e:
         import logging as _lg
