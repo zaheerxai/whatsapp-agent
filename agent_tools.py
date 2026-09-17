@@ -1944,6 +1944,141 @@ def _has_arabic_or_devanagari(text: str) -> bool:
     return False
 
 
+
+# ---------------------------------------------------------------------------
+# Adaptive length + continuation (never ship mid-sentence cuts)
+# ---------------------------------------------------------------------------
+_THOROUGH_MARKERS = frozenset({
+    "break down", "breakdown", "har cheez", "har baat", "poora", "pura",
+    "in depth", "indepth", "in-depth", "detailed", "detail me", "detail mein",
+    "sab kuch", "everything", "complete", "full summary", "deep dive",
+    "step by step", "step-by-step", "point by point", "har point",
+    "thorough", "comprehensive", "exhaustive", "lengthy", "long summary",
+})
+
+
+def _request_is_thorough(user_request: str) -> bool:
+    t = (user_request or "").lower()
+    return any(m in t for m in _THOROUGH_MARKERS)
+
+
+def _looks_incomplete(text: str) -> bool:
+    """Heuristic: response likely truncated mid-thought."""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if s.endswith(("…", "...", "—", "-")):
+        return True
+    # ends mid-word-ish or mid-sentence without terminal punctuation
+    if s[-1] not in ".!?;:)]}”\"'…":
+        # allow ending on bullet or section title
+        last_line = s.split("\n")[-1].strip()
+        if last_line.startswith(("*", "-", "•")) and len(last_line) < 80:
+            return False
+        if last_line.startswith("*") and last_line.endswith("*") and len(last_line) < 60:
+            return False
+        return True
+    return False
+
+
+def _trim_to_sentence(text: str, limit: int) -> str:
+    """Hard length limit but never mid-word; prefer last sentence end."""
+    if not text or len(text) <= limit:
+        return text or ""
+    chunk = text[:limit]
+    # prefer last paragraph break
+    for sep in ("\n\n", "\n", ". ", "? ", "! ", "। "):
+        i = chunk.rfind(sep)
+        if i >= int(limit * 0.55):
+            return chunk[: i + len(sep)].rstrip()
+    # last space
+    i = chunk.rfind(" ")
+    if i >= int(limit * 0.5):
+        return chunk[:i].rstrip() + "…"
+    return chunk.rstrip() + "…"
+
+
+def _llm_complete_until_done(
+    messages: list,
+    max_tokens: int,
+    *,
+    max_continuations: int = 3,
+    temperature: float = 0.2,
+) -> str:
+    """
+    Generate with adaptive continuation when finish_reason=length AND
+    the text looks incomplete. Avoids spurious continues on short complete answers.
+    """
+    if _client_ai is None or not _MODEL_NAME:
+        return ""
+
+    parts: list[str] = []
+    working = list(messages)
+    budget = max(256, int(max_tokens))
+
+    for round_i in range(max_continuations + 1):
+        last_err = None
+        resp = None
+        for attempt in range(4):
+            try:
+                resp = _client_ai.chat.completions.create(
+                    model=_MODEL_NAME,
+                    messages=working,
+                    temperature=temperature,
+                    max_tokens=budget,
+                )
+                break
+            except Exception as e:
+                last_err = e
+                err = str(e).lower()
+                if attempt < 3 and ("429" in err or "rate" in err or "too many" in err):
+                    time.sleep(1.4 * (attempt + 1))
+                    continue
+                raise
+        if resp is None:
+            raise RuntimeError(str(last_err) if last_err else "llm failed")
+
+        choice = resp.choices[0]
+        piece = (choice.message.content or "").strip()
+        finish = (getattr(choice, "finish_reason", None) or "").lower()
+        if piece:
+            parts.append(piece)
+
+        full = "\n".join(parts).strip() if len(parts) > 1 else (parts[0] if parts else "")
+        # Stop if natural end or looks complete
+        if finish in ("stop", "end_turn", "eos_token", ""):
+            if not _looks_incomplete(full):
+                return full
+            # finish=stop but incomplete punctuation — still accept if long enough
+            if len(full) > 400 and finish == "stop":
+                return full
+        if finish == "length" or _looks_incomplete(full):
+            if round_i >= max_continuations:
+                break
+            # Continue from truncation
+            working = list(messages) + [
+                {"role": "assistant", "content": full},
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue exactly from where you stopped. "
+                        "Do not repeat prior text. Finish all remaining points. "
+                        "Same language and formatting."
+                    ),
+                },
+            ]
+            # slightly smaller budget per continuation
+            budget = max(400, int(budget * 0.85))
+            print(
+                f"[llm_complete] continue round={round_i+1} "
+                f"finish={finish} so_far={len(full)}"
+            )
+            continue
+        return full
+
+    return "\n".join(parts).strip()
+
+
 def _refine_transcript_compact(
     raw: str,
     title: str = "",
@@ -1953,11 +2088,11 @@ def _refine_transcript_compact(
     user_request: str = "",
 ) -> str:
     """
-    One LLM pass → WhatsApp-ready text matching the user's ask.
+    LLM pass → WhatsApp-ready text matching the user ask.
 
-    Honours user_request for length, depth, language, and form (summary /
-    bullets / full transcript). Never returns Devanagari/Arabic when Latin
-    output is required. Retries briefly on Groq 429.
+    Adaptive max_tokens from target_words / thorough markers.
+    Continues on finish_reason=length when incomplete so replies are not cut off.
+    Never returns Devanagari/Arabic when Latin is required.
     """
     if not raw or not raw.strip():
         return raw or ""
@@ -1966,13 +2101,10 @@ def _refine_transcript_compact(
     if mode not in ("transcript", "summary", "key_points"):
         mode = "transcript"
     out_lang = (output_lang or "auto").strip().lower()
-    # Infer lang from user_request when not explicit
     if out_lang in ("auto", "") and user_request:
         try:
             from language_policy import detect_output_lang
             out_lang = detect_output_lang(user_request)
-            if out_lang == "roman_urdu":
-                out_lang = "roman_urdu"
         except Exception:
             out_lang = "roman_urdu"
 
@@ -1984,6 +2116,9 @@ def _refine_transcript_compact(
             tw = None
         if tw is not None:
             tw = max(80, min(2500, tw))
+    # No numeric target but thorough ask → treat as long summary
+    if tw is None and mode == "summary" and _request_is_thorough(user_request):
+        tw = 1000
 
     cleaned = _clean_raw_transcript(raw)
     if _client_ai is None or not _MODEL_NAME:
@@ -2019,44 +2154,47 @@ def _refine_transcript_compact(
 
     if mode == "summary":
         if tw:
-            hard_cap = min(12000, max(1400, tw * 6))
-            max_tok = min(4500, max(700, int(tw * 1.8)))
+            hard_cap = min(14000, max(2000, tw * 7))
+            max_tok = min(5000, max(1200, int(tw * 2.0)))
             format_rule = (
-                f"MODE=summary. Aim for about {tw} words (not fewer than {int(tw * 0.7)}). "
-                "Short section titles on their own lines, blank line between sections, "
-                "'- ' bullets. WhatsApp only: *bold* single asterisks, never **. "
-                "No # headers, no tables, no ---. ONE complete message — finish fully."
+                f"MODE=summary. Aim for about {tw} words (not under {int(tw * 0.65)}). "
+                "Cover EVERY major point from the transcript — user asked for depth. "
+                "Section titles on their own lines, blank lines between sections, '- ' bullets. "
+                "WhatsApp: *bold* single asterisks only, never **. No # headers, no tables, no ---. "
+                "ONE complete message — finish every section; do not stop mid-sentence."
             )
         else:
-            hard_cap, max_tok = 1400, 600
+            hard_cap, max_tok = 2200, 900
             format_rule = (
-                "MODE=summary. 1 line title + 5–10 short lines covering the video. "
-                "WhatsApp *bold* only. Under 1200 characters."
+                "MODE=summary. Title + clear coverage of main points (8–15 short lines or "
+                "short paragraphs). WhatsApp *bold* only. Finish completely."
             )
     elif mode == "key_points":
-        hard_cap, max_tok = 1600, 700
+        hard_cap, max_tok = 2000, 900
         format_rule = (
-            "MODE=key_points. Title + 8–15 '- ' bullets. WhatsApp *bold* only. "
-            "Under 1400 characters."
+            "MODE=key_points. Title + 8–15 '- ' bullets covering all main ideas. "
+            "WhatsApp *bold* only. Finish the full list."
         )
     else:
-        hard_cap, max_tok = 8000, 3500
+        hard_cap, max_tok = 12000, 4000
         format_rule = (
             "MODE=transcript. Clean spoken content as readable paragraphs. "
-            "Faithful, full coverage. WhatsApp *bold* sparingly. No code fences."
+            "Faithful full coverage. Finish the whole talk."
         )
 
     req_block = ""
     if (user_request or "").strip():
         req_block = (
-            "USER ASK (follow this for length, depth, language, and shape):\n"
-            f"{user_request.strip()[:500]}\n\n"
+            "USER ASK (length, depth, language, shape — follow closely):\n"
+            f"{user_request.strip()[:600]}\n\n"
         )
 
     system = (
         "You turn a raw video transcript into a WhatsApp reply.\n"
         "CRITICAL: Use ONLY facts from the Raw transcript. Do not invent.\n"
-        "Follow the USER ASK when provided (word count, depth, language).\n"
+        "Follow the USER ASK when provided.\n"
+        "Never end mid-sentence. If you are running long, still close the current point "
+        "with a complete sentence before stopping.\n"
         f"{script_rule}\n"
         f"{format_rule}"
     )
@@ -2067,78 +2205,58 @@ def _refine_transcript_compact(
         + cleaned
     )
 
-    def _call(messages, tokens):
-        last_err = None
-        for attempt in range(4):
-            try:
-                resp = _client_ai.chat.completions.create(
-                    model=_MODEL_NAME,
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=tokens,
-                )
-                return (resp.choices[0].message.content or "").strip()
-            except Exception as e:
-                last_err = e
-                err = str(e).lower()
-                if attempt < 3 and ("429" in err or "rate" in err or "too many" in err):
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                raise
-        raise RuntimeError(str(last_err) if last_err else "refine failed")
-
     try:
-        out = _call(
+        out = _llm_complete_until_done(
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             max_tok,
+            max_continuations=3,
+            temperature=0.2,
         )
         if not out:
             raise RuntimeError("empty refine")
 
-        # Latin required → never ship Devanagari/Arabic
         if want_latin and _has_arabic_or_devanagari(out):
             print("[transcribe_video] refine non-Latin — forced transliterate pass")
-            out2 = _call(
+            out2 = _llm_complete_until_done(
                 [
                     {
                         "role": "system",
                         "content": (
                             "Transliterate into Roman Urdu (Latin letters only). "
-                            "Keep full meaning and structure. No Devanagari/Arabic."
+                            "Keep full meaning and structure. No Devanagari/Arabic. "
+                            "Finish completely."
                         ),
                     },
                     {"role": "user", "content": out[:12000]},
                 ],
                 max_tok,
+                max_continuations=2,
             )
             if out2 and not _has_arabic_or_devanagari(out2):
                 out = out2
             else:
-                # Do not return native script as the user-facing summary
                 return (
                     "Summary source Hindi/Urdu script me tha; Roman/English convert "
-                    "rate-limit ki wajah se complete nahi hua. 30–60 sec baad dobara "
-                    "bhejo: summarize karo roman me / in english."
+                    "abhi complete nahi hua. 30–60 sec baad dobara bhejo."
                 )
 
         if _looks_like_youtube_description(out):
             raise RuntimeError("refine_still_description")
 
         if len(out) > hard_cap:
-            out = out[:hard_cap].rstrip() + "…"
+            out = _trim_to_sentence(out, hard_cap)
         return out
     except Exception as e:
         print(f"[transcribe_video] refine failed: {e}")
-        # Never dump raw Devanagari as a "summary" when Latin is required
         if want_latin and _has_arabic_or_devanagari(cleaned):
             return (
                 "Transcript mil gaya lekin summary convert abhi fail/rate-limit. "
                 "Thori der baad dobara try karo."
             )
-        return cleaned[: min(hard_cap, 3000)] + ("…" if len(cleaned) > 3000 else "")
+        return _trim_to_sentence(cleaned, min(hard_cap if 'hard_cap' in dir() else 3000, 3000))
 
 
 

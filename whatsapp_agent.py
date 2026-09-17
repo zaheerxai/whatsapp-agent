@@ -2617,6 +2617,36 @@ def _jid_server(jid):
         return ""
     return str(getattr(jid, "Server", getattr(jid, "server", "")) or "").strip().lower()
 
+
+def _split_whatsapp_chunks(text: str, limit: int = 3500) -> list:
+    """Split long replies on paragraph boundaries so WhatsApp never truncates."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            parts.append(rest)
+            break
+        chunk = rest[:limit]
+        cut = -1
+        for sep in ("\n\n", "\n", ". ", "? ", "! "):
+            i = chunk.rfind(sep)
+            if i >= int(limit * 0.5):
+                cut = i + len(sep)
+                break
+        if cut < 0:
+            cut = chunk.rfind(" ")
+            if cut < int(limit * 0.4):
+                cut = limit
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    return [p for p in parts if p]
+
+
 def process_message(client, message):
     try:
         if _should_skip_duplicate(message):
@@ -3287,7 +3317,22 @@ def _process_message_inner(client, message):
     except Exception:
         pass
 
-    client.reply_message(ai_answer, message, mentions_are_lids=is_lid_mode)
+    chunks = _split_whatsapp_chunks(ai_answer, limit=3500)
+    if not chunks:
+        chunks = [ai_answer]
+    # First chunk as reply (keeps quote context); rest as follow-up messages
+    client.reply_message(chunks[0], message, mentions_are_lids=is_lid_mode)
+    if len(chunks) > 1:
+        try:
+            chat_jid = message.Info.MessageSource.Chat
+            for i, part in enumerate(chunks[1:], start=2):
+                client.send_message(
+                    chat_jid,
+                    f"(part {i}/{len(chunks)})\n{part}",
+                    mentions_are_lids=is_lid_mode,
+                )
+        except Exception as _se:
+            log.warning("follow-up chunk send failed: %s", _se)
 
 
 # 5. START THE BOT

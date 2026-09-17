@@ -1454,6 +1454,17 @@ def run_agent(
                     "timestamps": False,
                     "user_request": (_intent_text or "")[:500],
                 }
+                if not tw and spoken_mode == "summary":
+                    _il = (_intent_low or "")
+                    if any(
+                        m in _il
+                        for m in (
+                            "break down", "breakdown", "har cheez", "in depth",
+                            "indepth", "detailed", "sab kuch", "poora", "thorough",
+                            "point by point", "step by step",
+                        )
+                    ):
+                        tw = 1000
                 if tw and spoken_mode in ("summary", "transcript", "key_points"):
                     tool_args["target_words"] = tw
                 print(
