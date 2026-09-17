@@ -548,6 +548,187 @@ def init_agent(
     _get_tzinfo = get_tzinfo
 
 
+
+# ---------------------------------------------------------------------------
+# WhatsApp reply formatting (native syntax only)
+# ---------------------------------------------------------------------------
+# Long guide is injected only when the turn is likely structured (list /
+# transcript / summary / tool OBS). Greetings and pure chat keep the short
+# system prompt to save tokens on every Groq turn.
+
+_WHATSAPP_FORMAT_GUIDE = """=== WHATSAPP RESPONSE FORMATTING (USE WITH AWARENESS) ===
+WhatsApp supports a small native style set. Use it only when it makes the reply clearer, more scannable, or more professional. Never decorate every sentence. Prefer plain text for short casual replies.
+
+Supported syntax (exact — no spaces between marker and text):
+- *bold* → highlight the single most important word/phrase (names, times, status, prices, key answer).
+- _italic_ → soft emphasis, titles, gentle nuance, or a short aside.
+- ~strikethrough~ → corrections, old price / superseded info, light sarcasm.
+- `inline code` (single backtick) → short codes, IDs, commands, order numbers, file names.
+- ```monospace block``` (three backticks on their own lines or around a short block) → multi-line code, aligned data, or a short pasted snippet that must keep spacing.
+- Bulleted list: start a line with "- " or "* " (hyphen/asterisk + space). Use for 2–5 parallel items.
+- Numbered list: start a line with "1. " "2. " etc. Use only for real sequential steps. Hard max 5 items.
+- Block quote: start a line with "> " to set off a short quoted line or key takeaway.
+- Combinations work when nested cleanly, e.g. *_bold italic_*, *~strike bold~*. Close in reverse order of opening. Do not over-nest.
+- Line breaks: one blank line between short paragraphs for readability. Avoid huge gaps.
+
+Smart usage rules:
+- Default = plain text. Add style only when it earns its place (emphasis, structure, or technical clarity).
+- One primary emphasis per short reply is usually enough (*bold* the answer or the deadline).
+- Lists: prefer 2–5 tight bullets over a dense paragraph. Never turn a 1-line answer into a list.
+- For Roman Urdu / mixed replies the same markers work; keep markers ASCII and text natural.
+- Never use Markdown headers (###), tables, labeled links [text](url), or HTML. WhatsApp does not render them.
+- Do not wrap entire replies in monospace or code fences. Do not promise "part 1" or multi-message dumps.
+- Transcript / long tool output: present cleanly; light *key points* or a short - list is fine if it improves scanability. Still one WhatsApp message.
+- Models: emit WhatsApp *bold* / _italic_ — NEVER GitHub-flavored **bold** or __italic__ (those show as literal asterisks on WhatsApp).
+- When in doubt, stay plain and short.
+"""
+
+# Cheap tokens that mean "this turn may need structure" (list/summary/transcript)
+_STRUCTURE_HINT_RE = re.compile(
+    r"\b("
+    r"list|bullet|steps?|summary|summarize|khulasa|key\s*points?|points?|"
+    r"transcript|transcribe|full\s*text|detail|details|compare|pros|cons|"
+    r"options?|features?|checklist|todo|plan|agenda|ingredients?|"
+    r"how\s+to|kaise|steps\s+to|numbered|points\s+mein"
+    r")\b",
+    re.I,
+)
+
+_GREETING_ONLY_RE = re.compile(
+    r"^[\s@]*(hi|hello|hey|salam|salaam|assalam|asalam|aoa|hola|yo|"
+    r"kya\s*haal|kais[ae]|hows?\s*it\s*going|what'?s\s*up|sup|"
+    r"good\s*(morning|evening|night|afternoon)|gm|gn|"
+    r"mojo|aimojo)[\s!?.❤️💛🙏]*$",
+    re.I,
+)
+
+
+def _needs_format_guide(
+    latest_user_text: Optional[str] = None,
+    force_urls: Optional[List[str]] = None,
+    extra_user_note: Optional[str] = None,
+) -> bool:
+    """True when the long format block is worth the tokens this turn."""
+    if force_urls:
+        return True
+    blob = " ".join(
+        x for x in ((latest_user_text or ""), (extra_user_note or "")) if x
+    ).strip()
+    if not blob:
+        return False
+    if _GREETING_ONLY_RE.match(blob.strip()):
+        return False
+    # Transcript / document / quoted long content already in the note
+    low = blob.lower()
+    if any(
+        m in low
+        for m in (
+            "[voice note transcript]",
+            "[cached recent voice",
+            "[quoted message]",
+            "transcript",
+            "summary",
+            "key points",
+            "key_points",
+        )
+    ):
+        return True
+    if _STRUCTURE_HINT_RE.search(blob):
+        return True
+    # Longer asks often benefit from light structure
+    if len(blob) > 180:
+        return True
+    return False
+
+
+def _format_whatsapp_reply(text: str) -> str:
+    """Post-synthesis sanitizer: GFM → WhatsApp native, strip illegal Markdown.
+
+    - **bold** / __bold__ → *bold*
+    - strip ATX headers (###), pipe tables, bare HTML tags
+    - normalize * bold * spacing → *bold*
+    - hard-cap numbered list items at 5 (extra items flattened to plain lines)
+    - collapse 3+ blank lines
+    Safe on plain text; never raises.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Strip fenced code language tags but keep content (WhatsApp has no lang)
+    t = re.sub(r"```[\w+-]*\n", "```\n", t)
+
+    # GFM bold/italic → WhatsApp single-marker (non-greedy, no cross-line for **)
+    # Do ** before * so we don't leave stray asterisks
+    t = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"*\1*", t, flags=re.S)
+    t = re.sub(r"__(?!\s)(.+?)(?<!\s)__", r"_\1_", t, flags=re.S)
+    # Stray double markers left as singles
+    t = t.replace("****", "").replace("____", "")
+
+    # ATX headers → plain bold-ish line (drop # marks)
+    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"*\1*", t)
+
+    # Pipe tables → plain lines (drop separator rows, strip pipes)
+    lines_out: List[str] = []
+    for line in t.split("\n"):
+        s = line.strip()
+        if re.match(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$", s):
+            continue  # markdown table separator
+        if s.count("|") >= 2 and s.startswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            lines_out.append(" · ".join(c for c in cells if c))
+            continue
+        lines_out.append(line)
+    t = "\n".join(lines_out)
+
+    # Bare HTML tags (rare from models)
+    t = re.sub(r"</?(?:b|strong|i|em|u|s|strike|code|pre|p|br|div|span)[^>]*>", "", t, flags=re.I)
+
+    # Labeled markdown links [label](url) → label (url)
+    t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", t)
+
+    # Normalize spacing inside WhatsApp markers: * bold * → *bold*
+    def _tight(m: re.Match) -> str:
+        mark = m.group(1)
+        body = m.group(2).strip()
+        return f"{mark}{body}{mark}"
+
+    t = re.sub(r"([*_~])\s+(.+?)\s+\1", _tight, t)
+
+    # Hard-cap numbered lists at 5 items (per contiguous block)
+    capped: List[str] = []
+    num_count = 0
+    for line in t.split("\n"):
+        m = re.match(r"^(\s*)(\d{1,2})\.\s+(.*)$", line)
+        if m:
+            num_count += 1
+            if num_count > 5:
+                # Flatten overflow to a plain dash line (still readable, not a 12-step essay)
+                capped.append(f"{m.group(1)}- {m.group(3)}")
+            else:
+                # Re-number sequentially 1..5 for cleanliness
+                capped.append(f"{m.group(1)}{num_count}. {m.group(3)}")
+        else:
+            if not line.strip():
+                num_count = 0  # blank line ends the list block
+            elif not re.match(r"^\s*([-*]|\d{1,2}\.)\s+", line):
+                num_count = 0
+            capped.append(line)
+    t = "\n".join(capped)
+
+    # Cap bullet density lightly: if >8 bullet lines in a row, leave as-is
+    # (formatter focuses on numbered-list fight with browse rule)
+
+    # Collapse excessive blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _reply(text: str) -> str:
+    """User-facing exit: always run the WhatsApp sanitizer."""
+    return _format_whatsapp_reply(text) if text else text
+
+
 def _build_system_prompt(
     chat_id: str,
     sender_id: str,
@@ -555,6 +736,7 @@ def _build_system_prompt(
     time_context: str,
     tag_block: str,
     memory_block: str,
+    include_format_guide: bool = False,
 ) -> str:
     env = (
         "ENVIRONMENT: GROUP CHAT.\n"
@@ -563,6 +745,13 @@ def _build_system_prompt(
         else "ENVIRONMENT: PRIVATE CHAT.\n"
         "BEHAVIOR: Professional, warm, helpful."
     )
+
+    # Short always-on style hint (cheap). Full guide only when structured reply likely.
+    style_hint = (
+        "STYLE: WhatsApp-native only — *bold* _italic_ ~strike~ `code`; "
+        "never **GFM** or ### headers. Short replies."
+    )
+    format_block = ("\n" + _WHATSAPP_FORMAT_GUIDE) if include_format_guide else ""
 
     return f"""You are Mojo, the official AI Assistant for Mojo AI Agency (Founder: Muhammad Zaheer).
 
@@ -587,7 +776,7 @@ def _build_system_prompt(
 7. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
 8. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
-10. When summarizing a website from browse_url: 2–3 plain lines max. Light formatting (bold key phrase or a short list) is fine; no numbered essay sections.
+10. When summarizing a website from browse_url: 2–3 plain lines max. Light formatting (*bold* key phrase or a short list of ≤5 items) is fine; no numbered essay sections.
 11. VOICE: If the turn includes "[Voice note transcript]" or "[Cached recent voice-note transcript]", answer from that text. For "kya bola" / "voice note me kya" / "what did I say" use the transcript — never browse a website and never claim no voice exists when a transcript is present.
 11b. NOTE DOWN vs IMAGE DESCRIBE:
    - note down / note karlo / onedrive me note / save this → note_down with FULL content WORD-FOR-WORD (quoted text, transcript, or image OCR). No "…" truncation. Summarize ONLY if user asked summary/khulasa/key points.
@@ -595,31 +784,8 @@ def _build_system_prompt(
    - Never claim "saved"/"noted" unless note_down returned success.
    - Do not ask "kis cheez ko note karna hai?" when quoted/OCR content is already present.
 
-=== WHATSAPP RESPONSE FORMATTING (USE WITH AWARENESS) ===
-WhatsApp supports a small native style set. Use it only when it makes the reply clearer, more scannable, or more professional. Never decorate every sentence. Prefer plain text for short casual replies.
-
-Supported syntax (exact — no spaces between marker and text):
-- *bold* → highlight the single most important word/phrase (names, times, status, prices, key answer).
-- _italic_ → soft emphasis, titles, gentle nuance, or a short aside.
-- ~strikethrough~ → corrections, old price / superseded info, light sarcasm.
-- `inline code` (single backtick) → short codes, IDs, commands, order numbers, file names.
-- ```monospace block``` (three backticks on their own lines or around a short block) → multi-line code, aligned data, or a short pasted snippet that must keep spacing.
-- Bulleted list: start a line with "- " or "* " (hyphen/asterisk + space). Use for 2–5 parallel items.
-- Numbered list: start a line with "1. " "2. " etc. Use only for real sequential steps.
-- Block quote: start a line with "> " to set off a short quoted line or key takeaway.
-- Combinations work when nested cleanly, e.g. *_bold italic_*, *~strike bold~*, _~italic strike~_. Close in reverse order of opening. Do not over-nest.
-- Line breaks: one blank line between short paragraphs for readability. Avoid huge gaps.
-
-Smart usage rules:
-- Default = plain text. Add style only when it earns its place (emphasis, structure, or technical clarity).
-- One primary emphasis per short reply is usually enough (*bold* the answer or the deadline).
-- Lists: prefer 2–5 tight bullets over a dense paragraph. Never turn a 1-line answer into a list.
-- For Roman Urdu / mixed replies the same markers work; keep markers ASCII and text natural.
-- Never use Markdown headers (###), tables, labeled links [text](url), or HTML. WhatsApp does not render them.
-- Do not wrap entire replies in monospace or code fences. Do not promise "part 1" or multi-message dumps.
-- Transcript / long tool output: present cleanly; light *key points* or a short - list is fine if it improves scanability. Still one WhatsApp message.
-- When in doubt, stay plain and short.
-
+{style_hint}
+{format_block}
 === URL / WEB FACTS (NO HALLUCINATION) ===
 12. Call browse_url ONLY when the CURRENT message has a URL (force_urls / priority note) OR the user clearly asks about a link/site ("details iska", "what is this about" with a link context, "fetch latest repo"). Never browse just because the last topic was a website.
 13. When the user says "fetch latest repo" after a GitHub profile link, call browse_url on that exact github.com/username URL.
@@ -635,7 +801,7 @@ Smart usage rules:
 16b. TRANSCRIPT REPLY (tool already refined for the chosen mode):
    - Present the tool result almost as-is in ONE WhatsApp message.
    - Do NOT wrap the whole reply in code fences, do NOT promise "part 1 / more messages later", do NOT re-translate into Devanagari.
-   - Light *emphasis* or a short - list is allowed if it improves readability.
+   - Light *emphasis* or a short - list (≤5) is allowed if it improves readability.
    - Match LANGUAGE POLICY (Roman Urdu if user wrote Roman Urdu).
 
 Agency knowledge is available via the search_knowledge tool (only when asked).
@@ -917,8 +1083,19 @@ def run_agent(
                     "When tagging, use exact @Name from this list."
                 )
 
+        _include_fmt = _needs_format_guide(
+            latest_user_text=latest_user_text,
+            force_urls=force_urls,
+            extra_user_note=extra_user_note,
+        )
         system = _build_system_prompt(
-            chat_id, sender_id, is_group, time_context, tag_block, memory_block
+            chat_id,
+            sender_id,
+            is_group,
+            time_context,
+            tag_block,
+            memory_block,
+            include_format_guide=_include_fmt,
         )
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
@@ -1006,12 +1183,12 @@ def run_agent(
                     logging.getLogger("mojo.agent").info(
                         "DIRECT_NOTE_DOWN chars=%s", len(body)
                     )
-                    return (
+                    return _reply(
                         f"OneDrive (MojoAgent) mein note save ho gaya ✅ "
                         f"({len(body)} chars)."
                     )
                 if "Permission denied" in obs_s:
-                    return "Note down sirf bot owner ke liye available hai."
+                    return _reply("Note down sirf bot owner ke liye available hai.")
                 # Soft failure: fingerprint only in history (never sliced body)
                 messages.append({
                     "role": "assistant",
@@ -1066,6 +1243,8 @@ def run_agent(
                     _intent_text = m.get("content") or ""
                     break
         _intent_low = _intent_text.lower()
+        tw = None
+        spoken_mode = None
 
         def _parse_target_words(text_low: str) -> Optional[int]:
             # 1.5k / 2k / 1.5K words
@@ -1212,7 +1391,7 @@ def run_agent(
                     logging.getLogger("mojo.agent").info(
                         "DIRECT_OBS_REPLY mode=preview/fallback chars=%s", len(direct)
                     )
-                    return direct
+                    return _reply(direct)
                 tools_for_next = None
 
             elif use_video and can_transcribe:
@@ -1274,6 +1453,52 @@ def run_agent(
                                 "DIRECT_OBS_DROP description chars=%s", len(direct)
                             )
                             direct = None
+                            # Retry once from raw speech cache (same source as good
+                            # short summaries) so we do not fall back to a truncated
+                            # free-form synthesis without transcript context.
+                            try:
+                                from agent_tools import (
+                                    _RAW_SPEECH_CACHE,
+                                    _extract_youtube_id,
+                                    _refine_transcript_compact,
+                                    _looks_like_youtube_description as _desc,
+                                )
+                                import time as _time
+                                _vid = _extract_youtube_id(primary_url)
+                                _raw = None
+                                if _vid and _vid in _RAW_SPEECH_CACHE:
+                                    _txt, _exp = _RAW_SPEECH_CACHE[_vid]
+                                    if _time.time() <= _exp and _txt and not _desc(_txt):
+                                        _raw = _txt
+                                if _raw:
+                                    _retry_lang = "en" if _lang == "en" else "auto"
+                                    _retry = _refine_transcript_compact(
+                                        _raw,
+                                        title="",
+                                        mode=spoken_mode or "summary",
+                                        target_words=tw,
+                                        output_lang=_retry_lang,
+                                    )
+                                    if _retry and not _desc(_retry) and len(_retry) >= 80:
+                                        direct = _retry
+                                        print(
+                                            f"[AGENT] summary retry from RAW_CACHE "
+                                            f"chars={len(direct)} tw={tw}"
+                                        )
+                                        logging.getLogger("mojo.agent").info(
+                                            "DIRECT_OBS_RETRY raw_cache chars=%s",
+                                            len(direct),
+                                        )
+                                        # Replace last tool OBS so synthesis sees good text
+                                        for _mi in range(len(messages) - 1, -1, -1):
+                                            if messages[_mi].get("role") == "tool":
+                                                messages[_mi]["content"] = (
+                                                    f"Source: raw_cache_retry | "
+                                                    f"mode={spoken_mode}\n\n{direct}"
+                                                )
+                                                break
+                            except Exception as _re:
+                                print(f"[AGENT] raw_cache summary retry failed: {_re}")
                     except Exception as _e:
                         print(f"[AGENT] description gate skip: {_e}")
                 if direct and len(direct) >= 20:
@@ -1286,13 +1511,14 @@ def run_agent(
                         spoken_mode,
                         len(direct),
                     )
-                    return direct
+                    return _reply(direct)
                 messages.append({
                     "role": "system",
                     "content": (
                         f"You already ran video tools on {primary_url} "
                         f"(mode={spoken_mode}). Answer from that tool result only in "
-                        "ONE message. Present the content almost as-is. If the tool "
+                        "ONE complete message (do not cut mid-sentence). "
+                        "Present the content almost as-is. If the tool "
                         "reported an error (private video, download failed, etc.), "
                         "relay that honestly in 1–2 lines. Do NOT invent a rate-limit / "
                         "request-limit / 'fetch nahi hua' / 'thodi der baad' excuse. "
@@ -1300,6 +1526,13 @@ def run_agent(
                     ),
                 })
                 tools_for_next = None  # synthesis only — no tool schema payload
+                # Long summary / transcript needs a higher completion budget
+                if tw and tw >= 400:
+                    # stashed for the model call below
+                    messages.append({
+                        "role": "system",
+                        "content": f"[INTERNAL] target_words={tw} long_reply=1",
+                    })
             elif use_video and can_preview:
                 # transcribe disabled but preview allowed
                 print(f"[AGENT] force link_preview (no transcribe) for: {primary_url}")
@@ -1308,7 +1541,7 @@ def run_agent(
                 )
                 direct = _last_tool_obs_for_user(messages)
                 if direct and len(direct) >= 20:
-                    return direct
+                    return _reply(direct)
                 tools_for_next = None
             elif use_video and not can_transcribe and not can_preview:
                 print(
@@ -1375,13 +1608,30 @@ def run_agent(
                 )
 
         # --- Agentic loop ---
+        # Long video summaries need far more than the default 1024-token cap
+        # (1.5k words ≈ 2k+ tokens; 1024 cut the previous reply mid-sentence).
+        _reply_max_tokens = MAX_COMPLETION_TOKENS
+        try:
+            if tw and int(tw) >= 400:
+                _reply_max_tokens = max(
+                    MAX_COMPLETION_TOKENS,
+                    min(4500, int(int(tw) * 1.8) + 200),
+                )
+            elif spoken_mode in ("transcript", "summary") and any(
+                (m.get("role") == "system" and "long_reply=1" in str(m.get("content") or ""))
+                for m in messages
+            ):
+                _reply_max_tokens = max(MAX_COMPLETION_TOKENS, 3000)
+        except Exception:
+            _reply_max_tokens = MAX_COMPLETION_TOKENS
+
         for step in range(MAX_TOOL_STEPS):
             try:
                 msg = _chat_completion(
                     messages,
                     tools=tools_for_next,
                     temperature=0.3,
-                    max_tokens=MAX_COMPLETION_TOKENS,
+                    max_tokens=_reply_max_tokens,
                 )
             except Exception as e:
                 print(f"[AGENT] completion failed at step {step}: {e}")
@@ -1392,7 +1642,7 @@ def run_agent(
                     logging.getLogger("mojo.agent").info(
                         "RETURNING_TOOL_OBS after completion failure (step=%s)", step
                     )
-                    return obs
+                    return _reply(obs)
                 if step > 0:
                     try:
                         final = _chat_completion(
@@ -1403,10 +1653,10 @@ def run_agent(
                         )
                         ans = (final.content or "").strip()
                         if ans and not _is_bad_post_tool_reply(ans):
-                            return ans
+                            return _reply(ans)
                     except Exception:
                         pass
-                return "Thori si technical issue aa gayi — ek second baad dobara try karo."
+                return _reply("Thori si technical issue aa gayi — ek second baad dobara try karo.")
 
             tool_calls = _normalize_tool_calls(msg)
 
@@ -1446,6 +1696,15 @@ def run_agent(
                     logging.getLogger("mojo.agent").info(
                         "BAD_AFTER_TOOLS answer=%r — forcing synthesis or OBS", answer
                     )
+                    # Structured OBS path — remind model of native markers cheaply
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "WhatsApp style: use *bold* _italic_ ~strike~ `code` "
+                            "(single markers). Never **double** asterisks or ### headers. "
+                            "Lists max 5 items."
+                        ),
+                    })
                     messages.append({
                         "role": "user",
                         "content": (
@@ -1465,13 +1724,13 @@ def run_agent(
                         )
                         forced = (final.content or "").strip()
                         if forced and not _is_bad_post_tool_reply(forced):
-                            return forced
+                            return _reply(forced)
                     except Exception as fe:
                         print(f"[AGENT] forced synthesis failed: {fe}")
                     obs = _last_tool_obs_for_user(messages)
                     if obs:
-                        return obs
-                return answer or "Theek hai 👍"
+                        return _reply(obs)
+                return _reply(answer or "Theek hai 👍")
 
             # Execute tools
             for tc in tool_calls:
@@ -1547,16 +1806,16 @@ def run_agent(
             )
             ans = (final.content or "").strip()
             if ans and not _is_bad_post_tool_reply(ans):
-                return ans
+                return _reply(ans)
         except Exception as e:
             print(f"[AGENT] final close failed: {e}")
         obs = _last_tool_obs_for_user(messages)
         if obs:
-            return obs
-        return "Kaam almost complete ho gaya — dobara try kar lo."
+            return _reply(obs)
+        return _reply("Kaam almost complete ho gaya — dobara try kar lo.")
 
     except Exception as e:
         traceback.print_exc()
         print(f"[AGENT ERROR] {e}")
         logging.getLogger("mojo.agent").exception("run_agent failed: %s", e)
-        return "Thori si technical issue aa gayi — ek second baad dobara try karo."
+        return _reply("Thori si technical issue aa gayi — ek second baad dobara try karo.")

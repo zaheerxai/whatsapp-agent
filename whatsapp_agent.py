@@ -3216,6 +3216,12 @@ def _process_message_inner(client, message):
     insert_chat_message(chat_id, "mojo_agent", "assistant", ai_answer)
 
     ai_answer = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{1,2}:\d{2}\s[AP]M\]\s*', '', ai_answer).strip()
+    # Defense-in-depth: GFM **bold** → WhatsApp *bold*, strip ### / tables, cap lists
+    try:
+        from agent_loop import _format_whatsapp_reply
+        ai_answer = _format_whatsapp_reply(ai_answer)
+    except Exception:
+        pass
 
     client.reply_message(ai_answer, message, mentions_are_lids=is_lid_mode)
 
