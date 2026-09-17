@@ -1279,9 +1279,9 @@ def run_agent(
         spoken_mode = None
 
         def _parse_target_words(text_low: str) -> Optional[int]:
-            # 1.5k / 2k / 1.5K words
+            # 1.2k / 1.5k / 2k words (optional trailing me/mein)
             m = _re.search(
-                r"(\d+(?:[.,]\d+)?)\s*[kK]\s*[- ]?\s*words?",
+                r"(\d+(?:[.,]\d+)?)\s*[kK]\s*(?:words?|lafz)?",
                 text_low,
             )
             if m:
@@ -1290,9 +1290,8 @@ def run_agent(
                     return max(80, min(2500, n))
                 except ValueError:
                     pass
-            # 1,500 words / 1500 words / 1500-word
             m = _re.search(
-                r"(\d{1,3}(?:,\d{3})+|\d{2,4})\s*[- ]?\s*words?",
+                r"(\d{1,3}(?:,\d{3})+|\d{2,4})\s*[- ]?\s*(?:words?|lafz)",
                 text_low,
             )
             if not m:
@@ -1453,8 +1452,9 @@ def run_agent(
                     "mode": spoken_mode,
                     "language": _lang,
                     "timestamps": False,
+                    "user_request": (_intent_text or "")[:500],
                 }
-                if tw and spoken_mode == "summary":
+                if tw and spoken_mode in ("summary", "transcript", "key_points"):
                     tool_args["target_words"] = tw
                 print(
                     f"[AGENT] force transcribe_video mode={spoken_mode} "
@@ -1503,15 +1503,26 @@ def run_agent(
                                     if _time.time() <= _exp and _txt and not _desc(_txt):
                                         _raw = _txt
                                 if _raw:
-                                    _retry_lang = "en" if _lang == "en" else "auto"
+                                    try:
+                                        from language_policy import detect_output_lang
+                                        _retry_lang = detect_output_lang(
+                                            _intent_low or ""
+                                        )
+                                    except Exception:
+                                        _retry_lang = "en" if _lang == "en" else "roman_urdu"
                                     _retry = _refine_transcript_compact(
                                         _raw,
                                         title="",
                                         mode=spoken_mode or "summary",
                                         target_words=tw,
                                         output_lang=_retry_lang,
+                                        user_request=(_intent_text or "")[:500],
                                     )
-                                    if _retry and not _desc(_retry) and len(_retry) >= 80:
+                                    if (
+                                        _retry
+                                        and not _desc(_retry)
+                                        and len(_retry) >= 80
+                                    ):
                                         direct = _retry
                                         print(
                                             f"[AGENT] summary retry from RAW_CACHE "

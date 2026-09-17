@@ -1950,25 +1950,31 @@ def _refine_transcript_compact(
     mode: str = "transcript",
     target_words: Optional[int] = None,
     output_lang: str = "auto",
+    user_request: str = "",
 ) -> str:
     """
-    One cheap LLM pass → WhatsApp-ready text.
+    One LLM pass → WhatsApp-ready text matching the user's ask.
 
-    mode:
-      - transcript: cleaned continuous speech text
-      - summary: overview (honours target_words when set)
-      - key_points: bullet list only
-
-    output_lang: auto | en | roman_urdu — user may ask "in english".
-    Keeps agent context small (no 50k dump → no 413 / token burn).
+    Honours user_request for length, depth, language, and form (summary /
+    bullets / full transcript). Never returns Devanagari/Arabic when Latin
+    output is required. Retries briefly on Groq 429.
     """
     if not raw or not raw.strip():
-        return raw
+        return raw or ""
 
     mode = (mode or "transcript").strip().lower()
     if mode not in ("transcript", "summary", "key_points"):
         mode = "transcript"
     out_lang = (output_lang or "auto").strip().lower()
+    # Infer lang from user_request when not explicit
+    if out_lang in ("auto", "") and user_request:
+        try:
+            from language_policy import detect_output_lang
+            out_lang = detect_output_lang(user_request)
+            if out_lang == "roman_urdu":
+                out_lang = "roman_urdu"
+        except Exception:
+            out_lang = "roman_urdu"
 
     tw = None
     if target_words is not None:
@@ -1983,141 +1989,157 @@ def _refine_transcript_compact(
     if _client_ai is None or not _MODEL_NAME:
         return cleaned[:3000] + ("…" if len(cleaned) > 3000 else "")
 
-    # Cap refiner input for cost
-    if len(cleaned) > 18000:
+    if mode != "transcript" and len(cleaned) > 18000:
         cleaned = (
             cleaned[:12000]
             + "\n\n[...middle omitted for length...]\n\n"
             + cleaned[-5000:]
         )
+    elif mode == "transcript" and len(cleaned) > 24000:
+        cleaned = cleaned[:24000]
+
+    want_latin = out_lang not in ("urdu_script", "hindi_script", "ur", "hi")
 
     if out_lang in ("en", "english"):
         script_rule = (
-            "OUTPUT LANGUAGE: English only. Translate Hindi/Urdu/Roman-Urdu speech "
-            "into clear English. Latin letters only."
+            "OUTPUT LANGUAGE: English only. Latin letters only. "
+            "Translate any Hindi/Urdu speech into clear English."
         )
-    elif out_lang in ("roman_urdu", "ur", "urdu"):
-        script_rule = (
-            "OUTPUT SCRIPT: Roman Urdu only (Latin letters). "
-            "Transliterate any Hindi/Urdu/Devanagari/Arabic script. "
-            "Do NOT output Devanagari or Arabic letters at all."
-        )
+    elif out_lang in ("urdu_script", "ur"):
+        script_rule = "OUTPUT SCRIPT: Urdu (Arabic/Nastaliq letters) as requested."
+        want_latin = False
+    elif out_lang in ("hindi_script", "hi"):
+        script_rule = "OUTPUT SCRIPT: Hindi Devanagari as requested."
+        want_latin = False
     else:
         script_rule = (
             "OUTPUT SCRIPT: Roman Urdu only (Latin letters). "
-            "Transliterate any Hindi/Urdu/Devanagari/Arabic script. "
-            "Do NOT output Devanagari or Arabic letters at all."
+            "Transliterate Devanagari/Arabic. Never output native Urdu/Hindi script."
         )
-        if not _has_arabic_or_devanagari(cleaned):
-            script_rule = (
-                "OUTPUT SCRIPT: keep Latin script (English or Roman Urdu as in source). "
-                "Do not switch to Devanagari/Arabic."
-            )
 
     if mode == "summary":
         if tw:
-            # ~5 chars/word rough; leave headroom for title/sections
-            # ~5-6 chars/word; 1500 words ≈ 9k chars, need room in model output
             hard_cap = min(12000, max(1400, tw * 6))
             max_tok = min(4500, max(700, int(tw * 1.8)))
             format_rule = (
-                f"MODE=summary. Aim for about {tw} words (not fewer than {int(tw*0.7)}). "
-                "Structure with short section titles on their own lines, blank line between "
-                "sections, and '- ' bullets. "
-                "WhatsApp formatting only: use *bold* with single asterisks, never **double**. "
-                "No markdown headers (#), no tables, no --- rules. "
-                "ONE complete message — do not cut mid-sentence or promise more parts. "
-                f"Hard limit: under {hard_cap} characters. No code fences."
+                f"MODE=summary. Aim for about {tw} words (not fewer than {int(tw * 0.7)}). "
+                "Short section titles on their own lines, blank line between sections, "
+                "'- ' bullets. WhatsApp only: *bold* single asterisks, never **. "
+                "No # headers, no tables, no ---. ONE complete message — finish fully."
             )
         else:
+            hard_cap, max_tok = 1400, 600
             format_rule = (
-                "MODE=summary. Output ONLY:\n"
-                "- 1 line title if known\n"
-                "- 5–10 short lines covering what the video is about and main arguments\n"
-                "Hard limit: under 1200 characters. No code fences."
+                "MODE=summary. 1 line title + 5–10 short lines covering the video. "
+                "WhatsApp *bold* only. Under 1200 characters."
             )
-            max_tok, hard_cap = 600, 1400
     elif mode == "key_points":
+        hard_cap, max_tok = 1600, 700
         format_rule = (
-            "MODE=key_points. Output ONLY:\n"
-            "- 1 line title if known\n"
-            "- 8–15 short bullet lines (use '- ') with the main ideas / quotes\n"
-            "Hard limit: under 1400 characters. No long paragraphs. No code fences."
+            "MODE=key_points. Title + 8–15 '- ' bullets. WhatsApp *bold* only. "
+            "Under 1400 characters."
         )
-        max_tok, hard_cap = 700, 1600
-    # Avoid middle slicing when full transcript mode is requested
-    if mode == "transcript":
-        format_rule = (
-            "MODE=transcript. Output the spoken content as clean readable text "
-            "(paragraphs ok). Remove music tags and noise. Keep meaning faithful. "
-            "Cover the full duration of the video. "
-            "ONE message only. No code fences. No 'Key points' section."
-        )
-        max_tok, hard_cap = 3500, 8000
-        # Do not slice middle out of raw text if mode is full transcript
     else:
-        if len(cleaned) > 18000:
-            cleaned = (
-                cleaned[:12000]
-                + "\n\n[...middle omitted for length...]\n\n"
-                + cleaned[-5000:]
-            )
+        hard_cap, max_tok = 8000, 3500
+        format_rule = (
+            "MODE=transcript. Clean spoken content as readable paragraphs. "
+            "Faithful, full coverage. WhatsApp *bold* sparingly. No code fences."
+        )
+
+    req_block = ""
+    if (user_request or "").strip():
+        req_block = (
+            "USER ASK (follow this for length, depth, language, and shape):\n"
+            f"{user_request.strip()[:500]}\n\n"
+        )
 
     system = (
-        "You prepare video transcripts for WhatsApp. Be faithful. No fluff.\n"
-        "CRITICAL: Use ONLY facts and words supported by the Raw transcript below. "
-        "Do NOT invent scenes, topics, greetings, or conclusions that are not clearly "
-        "present in the raw text. If the raw transcript is very short or mostly noise, "
-        "say so in one honest line (e.g. 'Transcript bahut short / unclear hai') — "
-        "do NOT pad it into a fake multi-bullet summary.\n"
+        "You turn a raw video transcript into a WhatsApp reply.\n"
+        "CRITICAL: Use ONLY facts from the Raw transcript. Do not invent.\n"
+        "Follow the USER ASK when provided (word count, depth, language).\n"
         f"{script_rule}\n"
         f"{format_rule}"
     )
-    user = (f"Title: {title}\n\n" if title else "") + "Raw transcript:\n" + cleaned
+    user = (
+        req_block
+        + (f"Title: {title}\n\n" if title else "")
+        + "Raw transcript:\n"
+        + cleaned
+    )
+
+    def _call(messages, tokens):
+        last_err = None
+        for attempt in range(4):
+            try:
+                resp = _client_ai.chat.completions.create(
+                    model=_MODEL_NAME,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=tokens,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                last_err = e
+                err = str(e).lower()
+                if attempt < 3 and ("429" in err or "rate" in err or "too many" in err):
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        raise RuntimeError(str(last_err) if last_err else "refine failed")
 
     try:
-        resp = _client_ai.chat.completions.create(
-            model=_MODEL_NAME,
-            messages=[
+        out = _call(
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=0.2,
-            max_tokens=max_tok,
+            max_tok,
         )
-        out = (resp.choices[0].message.content or "").strip()
         if not out:
-            return cleaned[:hard_cap]
-        if _has_arabic_or_devanagari(out):
-            # Model ignored Roman-Urdu rule — force a second tiny pass or trim latin-only fail
-            print("[transcribe_video] refine returned non-Latin script, retrying")
-            try:
-                resp2 = _client_ai.chat.completions.create(
-                    model=_MODEL_NAME,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Transliterate the following into Roman Urdu "
-                                "(Latin letters only). Keep meaning. No Devanagari."
-                            ),
-                        },
-                        {"role": "user", "content": out[:3500]},
-                    ],
-                    temperature=0.1,
-                    max_tokens=max_tok,
+            raise RuntimeError("empty refine")
+
+        # Latin required → never ship Devanagari/Arabic
+        if want_latin and _has_arabic_or_devanagari(out):
+            print("[transcribe_video] refine non-Latin — forced transliterate pass")
+            out2 = _call(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Transliterate into Roman Urdu (Latin letters only). "
+                            "Keep full meaning and structure. No Devanagari/Arabic."
+                        ),
+                    },
+                    {"role": "user", "content": out[:12000]},
+                ],
+                max_tok,
+            )
+            if out2 and not _has_arabic_or_devanagari(out2):
+                out = out2
+            else:
+                # Do not return native script as the user-facing summary
+                return (
+                    "Summary source Hindi/Urdu script me tha; Roman/English convert "
+                    "rate-limit ki wajah se complete nahi hua. 30–60 sec baad dobara "
+                    "bhejo: summarize karo roman me / in english."
                 )
-                out2 = (resp2.choices[0].message.content or "").strip()
-                if out2 and not _has_arabic_or_devanagari(out2):
-                    out = out2
-            except Exception as e2:
-                print(f"[transcribe_video] transliterate retry failed: {e2}")
+
+        if _looks_like_youtube_description(out):
+            raise RuntimeError("refine_still_description")
+
         if len(out) > hard_cap:
             out = out[:hard_cap].rstrip() + "…"
         return out
     except Exception as e:
         print(f"[transcribe_video] refine failed: {e}")
-        return cleaned[:hard_cap] + ("…" if len(cleaned) > hard_cap else "")
+        # Never dump raw Devanagari as a "summary" when Latin is required
+        if want_latin and _has_arabic_or_devanagari(cleaned):
+            return (
+                "Transcript mil gaya lekin summary convert abhi fail/rate-limit. "
+                "Thori der baad dobara try karo."
+            )
+        return cleaned[: min(hard_cap, 3000)] + ("…" if len(cleaned) > 3000 else "")
+
 
 
 def _try_piped_captions(
@@ -3150,6 +3172,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         target_words = int(target_words) if target_words is not None else None
     except (TypeError, ValueError):
         target_words = None
+    user_request = (args.get("user_request") or args.get("query") or "").strip()
 
     if not url:
         return "URL required. Example: https://www.youtube.com/watch?v=..."
@@ -3259,6 +3282,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 mode=mode,
                 target_words=target_words,
                 output_lang=out_lang,
+                user_request=user_request,
             )
             if _looks_like_youtube_description(refined):
                 raise RuntimeError(
