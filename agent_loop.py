@@ -1308,6 +1308,10 @@ def run_agent(
             o = (obs or "").strip().lower()
             if not o or len(o) < 40:
                 return True
+            # Error/refusal strings are at the START of observations.
+            # Scanning the full 10k+ body for "failed"/"available" false-positives
+            # on real lecture transcripts and wrongly triggers link_preview.
+            head = o[:300]
             markers = (
                 "tool error",
                 "disabled for this chat",
@@ -1323,7 +1327,7 @@ def run_agent(
                 "unavailable",
                 "failed",
             )
-            return any(m in o for m in markers)
+            return any(m in head for m in markers)
 
         # Only tools the admin enabled for this chat are offered to the model.
         # Default is empty → pure conversational reply (ai_chat), no tools.

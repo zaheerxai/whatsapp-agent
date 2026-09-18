@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import random
 import time
 import traceback
 import tempfile
@@ -56,6 +57,8 @@ _file_ops = None
 _compute_next_occurrence = None
 _extract_reminder_data_via_ai = None
 _generate_reminder_confirmation = None
+_client_gemini = None
+_GEMINI_MODEL = None
 
 
 def init_tools(
@@ -78,6 +81,8 @@ def init_tools(
     compute_next_occurrence=None,
     extract_reminder_data_via_ai=None,
     generate_reminder_confirmation=None,
+    client_gemini=None,
+    gemini_model=None,
 ):
     global _supabase, _client_ai, _MODEL_NAME, _BUSINESS_KNOWLEDGE
     global _DEFAULT_TIMEZONE, _OWNER_SENDER_ID
@@ -85,6 +90,7 @@ def init_tools(
     global _handle_reminder_request, _list_reminders, _cancel_reminders
     global _get_group_memory, _send_proactive_message, _file_ops
     global _compute_next_occurrence, _extract_reminder_data_via_ai, _generate_reminder_confirmation
+    global _client_gemini, _GEMINI_MODEL
 
     _supabase = supabase
     _client_ai = client_ai
@@ -105,6 +111,8 @@ def init_tools(
     _compute_next_occurrence = compute_next_occurrence
     _extract_reminder_data_via_ai = extract_reminder_data_via_ai
     _generate_reminder_confirmation = generate_reminder_confirmation
+    _client_gemini = client_gemini
+    _GEMINI_MODEL = gemini_model
 
 
 # ---------------------------------------------------------------------------
@@ -1792,10 +1800,8 @@ def _render_speech_transcript(
     """
     mode=transcript from real speech — NO free-form rewrite.
 
-    Language policy (shared with language_policy.py):
-      en → English Latin only
-      auto / roman_urdu → Roman Urdu Latin only (never leave Devanagari)
-      urdu_script / hindi_script → native scripts only when explicitly requested
+    Larger chunks (8000) cut Groq RPM pressure; Groq→Gemini fallback on
+    each chunk; failed chunks keep raw text instead of silent drop.
     """
     from language_policy import non_latin_ratio, has_non_latin_script
 
@@ -1803,16 +1809,17 @@ def _render_speech_transcript(
     if not cleaned or _looks_like_youtube_description(cleaned):
         return ""
 
-    step = 4000
+    # 8000 (was 4000) roughly halves Groq request count per video
+    step = 8000
     chunks = [cleaned[i : i + step] for i in range(0, len(cleaned), step)]
-    if len(chunks) > 6:
-        chunks = chunks[:4] + chunks[-2:]
+    if len(chunks) > 8:
+        chunks = chunks[:5] + chunks[-3:]
         print(
-            f"[transcribe_video] speech_render trimmed to 6 chunks "
+            f"[transcribe_video] speech_render trimmed to 8 chunks "
             f"(raw was {len(cleaned)} chars)"
         )
 
-    if _client_ai is None or not _MODEL_NAME:
+    if _client_ai is None and _client_gemini is None:
         return cleaned[:hard_cap]
 
     lang = (out_lang or "auto").strip().lower()
@@ -1847,31 +1854,28 @@ def _render_speech_transcript(
         )
         want_latin = True
 
-    def _call_chunk(ch: str, attempt: int = 0) -> str:
-        try:
-            resp = _client_ai.chat.completions.create(
-                model=_MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": sys},
-                    {
-                        "role": "user",
-                        "content": "Speech part:\n\n" + ch,
-                    },
-                ],
-                temperature=0.1,
-                max_tokens=2200,
+    def _call_chunk(ch: str) -> str:
+        content, finish, source = _ai_chat_completion_with_fallback(
+            [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": "Speech part:\n\n" + ch},
+            ],
+            max_tokens=3200,
+            temperature=0.1,
+            groq_retries=3,
+        )
+        if content:
+            print(
+                f"[transcribe_video] chunk render via {source} "
+                f"chars={len(content)} finish={finish}"
             )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e:
-            err = str(e).lower()
-            if attempt < 3 and ("429" in err or "rate" in err or "too many" in err):
-                time.sleep(1.2 * (attempt + 1))
-                return _call_chunk(ch, attempt + 1)
-            print(f"[transcribe_video] speech render chunk failed: {e}")
-            return ""
+        return content
 
     parts: List[str] = []
+    ok_count = 0
     for idx, ch in enumerate(chunks):
+        if idx > 0:
+            time.sleep(0.3)  # spread requests — proactive rate spacing
         piece = _call_chunk(ch)
         if piece and _looks_like_youtube_description(piece):
             piece = ""
@@ -1891,22 +1895,27 @@ def _render_speech_transcript(
                 piece = ""
         if piece:
             parts.append(piece)
+            ok_count += 1
         else:
-            print(f"[transcribe_video] speech_render skip chunk {idx} (empty/bad)")
+            # Never silently drop — keeps mid-video content, avoids promo-tail splice
+            print(
+                f"[transcribe_video] speech_render chunk {idx} translate failed "
+                "— keeping raw"
+            )
+            parts.append(f"[untranslated — source language]\n{ch.strip()}")
 
     out = "\n\n".join(parts).strip()
-    if not out or _looks_like_youtube_description(out):
+    if not out or (ok_count == 0 and _looks_like_youtube_description(out)):
         if want_latin and has_non_latin_script(cleaned):
             return (
                 "Transcript mil gaya lekin language convert fail / rate-limit. "
                 "Thori der baad dobara try karo (english/roman me)."
             )
         out = cleaned
-    if want_latin and non_latin_ratio(out) > 0.35:
-        return (
-            "Transcript source Hindi/Urdu script me hai; Roman/English convert "
-            "abhi rate-limit ki wajah se complete nahi hua. 1 minute baad "
-            "'transcript dena english me' dobara bhejo."
+    elif want_latin and non_latin_ratio(out) > 0.6:
+        out = (
+            "⚠️ Kuch hissa translate nahi ho saka (rate-limit) — baaki original "
+            "language mein hai:\n\n" + out
         )
     if len(out) > hard_cap:
         out = (
@@ -2020,60 +2029,122 @@ def _chunk_text_by_chars(text: str, size: int = 5500, overlap: int = 200) -> lis
     return [p for p in parts if p]
 
 
+
+def _ai_chat_completion_with_fallback(
+    messages: list,
+    max_tokens: int,
+    temperature: float = 0.2,
+    groq_retries: int = 3,
+) -> tuple:
+    """
+    Groq primary (exponential backoff + jitter on 429/5xx), Gemini fallback.
+    Returns (content, finish_reason, source). Mirrors agent_loop._chat_completion.
+    """
+    if _client_ai is not None and _MODEL_NAME:
+        working = list(messages)
+        tokens = max(256, int(max_tokens))
+        for attempt in range(groq_retries):
+            try:
+                resp = _client_ai.chat.completions.create(
+                    model=_MODEL_NAME,
+                    messages=working,
+                    temperature=temperature,
+                    max_tokens=tokens,
+                )
+                choice = resp.choices[0]
+                content = (choice.message.content or "").strip()
+                finish = (getattr(choice, "finish_reason", None) or "stop").lower()
+                if content:
+                    return content, finish, "groq"
+            except Exception as e:
+                err = str(e).lower()
+                if "413" in err or "payload" in err or "too large" in err:
+                    new_working = []
+                    for m in working:
+                        role = m.get("role")
+                        c = m.get("content") or ""
+                        if role == "user" and len(c) > 2000:
+                            keep = max(1500, 8000 // (attempt + 2))
+                            c = (
+                                c[: keep // 2]
+                                + "\n\n[...truncated...]\n\n"
+                                + c[-(keep // 2):]
+                            )
+                        elif role == "system" and len(c) > 1500:
+                            c = c[:1500]
+                        new_working.append({"role": role, "content": c})
+                    working = new_working
+                    tokens = max(256, int(tokens * 0.75))
+                    continue
+                is_rate = "429" in err or "rate" in err or "too many" in err
+                is_server = "500" in err or "502" in err or "503" in err
+                if attempt < groq_retries - 1 and (is_rate or is_server):
+                    sleep_s = min(15.0, (2 ** attempt) + random.uniform(0, 1))
+                    print(
+                        f"[agent_tools] Groq {'429' if is_rate else '5xx'} — "
+                        f"retry in {sleep_s:.1f}s "
+                        f"(attempt {attempt+1}/{groq_retries})"
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                print(f"[agent_tools] Groq call failed, falling to Gemini: {e}")
+                break
+
+    if _client_gemini is not None and _GEMINI_MODEL:
+        try:
+            clean = [
+                {
+                    "role": (
+                        m.get("role")
+                        if m.get("role") in ("system", "user", "assistant")
+                        else "user"
+                    ),
+                    "content": (
+                        m.get("content")
+                        if isinstance(m.get("content"), str)
+                        else (m.get("content") or "")
+                    ),
+                }
+                for m in messages
+            ]
+            resp = _client_gemini.chat.completions.create(
+                model=_GEMINI_MODEL,
+                messages=clean,
+                temperature=temperature,
+                max_tokens=max(256, int(max_tokens)),
+            )
+            choice = resp.choices[0]
+            content = (choice.message.content or "").strip()
+            finish = (getattr(choice, "finish_reason", None) or "stop").lower()
+            if content:
+                print(
+                    f"[agent_tools] Gemini fallback succeeded ({len(content)} chars)"
+                )
+                return content, finish, "gemini"
+        except Exception as e2:
+            print(f"[agent_tools] Gemini fallback also failed: {e2}")
+
+    return "", "error", "none"
+
+
 def _groq_chat(
     messages: list,
     max_tokens: int,
     temperature: float = 0.2,
     retries: int = 4,
 ) -> tuple:
-    """
-    Returns (content, finish_reason). Shrinks messages on 413.
-    """
-    if _client_ai is None or not _MODEL_NAME:
+    """Returns (content, finish_reason). Groq w/ backoff, then Gemini fallback."""
+    if (_client_ai is None or not _MODEL_NAME) and (
+        _client_gemini is None or not _GEMINI_MODEL
+    ):
         return "", "error"
-
-    working = list(messages)
-    tokens = max(256, int(max_tokens))
-    last_err = None
-
-    for attempt in range(retries):
-        try:
-            resp = _client_ai.chat.completions.create(
-                model=_MODEL_NAME,
-                messages=working,
-                temperature=temperature,
-                max_tokens=tokens,
-            )
-            choice = resp.choices[0]
-            content = (choice.message.content or "").strip()
-            finish = (getattr(choice, "finish_reason", None) or "stop").lower()
-            return content, finish
-        except Exception as e:
-            last_err = e
-            err = str(e).lower()
-            if "413" in err or "payload" in err or "too large" in err:
-                # Shrink user content aggressively
-                print(f"[groq_chat] 413 — shrinking payload attempt={attempt+1}")
-                new_working = []
-                for m in working:
-                    role = m.get("role")
-                    c = m.get("content") or ""
-                    if role == "user" and len(c) > 2000:
-                        # keep head + tail
-                        keep = max(1500, 8000 // (attempt + 2))
-                        c = c[: keep // 2] + "\n\n[...truncated...]\n\n" + c[-(keep // 2) :]
-                    elif role == "system" and len(c) > 1500:
-                        c = c[:1500]
-                    new_working.append({"role": role, "content": c})
-                working = new_working
-                tokens = max(256, int(tokens * 0.75))
-                continue
-            if attempt < retries - 1 and ("429" in err or "rate" in err or "too many" in err):
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            print(f"[groq_chat] failed: {e}")
-            break
-    return "", "error"
+    content, finish, _source = _ai_chat_completion_with_fallback(
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        groq_retries=max(2, retries - 1),
+    )
+    return content, finish
 
 
 def _continue_text_only(
@@ -2151,7 +2222,7 @@ def _map_reduce_summary(
     For long transcripts: summarize each chunk, then merge.
     Prevents 413 by keeping each call under context limits.
     """
-    chunks = _chunk_text_by_chars(cleaned, size=5500, overlap=180)
+    chunks = _chunk_text_by_chars(cleaned, size=8000, overlap=180)
     print(f"[map_reduce] chunks={len(chunks)} total_chars={len(cleaned)}")
 
     partials = []

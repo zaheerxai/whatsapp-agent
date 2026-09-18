@@ -2315,6 +2315,8 @@ agent_tools.init_tools(
     compute_next_occurrence=compute_next_occurrence,
     extract_reminder_data_via_ai=extract_reminder_data_via_ai,
     generate_reminder_confirmation=generate_reminder_confirmation,
+    client_gemini=client_gemini,
+    gemini_model=GEMINI_MODEL,
 )
 
 # RAG knowledge base (pgvector + OneDrive Documents/aimojo)
