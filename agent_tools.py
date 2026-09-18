@@ -1947,6 +1947,9 @@ def _has_arabic_or_devanagari(text: str) -> bool:
 
 # ---------------------------------------------------------------------------
 # Adaptive length + continuation (never ship mid-sentence cuts)
+
+# ---------------------------------------------------------------------------
+# Adaptive length, map-reduce summary, safe continuation (no 413 loops)
 # ---------------------------------------------------------------------------
 _THOROUGH_MARKERS = frozenset({
     "break down", "breakdown", "har cheez", "har baat", "poora", "pura",
@@ -1963,120 +1966,268 @@ def _request_is_thorough(user_request: str) -> bool:
 
 
 def _looks_incomplete(text: str) -> bool:
-    """Heuristic: response likely truncated mid-thought."""
     s = (text or "").strip()
     if not s:
         return True
-    if s.endswith(("…", "...", "—", "-")):
+    if s.endswith(("…", "...", "—")):
         return True
-    # ends mid-word-ish or mid-sentence without terminal punctuation
     if s[-1] not in ".!?;:)]}”\"'…":
-        # allow ending on bullet or section title
         last_line = s.split("\n")[-1].strip()
-        if last_line.startswith(("*", "-", "•")) and len(last_line) < 80:
+        if last_line.startswith(("*", "-", "•")) and len(last_line) < 100:
             return False
-        if last_line.startswith("*") and last_line.endswith("*") and len(last_line) < 60:
+        if last_line.startswith("*") and last_line.endswith("*") and len(last_line) < 80:
             return False
         return True
     return False
 
 
 def _trim_to_sentence(text: str, limit: int) -> str:
-    """Hard length limit but never mid-word; prefer last sentence end."""
     if not text or len(text) <= limit:
         return text or ""
     chunk = text[:limit]
-    # prefer last paragraph break
     for sep in ("\n\n", "\n", ". ", "? ", "! ", "। "):
         i = chunk.rfind(sep)
         if i >= int(limit * 0.55):
             return chunk[: i + len(sep)].rstrip()
-    # last space
     i = chunk.rfind(" ")
     if i >= int(limit * 0.5):
         return chunk[:i].rstrip() + "…"
     return chunk.rstrip() + "…"
 
 
-def _llm_complete_until_done(
+def _chunk_text_by_chars(text: str, size: int = 5500, overlap: int = 200) -> list:
+    """Split long transcript into overlapping windows for map-reduce."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    parts = []
+    i = 0
+    n = len(text)
+    while i < n:
+        end = min(n, i + size)
+        # prefer break at paragraph / sentence
+        if end < n:
+            window = text[i:end]
+            cut = max(window.rfind("\n\n"), window.rfind(". "), window.rfind("। "))
+            if cut >= int(size * 0.4):
+                end = i + cut + 1
+        parts.append(text[i:end].strip())
+        if end >= n:
+            break
+        i = max(end - overlap, i + 1)
+    return [p for p in parts if p]
+
+
+def _groq_chat(
     messages: list,
     max_tokens: int,
-    *,
-    max_continuations: int = 3,
     temperature: float = 0.2,
-) -> str:
+    retries: int = 4,
+) -> tuple:
     """
-    Generate with adaptive continuation when finish_reason=length AND
-    the text looks incomplete. Avoids spurious continues on short complete answers.
+    Returns (content, finish_reason). Shrinks messages on 413.
     """
     if _client_ai is None or not _MODEL_NAME:
+        return "", "error"
+
+    working = list(messages)
+    tokens = max(256, int(max_tokens))
+    last_err = None
+
+    for attempt in range(retries):
+        try:
+            resp = _client_ai.chat.completions.create(
+                model=_MODEL_NAME,
+                messages=working,
+                temperature=temperature,
+                max_tokens=tokens,
+            )
+            choice = resp.choices[0]
+            content = (choice.message.content or "").strip()
+            finish = (getattr(choice, "finish_reason", None) or "stop").lower()
+            return content, finish
+        except Exception as e:
+            last_err = e
+            err = str(e).lower()
+            if "413" in err or "payload" in err or "too large" in err:
+                # Shrink user content aggressively
+                print(f"[groq_chat] 413 — shrinking payload attempt={attempt+1}")
+                new_working = []
+                for m in working:
+                    role = m.get("role")
+                    c = m.get("content") or ""
+                    if role == "user" and len(c) > 2000:
+                        # keep head + tail
+                        keep = max(1500, 8000 // (attempt + 2))
+                        c = c[: keep // 2] + "\n\n[...truncated...]\n\n" + c[-(keep // 2) :]
+                    elif role == "system" and len(c) > 1500:
+                        c = c[:1500]
+                    new_working.append({"role": role, "content": c})
+                working = new_working
+                tokens = max(256, int(tokens * 0.75))
+                continue
+            if attempt < retries - 1 and ("429" in err or "rate" in err or "too many" in err):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            print(f"[groq_chat] failed: {e}")
+            break
+    return "", "error"
+
+
+def _continue_text_only(
+    so_far: str,
+    *,
+    lang_rule: str,
+    max_tokens: int = 1200,
+    rounds: int = 3,
+) -> str:
+    """
+    Continue a truncated answer WITHOUT resending the raw transcript
+    (avoids Groq 413). Minimal context: system + assistant so_far + continue.
+    """
+    text = (so_far or "").strip()
+    if not text:
+        return text
+
+    for r in range(rounds):
+        if not _looks_incomplete(text) and r > 0:
+            break
+        # Only continue if clearly incomplete or first round after length stop
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "Continue the WhatsApp reply exactly from where it stopped. "
+                    "Do NOT repeat earlier text. Finish remaining points. "
+                    f"{lang_rule} WhatsApp *bold* only (no **). No code fences."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": text[-6000:],  # only tail — enough continuity
+            },
+            {
+                "role": "user",
+                "content": "Continue from the last sentence. Complete all remaining sections.",
+            },
+        ]
+        piece, finish = _groq_chat(msgs, max_tokens=max_tokens, temperature=0.2)
+        if not piece:
+            break
+        # Avoid pure duplication
+        if piece in text:
+            break
+        # If model repeated a large prefix, strip it
+        overlap = 0
+        max_o = min(400, len(piece), len(text))
+        for o in range(max_o, 40, -20):
+            if text.endswith(piece[:o]):
+                overlap = o
+                break
+        addition = piece[overlap:].strip() if overlap else piece
+        if not addition:
+            break
+        text = (text.rstrip() + "\n\n" + addition).strip()
+        print(f"[continue] round={r+1} finish={finish} total={len(text)}")
+        if finish in ("stop", "end_turn") and not _looks_incomplete(text):
+            break
+        if finish != "length" and not _looks_incomplete(text):
+            break
+    return text
+
+
+def _map_reduce_summary(
+    cleaned: str,
+    *,
+    system_core: str,
+    user_request: str,
+    title: str,
+    max_tok_final: int,
+    lang_rule: str,
+) -> str:
+    """
+    For long transcripts: summarize each chunk, then merge.
+    Prevents 413 by keeping each call under context limits.
+    """
+    chunks = _chunk_text_by_chars(cleaned, size=5500, overlap=180)
+    print(f"[map_reduce] chunks={len(chunks)} total_chars={len(cleaned)}")
+
+    partials = []
+    for idx, ch in enumerate(chunks):
+        sys = (
+            f"{system_core}\n"
+            f"This is part {idx+1}/{len(chunks)} of the transcript. "
+            "Extract and summarize ALL important points from THIS part only. "
+            "Use short paragraphs or '- ' bullets. Do not invent."
+        )
+        user = (
+            (f"USER ASK: {user_request[:300]}\n\n" if user_request else "")
+            + (f"Title: {title}\n\n" if title else "")
+            + f"Transcript part {idx+1}/{len(chunks)}:\n{ch}"
+        )
+        part, finish = _groq_chat(
+            [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=min(1200, max_tok_final),
+            temperature=0.2,
+        )
+        if part:
+            partials.append(f"[Part {idx+1}]\n{part}")
+            print(f"[map_reduce] part {idx+1} chars={len(part)} finish={finish}")
+        else:
+            print(f"[map_reduce] part {idx+1} EMPTY")
+
+    if not partials:
         return ""
 
-    parts: list[str] = []
-    working = list(messages)
-    budget = max(256, int(max_tokens))
-
-    for round_i in range(max_continuations + 1):
-        last_err = None
-        resp = None
-        for attempt in range(4):
-            try:
-                resp = _client_ai.chat.completions.create(
-                    model=_MODEL_NAME,
-                    messages=working,
-                    temperature=temperature,
-                    max_tokens=budget,
-                )
-                break
-            except Exception as e:
-                last_err = e
-                err = str(e).lower()
-                if attempt < 3 and ("429" in err or "rate" in err or "too many" in err):
-                    time.sleep(1.4 * (attempt + 1))
-                    continue
-                raise
-        if resp is None:
-            raise RuntimeError(str(last_err) if last_err else "llm failed")
-
-        choice = resp.choices[0]
-        piece = (choice.message.content or "").strip()
-        finish = (getattr(choice, "finish_reason", None) or "").lower()
-        if piece:
-            parts.append(piece)
-
-        full = "\n".join(parts).strip() if len(parts) > 1 else (parts[0] if parts else "")
-        # Stop if natural end or looks complete
-        if finish in ("stop", "end_turn", "eos_token", ""):
-            if not _looks_incomplete(full):
-                return full
-            # finish=stop but incomplete punctuation — still accept if long enough
-            if len(full) > 400 and finish == "stop":
-                return full
-        if finish == "length" or _looks_incomplete(full):
-            if round_i >= max_continuations:
-                break
-            # Continue from truncation
-            working = list(messages) + [
-                {"role": "assistant", "content": full},
-                {
-                    "role": "user",
-                    "content": (
-                        "Continue exactly from where you stopped. "
-                        "Do not repeat prior text. Finish all remaining points. "
-                        "Same language and formatting."
-                    ),
-                },
-            ]
-            # slightly smaller budget per continuation
-            budget = max(400, int(budget * 0.85))
-            print(
-                f"[llm_complete] continue round={round_i+1} "
-                f"finish={finish} so_far={len(full)}"
+    if len(partials) == 1:
+        merged = partials[0]
+        # strip [Part 1] header
+        merged = re.sub(r"^\[Part \d+\]\s*", "", merged).strip()
+    else:
+        join_body = "\n\n".join(partials)
+        # Cap merge input
+        if len(join_body) > 14000:
+            join_body = join_body[:14000]
+        sys = (
+            f"{system_core}\n"
+            "Merge the partial summaries into ONE coherent WhatsApp reply. "
+            "Remove [Part N] labels and duplication. Cover every major point. "
+            "Finish completely — never stop mid-sentence."
+        )
+        user = (
+            (f"USER ASK: {user_request[:400]}\n\n" if user_request else "")
+            + (f"Title: {title}\n\n" if title else "")
+            + "Partial summaries to merge:\n"
+            + join_body
+        )
+        merged, finish = _groq_chat(
+            [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tok_final,
+            temperature=0.2,
+        )
+        print(f"[map_reduce] merge chars={len(merged or '')} finish={finish}")
+        if not merged:
+            # fallback: concatenate partials
+            merged = "\n\n".join(
+                re.sub(r"^\[Part \d+\]\s*", "", p).strip() for p in partials
             )
-            continue
-        return full
+        if finish == "length" or _looks_incomplete(merged or ""):
+            merged = _continue_text_only(
+                merged or "",
+                lang_rule=lang_rule,
+                max_tokens=min(1500, max_tok_final),
+                rounds=3,
+            )
 
-    return "\n".join(parts).strip()
+    return (merged or "").strip()
 
 
 def _refine_transcript_compact(
@@ -2088,11 +2239,12 @@ def _refine_transcript_compact(
     user_request: str = "",
 ) -> str:
     """
-    LLM pass → WhatsApp-ready text matching the user ask.
+    Robust LLM refine for WhatsApp.
 
-    Adaptive max_tokens from target_words / thorough markers.
-    Continues on finish_reason=length when incomplete so replies are not cut off.
-    Never returns Devanagari/Arabic when Latin is required.
+    - Long input → map-reduce (avoids Groq 413)
+    - finish_reason=length → minimal-context continuation (no full transcript resend)
+    - Thorough asks without word count → ~1000 word budget
+    - Never return Devanagari when Latin required
     """
     if not raw or not raw.strip():
         return raw or ""
@@ -2116,22 +2268,12 @@ def _refine_transcript_compact(
             tw = None
         if tw is not None:
             tw = max(80, min(2500, tw))
-    # No numeric target but thorough ask → treat as long summary
     if tw is None and mode == "summary" and _request_is_thorough(user_request):
         tw = 1000
 
     cleaned = _clean_raw_transcript(raw)
     if _client_ai is None or not _MODEL_NAME:
         return cleaned[:3000] + ("…" if len(cleaned) > 3000 else "")
-
-    if mode != "transcript" and len(cleaned) > 18000:
-        cleaned = (
-            cleaned[:12000]
-            + "\n\n[...middle omitted for length...]\n\n"
-            + cleaned[-5000:]
-        )
-    elif mode == "transcript" and len(cleaned) > 24000:
-        cleaned = cleaned[:24000]
 
     want_latin = out_lang not in ("urdu_script", "hindi_script", "ur", "hi")
 
@@ -2141,7 +2283,7 @@ def _refine_transcript_compact(
             "Translate any Hindi/Urdu speech into clear English."
         )
     elif out_lang in ("urdu_script", "ur"):
-        script_rule = "OUTPUT SCRIPT: Urdu (Arabic/Nastaliq letters) as requested."
+        script_rule = "OUTPUT SCRIPT: Urdu (Arabic/Nastaliq) as requested."
         want_latin = False
     elif out_lang in ("hindi_script", "hi"):
         script_rule = "OUTPUT SCRIPT: Hindi Devanagari as requested."
@@ -2154,93 +2296,109 @@ def _refine_transcript_compact(
 
     if mode == "summary":
         if tw:
-            hard_cap = min(14000, max(2000, tw * 7))
-            max_tok = min(5000, max(1200, int(tw * 2.0)))
+            hard_cap = min(14000, max(2500, tw * 7))
+            max_tok = min(4500, max(1400, int(tw * 2.0)))
             format_rule = (
-                f"MODE=summary. Aim for about {tw} words (not under {int(tw * 0.65)}). "
-                "Cover EVERY major point from the transcript — user asked for depth. "
-                "Section titles on their own lines, blank lines between sections, '- ' bullets. "
-                "WhatsApp: *bold* single asterisks only, never **. No # headers, no tables, no ---. "
-                "ONE complete message — finish every section; do not stop mid-sentence."
+                f"MODE=summary. Aim ~{tw} words (not under {int(tw * 0.6)}). "
+                "Cover every major point. Section titles on own lines, blank lines between "
+                "sections, '- ' bullets. WhatsApp *bold* only (never **). "
+                "No # headers, no tables, no ---. Finish completely."
             )
         else:
-            hard_cap, max_tok = 2200, 900
+            hard_cap, max_tok = 2500, 1100
             format_rule = (
-                "MODE=summary. Title + clear coverage of main points (8–15 short lines or "
-                "short paragraphs). WhatsApp *bold* only. Finish completely."
+                "MODE=summary. Title + clear coverage of main points. "
+                "WhatsApp *bold* only. Finish completely."
             )
     elif mode == "key_points":
-        hard_cap, max_tok = 2000, 900
+        hard_cap, max_tok = 2200, 1000
         format_rule = (
             "MODE=key_points. Title + 8–15 '- ' bullets covering all main ideas. "
             "WhatsApp *bold* only. Finish the full list."
         )
     else:
-        hard_cap, max_tok = 12000, 4000
+        hard_cap, max_tok = 12000, 3500
         format_rule = (
-            "MODE=transcript. Clean spoken content as readable paragraphs. "
-            "Faithful full coverage. Finish the whole talk."
+            "MODE=transcript. Clean readable paragraphs, full coverage, finish completely."
         )
 
-    req_block = ""
-    if (user_request or "").strip():
-        req_block = (
-            "USER ASK (length, depth, language, shape — follow closely):\n"
-            f"{user_request.strip()[:600]}\n\n"
-        )
-
-    system = (
+    system_core = (
         "You turn a raw video transcript into a WhatsApp reply.\n"
-        "CRITICAL: Use ONLY facts from the Raw transcript. Do not invent.\n"
-        "Follow the USER ASK when provided.\n"
-        "Never end mid-sentence. If you are running long, still close the current point "
-        "with a complete sentence before stopping.\n"
+        "CRITICAL: Use ONLY facts from the transcript. Do not invent.\n"
+        "Never end mid-sentence.\n"
         f"{script_rule}\n"
         f"{format_rule}"
     )
-    user = (
-        req_block
-        + (f"Title: {title}\n\n" if title else "")
-        + "Raw transcript:\n"
-        + cleaned
-    )
 
     try:
-        out = _llm_complete_until_done(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tok,
-            max_continuations=3,
-            temperature=0.2,
-        )
+        # Long speech → map-reduce; short → single shot
+        use_map = mode in ("summary", "key_points") and len(cleaned) > 7000
+
+        if use_map:
+            out = _map_reduce_summary(
+                cleaned,
+                system_core=system_core,
+                user_request=user_request or "",
+                title=title or "",
+                max_tok_final=max_tok,
+                lang_rule=script_rule,
+            )
+        else:
+            # Single-shot with safe input size
+            body = cleaned
+            if len(body) > 12000:
+                body = body[:8000] + "\n\n[...middle omitted...]\n\n" + body[-3500:]
+            user = (
+                (f"USER ASK: {(user_request or '')[:500]}\n\n" if user_request else "")
+                + (f"Title: {title}\n\n" if title else "")
+                + "Raw transcript:\n"
+                + body
+            )
+            out, finish = _groq_chat(
+                [
+                    {"role": "system", "content": system_core},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=max_tok,
+                temperature=0.2,
+            )
+            print(f"[refine] single finish={finish} chars={len(out or '')}")
+            if out and (finish == "length" or _looks_incomplete(out)):
+                out = _continue_text_only(
+                    out,
+                    lang_rule=script_rule,
+                    max_tokens=min(1500, max_tok),
+                    rounds=3,
+                )
+
         if not out:
             raise RuntimeError("empty refine")
 
         if want_latin and _has_arabic_or_devanagari(out):
-            print("[transcribe_video] refine non-Latin — forced transliterate pass")
-            out2 = _llm_complete_until_done(
+            print("[transcribe_video] refine non-Latin — transliterate")
+            out2, _fr = _groq_chat(
                 [
                     {
                         "role": "system",
                         "content": (
                             "Transliterate into Roman Urdu (Latin letters only). "
-                            "Keep full meaning and structure. No Devanagari/Arabic. "
-                            "Finish completely."
+                            "Keep structure and meaning. No Devanagari/Arabic. Finish fully."
                         ),
                     },
-                    {"role": "user", "content": out[:12000]},
+                    {"role": "user", "content": out[:10000]},
                 ],
-                max_tok,
-                max_continuations=2,
+                max_tokens=min(max_tok, 3500),
             )
             if out2 and not _has_arabic_or_devanagari(out2):
                 out = out2
+                if _looks_incomplete(out):
+                    out = _continue_text_only(
+                        out, lang_rule=script_rule, max_tokens=1200, rounds=2
+                    )
             else:
                 return (
-                    "Summary source Hindi/Urdu script me tha; Roman/English convert "
-                    "abhi complete nahi hua. 30–60 sec baad dobara bhejo."
+                    "Summary source Hindi/Urdu script me tha; Roman convert "
+                    "complete nahi hua. 30–60 sec baad dobara try karo."
                 )
 
         if _looks_like_youtube_description(out):
@@ -2253,10 +2411,10 @@ def _refine_transcript_compact(
         print(f"[transcribe_video] refine failed: {e}")
         if want_latin and _has_arabic_or_devanagari(cleaned):
             return (
-                "Transcript mil gaya lekin summary convert abhi fail/rate-limit. "
+                "Transcript mil gaya lekin summary convert abhi fail. "
                 "Thori der baad dobara try karo."
             )
-        return _trim_to_sentence(cleaned, min(hard_cap if 'hard_cap' in dir() else 3000, 3000))
+        return _trim_to_sentence(cleaned, 3000)
 
 
 
