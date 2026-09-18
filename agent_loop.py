@@ -166,6 +166,25 @@ _EXPLICIT_SUMMARY_PHRASES = frozenset({
     "1.5k words",
     "in 1.5k",
     "in 1500",
+    # analysis / explain — NOT raw transcript dumps
+    "explain",
+    "explain this",
+    "explain karo",
+    "analysis",
+    "analyse",
+    "analyze",
+    "point by point",
+    "action by action",
+    "step by step",
+    "break down",
+    "breakdown",
+    "in depth analysis",
+    "indepth analysis",
+    "deep dive",
+    "walk through",
+    "walk me through",
+    "samjhao",
+    "samjha do",
 })
 
 _SUMMARY_PHRASES = frozenset({
@@ -344,17 +363,23 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
     if not t:
         return "summary"
 
-    # Explicit "summarize" / word-count summary wins over "in depth"
-    # so "summarize in depth in 1.5k words" → summary, not transcript.
+    # Explicit summary / analysis / explain wins over "in depth"
+    # so "explain point by point in depth analysis" → summary, not transcript dump.
     if any(w in t for w in _EXPLICIT_SUMMARY_PHRASES):
         return "summary"
     if any(w in t for w in _KEY_POINTS_PHRASES):
         return "key_points"
 
+    # Word-for-word / spoken-text only (not analysis)
     if any(w in t for w in _TRANSCRIPT_PHRASES):
+        # "each point" / "har point" alone can mean analysis — if explain/analysis
+        # already handled above. Pure transcript phrases still win here.
         return "transcript"
 
-    # Detail language without summarize → full transcript of speech
+    # Detail language WITHOUT explain/analysis/summary → still prefer summary
+    # for "in depth" / "detailed" (users almost always want structured analysis,
+    # not a raw Hindi dump). Only force transcript when they clearly ask for
+    # spoken wording (kya bola / word for word / transcript).
     if any(
         m in t
         for m in (
@@ -363,19 +388,17 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
             "in-depth",
             "detailed",
             "in detail",
-            "what was said",
-            "dont miss",
-            "don't miss",
-            "do not miss",
             "each point",
             "har point",
             "every point",
             "full detail",
             "sab kuch",
             "everything covered",
+            "point by point",
+            "action by action",
         )
     ):
-        return "transcript"
+        return "summary"
 
     if any(w in t for w in _SUMMARY_PHRASES):
         return "summary"
@@ -394,20 +417,7 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
     # Longer residual: still force when it looks like a content ask about the video
     # (otherwise force path falls through to browse_url → title only).
     if any(tok in _VIDEO_CONTENT_TOKENS for tok in tokens):
-        if any(
-            m in t
-            for m in (
-                "detail",
-                "said",
-                "bola",
-                "kaha",
-                "miss",
-                "poora",
-                "full",
-                "everything",
-                "implementation",
-            )
-        ):
+        if any(m in t for m in ("bola", "kaha", "said", "word for word", "transcript")):
             return "transcript"
         return "summary"
     # Substantial non-blocked ask with a video URL present (caller gates URL) —
@@ -1465,7 +1475,8 @@ def run_agent(
                         for m in (
                             "break down", "breakdown", "har cheez", "in depth",
                             "indepth", "detailed", "sab kuch", "poora", "thorough",
-                            "point by point", "step by step",
+                            "point by point", "step by step", "action by action",
+                            "analysis", "analyse", "analyze", "explain",
                         )
                     ):
                         tw = 1000
@@ -1559,6 +1570,66 @@ def run_agent(
                                 print(f"[AGENT] raw_cache summary retry failed: {_re}")
                     except Exception as _e:
                         print(f"[AGENT] description gate skip: {_e}")
+                # Reject mostly-untranslated Hindi dumps when user wanted
+                # English/Roman analysis or summary (not raw speech).
+                if direct and spoken_mode in ("summary", "key_points"):
+                    try:
+                        from language_policy import non_latin_ratio, has_non_latin_script
+                        from agent_tools import (
+                            _RAW_SPEECH_CACHE,
+                            _extract_youtube_id,
+                            _refine_transcript_compact,
+                            _looks_like_youtube_description as _desc,
+                        )
+                        import time as _time
+                        low_d = (direct or "").lower()
+                        bad_dump = (
+                            "[untranslated" in low_d
+                            or "kuch hissa translate nahi" in low_d
+                            or (
+                                has_non_latin_script(direct)
+                                and non_latin_ratio(direct) > 0.35
+                            )
+                        )
+                        if bad_dump:
+                            print(
+                                "[AGENT] DIRECT_OBS untranslated/native dump — "
+                                "forcing summary refine from RAW_CACHE"
+                            )
+                            _vid = _extract_youtube_id(primary_url)
+                            _raw = None
+                            if _vid and _vid in _RAW_SPEECH_CACHE:
+                                _txt, _exp = _RAW_SPEECH_CACHE[_vid]
+                                if _time.time() <= _exp and _txt and not _desc(_txt):
+                                    _raw = _txt
+                            if _raw:
+                                try:
+                                    from language_policy import detect_output_lang
+                                    _rl = detect_output_lang(_intent_low or "")
+                                except Exception:
+                                    _rl = "en" if _lang == "en" else "roman_urdu"
+                                _retry = _refine_transcript_compact(
+                                    _raw,
+                                    title="",
+                                    mode="summary",
+                                    target_words=tw or 1000,
+                                    output_lang=_rl,
+                                    user_request=(_intent_text or "")[:500],
+                                )
+                                if (
+                                    _retry
+                                    and not _desc(_retry)
+                                    and len(_retry) >= 80
+                                    and non_latin_ratio(_retry) < 0.25
+                                ):
+                                    direct = _retry
+                                    logging.getLogger("mojo.agent").info(
+                                        "DIRECT_OBS_RETRY summary chars=%s",
+                                        len(direct),
+                                    )
+                    except Exception as _ue:
+                        print(f"[AGENT] untranslated-dump gate skip: {_ue}")
+
                 if direct and len(direct) >= 20:
                     print(
                         "[AGENT] force transcribe/preview → direct OBS reply "

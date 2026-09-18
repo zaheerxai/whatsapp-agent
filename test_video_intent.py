@@ -41,6 +41,7 @@ CASES = [
     ("thanks", None, False, False, False),
     # Long detailed asks must force (was broken: only ≤6 tokens → browse title only)
     (
+        # "what was said" / "dont miss" → transcript (spoken wording)
         "tell me in depth about all ideas and implementation of them covered "
         "in the day 12 video in english, each point detailed what was said "
         "dont miss anything",
@@ -50,8 +51,16 @@ CASES = [
         True,
     ),
     (
+        # explain / analysis → structured summary, NOT raw transcript dump
         "explain the video ideas and implementation in detail",
-        "transcript",
+        "summary",
+        False,
+        False,
+        True,
+    ),
+    (
+        "Explain this point by point, action by action, do a very in depth analysis",
+        "summary",
         False,
         False,
         True,
