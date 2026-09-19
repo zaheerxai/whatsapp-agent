@@ -2949,6 +2949,47 @@ def _try_oembed_about(url: str) -> Optional[str]:
     return None
 
 
+
+def _resolve_ytdlp_cookies(*, context: str = "ytdlp") -> Optional[str]:
+    """
+    Resolve YTDLP_COOKIES env to a real cookiefile path.
+    Logs once per call so Render/deploy misconfig is obvious in mojo logs.
+    """
+    raw = (os.getenv("YTDLP_COOKIES") or "").strip()
+    if not raw:
+        msg = f"[cookies] {context}: YTDLP_COOKIES unset — yt-dlp will run without cookies"
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
+        return None
+    if os.path.isfile(raw):
+        try:
+            size = os.path.getsize(raw)
+        except OSError:
+            size = -1
+        msg = (
+            f"[cookies] {context}: using cookiefile path={raw!r} size={size}b"
+        )
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
+        return raw
+    msg = (
+        f"[cookies] {context}: YTDLP_COOKIES set but not a file path={raw!r} "
+        f"(cwd={os.getcwd()!r}) — cookies NOT applied"
+    )
+    print(msg)
+    try:
+        logging.getLogger("mojo").warning(msg)
+    except Exception:
+        pass
+    return None
+
+
 def _try_ytdlp_metadata_about(url: str) -> Optional[str]:
     """
     yt-dlp extract_info (no download) → title/description/uploader.
@@ -2981,8 +3022,8 @@ def _try_ytdlp_metadata_about(url: str) -> Optional[str]:
     elif _is_facebook_url(u):
         opts["http_headers"]["Referer"] = "https://www.facebook.com/"
 
-    cookies_path = (os.getenv("YTDLP_COOKIES") or "").strip()
-    if cookies_path and os.path.isfile(cookies_path):
+    cookies_path = _resolve_ytdlp_cookies(context="yt_opts")
+    if cookies_path:
         opts["cookiefile"] = cookies_path
 
     try:
@@ -3139,7 +3180,7 @@ def _try_ytdlp_subs(url: str, with_timestamps: bool) -> Optional[str]:
         ["android", "ios"],
         ["tv"],
     )
-    cookies = (os.getenv("YTDLP_COOKIES") or "").strip()
+    cookies = _resolve_ytdlp_cookies(context="caption_or_dl")
 
     for clients in clients_try:
         opts: Dict[str, Any] = {
@@ -3163,7 +3204,7 @@ def _try_ytdlp_subs(url: str, with_timestamps: bool) -> Optional[str]:
                 ),
             },
         }
-        if cookies and os.path.isfile(cookies):
+        if cookies:
             opts["cookiefile"] = cookies
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -3300,8 +3341,8 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
     }
 
     # Optional cookies file (set YTDLP_COOKIES=/path/to/cookies.txt on the host)
-    cookies_path = (os.getenv("YTDLP_COOKIES") or "").strip()
-    if cookies_path and os.path.isfile(cookies_path):
+    cookies_path = _resolve_ytdlp_cookies(context="ytdlp_download")
+    if cookies_path:
         base_opts["cookiefile"] = cookies_path
 
     attempt_opts: List[Dict[str, Any]] = []
