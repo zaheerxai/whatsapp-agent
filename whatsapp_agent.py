@@ -123,12 +123,38 @@ SESSION_OBJECT = "whatsapp_session.db"
 # Change-detected uploads: default 30 min (was 5). Override with SESSION_UPLOAD_SEC.
 SESSION_UPLOAD_INTERVAL_SEC = int(os.environ.get("SESSION_UPLOAD_SEC", "1800"))
 
-# Set once at startup. True = local testing (different number) → never upload.
+# Set once at startup by get_session_path(). True = laptop/dev → never upload/download
+# the shared Supabase session (avoids clobbering the production pair with a local QR).
 IS_LOCAL_MODE = False
 
 # Last successful upload fingerprint (size + mtime). Avoids re-uploading unchanged DB.
 _last_session_upload = {"size": None, "mtime": None}
 _session_upload_lock = threading.Lock()
+
+
+def _is_cloud_host() -> bool:
+    """True when running on Render (or forced cloud). File presence is NOT a signal.
+
+    Bug this fixes: after the first bucket download (or any in-place process
+    restart) whatsapp_session.db exists on disk. The old heuristic treated that
+    as 'local mode' and disabled uploads on the live Render service.
+    """
+    force_cloud = (os.environ.get("FORCE_CLOUD_SESSION") or "").strip().lower()
+    if force_cloud in ("1", "true", "yes", "on"):
+        return True
+    force_local = (os.environ.get("LOCAL_MODE") or "").strip().lower()
+    if force_local in ("1", "true", "yes", "on"):
+        return False
+    # Render sets these on every service; any one is enough.
+    if (
+        os.environ.get("RENDER")
+        or os.environ.get("RENDER_SERVICE_ID")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("RENDER_INSTANCE_ID")
+    ):
+        return True
+    return False
+
 
 # WhatsApp auto-logs out linked devices after ~30 days of *device* inactivity
 # (official FAQ). WebSocket keep-alives from whatsmeow keep the socket up but do
@@ -224,20 +250,47 @@ def _upload_session_to_bucket(force: bool = False) -> dict:
 
 def get_session_path():
     """
-    Priority:
-    1. Local file exists → local testing mode (different number). Never touch the bucket.
-    2. No local file → Render/ephemeral mode → download from bucket if present.
+    Resolve the session DB path and set IS_LOCAL_MODE.
+
+    Cloud (Render / FORCE_CLOUD_SESSION):
+      - Always allow upload/download.
+      - If no local file yet, pull from Supabase Storage.
+      - If file already exists (in-place restart), reuse it — do NOT flip to local.
+
+    Local (laptop / LOCAL_MODE=1 / no cloud env):
+      - If a session file is already in cwd, use it and never touch the shared bucket
+        (protects the production pair from a dev QR).
+      - If no file, still create a fresh local path (QR scan) without uploading.
     """
     global IS_LOCAL_MODE
 
-    if os.path.exists(LOCAL_SESSION_FILE):
-        IS_LOCAL_MODE = True
-        print("[SESSION] Local session file found → local testing mode (uploads DISABLED)")
+    if _is_cloud_host():
+        IS_LOCAL_MODE = False
+        if os.path.exists(LOCAL_SESSION_FILE):
+            print(
+                "[SESSION] Cloud host + existing session file → "
+                "reuse local DB, uploads ENABLED"
+            )
+        else:
+            print(
+                "[SESSION] Cloud host, no local session → "
+                "downloading from bucket if present..."
+            )
+            _download_session_from_bucket()
         return LOCAL_SESSION_FILE
 
-    IS_LOCAL_MODE = False
-    print("[SESSION] No local session file → ephemeral/Render mode, checking bucket...")
-    _download_session_from_bucket()
+    # Laptop / explicit local
+    IS_LOCAL_MODE = True
+    if os.path.exists(LOCAL_SESSION_FILE):
+        print(
+            "[SESSION] Local host + session file → local mode "
+            "(uploads DISABLED — will not touch production bucket)"
+        )
+    else:
+        print(
+            "[SESSION] Local host, no session file → local mode "
+            "(fresh QR; uploads DISABLED)"
+        )
     return LOCAL_SESSION_FILE
 
 
@@ -246,6 +299,7 @@ def get_session_upload_status() -> dict:
     stat = _session_file_stat()
     return {
         "local_mode": IS_LOCAL_MODE,
+        "cloud_host": _is_cloud_host(),
         "path": LOCAL_SESSION_FILE,
         "exists": stat is not None,
         "bytes": stat[0] if stat else 0,

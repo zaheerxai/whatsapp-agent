@@ -653,7 +653,7 @@ def cmd_sessionstatus(args):
         last_b = st.get("last_upload_bytes")
         last_kb = f"{last_b / 1024:.1f} KB" if last_b is not None else "never"
         lines = [
-            f"Local mode: {st.get('local_mode')}",
+            f"Local mode: {st.get('local_mode')} (cloud_host={st.get('cloud_host')})",
             f"Path: {st.get('path')} ({'exists' if st.get('exists') else 'missing'})",
             f"Size: {kb:.1f} KB",
             f"Last uploaded size: {last_kb}",
