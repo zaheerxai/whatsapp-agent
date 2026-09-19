@@ -31,8 +31,9 @@ log = logging.getLogger("mojo")
 
 from openai import OpenAI, RateLimitError
 from neonize.client import NewClient
-from neonize.events import MessageEv
+from neonize.events import MessageEv, ConnectedEv
 from neonize.utils import build_jid
+from neonize.utils.enum import Presence
 from supabase import create_client, Client
 
 # Import this AFTER load_dotenv() so it can see the variables
@@ -128,6 +129,17 @@ IS_LOCAL_MODE = False
 # Last successful upload fingerprint (size + mtime). Avoids re-uploading unchanged DB.
 _last_session_upload = {"size": None, "mtime": None}
 _session_upload_lock = threading.Lock()
+
+# WhatsApp auto-logs out linked devices after ~30 days of *device* inactivity
+# (official FAQ). WebSocket keep-alives from whatsmeow keep the socket up but do
+# NOT refresh the "Last active" timestamp shown on the primary phone. Periodic
+# Presence.AVAILABLE is the reliable, low-cost signal that resets that clock.
+# Default every 6h → well under the 30-day window even with multi-day outages.
+# Override with PRESENCE_KEEPALIVE_HOURS (float hours, min 0.5). Set 0 to disable.
+PRESENCE_KEEPALIVE_HOURS = float(os.environ.get("PRESENCE_KEEPALIVE_HOURS", "6"))
+_presence_keepalive_started = False
+_presence_keepalive_lock = threading.Lock()
+_last_presence_sent_at = None  # unix ts of last successful send_presence
 
 
 def _session_file_stat():
@@ -419,6 +431,80 @@ def start_self_ping(interval_seconds=600):
     t = threading.Thread(target=loop, daemon=True)
     t.start()
     print(f"[SELF-PING] Started (every {interval_seconds}s) → {url}")
+
+
+def _send_presence_available(reason: str = "keepalive") -> bool:
+    """Broadcast Presence.AVAILABLE so WhatsApp refreshes linked-device last-active.
+
+    Returns True on success. Safe to call when disconnected — fails quietly.
+    """
+    global _last_presence_sent_at
+    try:
+        client.send_presence(Presence.AVAILABLE)
+        _last_presence_sent_at = time.time()
+        log.info("PRESENCE available sent (%s)", reason)
+        print(f"[PRESENCE] available sent ({reason})")
+        return True
+    except Exception as e:
+        log.warning("PRESENCE send failed (%s): %s", reason, e)
+        print(f"[PRESENCE] send failed ({reason}): {e}")
+        return False
+
+
+def start_presence_keepalive(hours: float | None = None):
+    """Background loop: send Presence.AVAILABLE every N hours.
+
+    WhatsApp disconnects linked devices after ~30 days of device inactivity.
+    Socket keep-alives alone do not update the primary-phone 'Last active'
+    stamp. Presence.AVAILABLE does. Interval default 6h is conservative and
+    far below the 30-day limit; 0 disables the loop.
+    """
+    global _presence_keepalive_started
+    if hours is None:
+        hours = PRESENCE_KEEPALIVE_HOURS
+    if hours <= 0:
+        print("[PRESENCE] Keepalive disabled (PRESENCE_KEEPALIVE_HOURS<=0)")
+        return
+    # Clamp so a misconfigured env cannot spam WhatsApp
+    hours = max(0.5, min(float(hours), 48.0))
+    interval_sec = int(hours * 3600)
+
+    with _presence_keepalive_lock:
+        if _presence_keepalive_started:
+            return
+        _presence_keepalive_started = True
+
+    def loop():
+        # First tick after one full interval; connect handler already sent once.
+        while True:
+            time.sleep(interval_sec)
+            try:
+                if getattr(client, "is_connected", False):
+                    _send_presence_available("periodic")
+                else:
+                    log.debug("PRESENCE skip — client not connected")
+            except Exception as e:
+                log.warning("PRESENCE loop error: %s", e)
+
+    t = threading.Thread(target=loop, name="presence-keepalive", daemon=True)
+    t.start()
+    print(f"[PRESENCE] Keepalive started (every {hours}h / {interval_sec}s)")
+
+
+def get_presence_keepalive_status() -> dict:
+    """Status blob for /sessionstatus diagnostics."""
+    return {
+        "enabled": PRESENCE_KEEPALIVE_HOURS > 0,
+        "interval_hours": PRESENCE_KEEPALIVE_HOURS,
+        "started": _presence_keepalive_started,
+        "last_sent_at": _last_presence_sent_at,
+        "last_sent_ago_sec": (
+            round(time.time() - _last_presence_sent_at, 1)
+            if _last_presence_sent_at
+            else None
+        ),
+    }
+
 
 # Trigger words that tell the bot to save something permanently.
 # This is the simple/cheap version — see maybe_save_memory_smart() below for a
@@ -2596,6 +2682,23 @@ def _should_skip_duplicate(message) -> bool:
     return False
 
 
+@client.event(ConnectedEv)
+def on_connected(client: NewClient, event: ConnectedEv):
+    """On every successful connect (including reconnects): mark device active + start keepalive.
+
+    WhatsApp's 30-day linked-device inactivity timer is driven by last activity on
+    the companion device, not by socket keep-alives. Presence.AVAILABLE is the
+    lightest signal that reliably refreshes that stamp on the primary phone.
+    """
+    try:
+        log.info("ConnectedEv — sending presence + ensuring keepalive")
+        print("[PRESENCE] ConnectedEv — marking device active")
+        _send_presence_available("connect")
+        start_presence_keepalive()
+    except Exception as e:
+        log.warning("ConnectedEv presence setup failed: %s", e)
+
+
 @client.event(MessageEv)
 def on_message(client: NewClient, message: MessageEv):
     # Instantly hand off the heavy lifting to a background thread — daemon=True so
@@ -3347,6 +3450,13 @@ if __name__ == "__main__":
     try:
         client.connect()
         refresh_bot_identities(client)
+        # Mark linked device active immediately (ConnectedEv may already have
+        # fired; this is a safe second shot if the event was missed on slow boot).
+        try:
+            _send_presence_available("startup")
+            start_presence_keepalive()
+        except Exception as _pe:
+            log.warning("startup presence failed: %s", _pe)
         # Persist the session as soon as we are connected (covers first QR scan too).
         # force=True so the fingerprint is seeded even if size/mtime look "new".
         _upload_session_to_bucket(force=True)

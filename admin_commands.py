@@ -660,6 +660,19 @@ def cmd_sessionstatus(args):
             f"Interval: {st.get('interval_sec')}s (change-detected)",
             f"Bucket: {st.get('bucket')}",
         ]
+        # Linked-device 30-day inactivity keepalive (Presence.AVAILABLE)
+        try:
+            pr = wa.get_presence_keepalive_status()
+            ago = pr.get("last_sent_ago_sec")
+            ago_s = f"{ago:.0f}s ago" if ago is not None else "never"
+            lines.append(
+                f"Presence keepalive: "
+                f"{'ON' if pr.get('enabled') else 'OFF'} "
+                f"every {pr.get('interval_hours')}h | "
+                f"started={pr.get('started')} | last={ago_s}"
+            )
+        except Exception as _pe:
+            lines.append(f"Presence keepalive: (status error: {_pe})")
         return "\n".join(lines)
     except Exception as e:
         return f"sessionstatus failed: {e}"
