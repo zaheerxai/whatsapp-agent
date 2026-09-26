@@ -246,16 +246,21 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "save_memory",
             "description": (
-                "Save a durable fact, rule, or preference for this chat so it persists "
-                "across future conversations. Use when user says 'remember that...', "
-                "'from now on...', or gives a standing instruction."
+                "Save a durable fact, rule, preference, or full profile/resume for this chat "
+                "so it persists across future conversations. Use when user says "
+                "'always remember', 'remember this', 'yaad rakh', 'from now on...', or gives "
+                "a standing instruction. When a quoted body / resume / OCR dump is present, "
+                "pass the FULL content as note (do not collapse to a 1-line stub)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "note": {
                         "type": "string",
-                        "description": "Short clean fact/rule to store",
+                        "description": (
+                            "Content to store. Short fact/rule for simple prefs; "
+                            "FULL quoted body / resume / profile when user is storing a document."
+                        ),
                     },
                     "sender_id": {
                         "type": "string",
@@ -1127,16 +1132,31 @@ def _tool_save_memory(args: dict, ctx: dict) -> str:
     note = (args.get("note") or "").strip()
     if not note:
         return "Empty note — nothing saved."
+    # Reject pure command stubs the model used to emit ("Remember @7310…")
+    # when the real body lived in the quoted message. Require substance.
+    _stub = re.sub(r"@\d[\d\s]*", " ", note, flags=re.I)
+    _stub = re.sub(
+        r"(?i)\b(always\s+)?remember( this| that)?\b|\byaad\s+rakh\w*\b",
+        " ",
+        _stub,
+    )
+    _stub = re.sub(r"\s+", " ", _stub).strip(" \t\n\r-–—:|")
+    if len(_stub) < 12 and len(note) < 40:
+        return (
+            "Note too thin (looks like a command stub). "
+            "Pass the FULL quoted body / resume / fact as the note."
+        )
     sender_id = args.get("sender_id") or ctx.get("sender_id") or "unknown"
     try:
         _supabase.table("group_memory").insert(
             {
                 "chat_id": ctx["chat_id"],
                 "sender_id": sender_id,
-                "note": note,
+                "note": note[:12000],
             }
         ).execute()
-        return f"Saved permanent note: {note}"
+        preview = note[:120] + ("…" if len(note) > 120 else "")
+        return f"Saved permanent note ({len(note)} chars): {preview}"
     except Exception as e:
         return f"Failed to save note: {e}"
 

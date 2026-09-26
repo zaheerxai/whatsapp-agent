@@ -560,12 +560,59 @@ def get_presence_keepalive_status() -> dict:
     }
 
 
-# Trigger words that tell the bot to save something permanently.
-# This is the simple/cheap version — see maybe_save_memory_smart() below for a
-# version that catches rules that don't use any of these exact words.
-MEMORY_TRIGGERS = ["always remember"]
+# Trigger phrases that tell the bot to save something permanently into group_memory.
+# Keep Roman Urdu + English forms; match is case-insensitive substring on lowered text.
+MEMORY_TRIGGERS = (
+    "always remember",
+    "remember this",
+    "remember that",
+    "yaad rakh",
+    "yaad rakho",
+    "yaad rakhna",
+    "yaad kar lo",
+    "yaad karlo",
+    "permanent note",
+    "hamesha yaad",
+    "from now on remember",
+    "save this permanently",
+)
 
 
+def _extract_memory_note_body(text_content: str) -> str:
+    """Pull the durable content out of a 'remember …' message.
+
+    Prefer the quoted body (resume OCR, profile dump, standing rule) over the
+    command wrapper ('Always remember @bot'). Falls back to residual user text
+    with trigger phrases and @mentions stripped.
+    """
+    raw = (text_content or "").strip()
+    if not raw:
+        return ""
+
+    # Prefer explicit [Quoted Message] block when present
+    m = re.search(
+        r"\[Quoted Message\]:\s*(.+)$",
+        raw,
+        flags=re.I | re.S,
+    )
+    if m:
+        body = m.group(1).strip()
+        # Drop trailing bot self-quotes / part markers that are not the note
+        if body and len(body) >= 20:
+            return body[:12000]
+
+    # No quote — strip trigger phrases, @mentions, and common command noise
+    residual = raw
+    residual = re.sub(r"@\d[\d\s]*", " ", residual)
+    for trig in MEMORY_TRIGGERS:
+        residual = re.sub(re.escape(trig), " ", residual, flags=re.I)
+    residual = re.sub(
+        r"(?i)\b(always|please|pls|karo|kar lo|karlo|this|that)\b",
+        " ",
+        residual,
+    )
+    residual = re.sub(r"\s+", " ", residual).strip(" \t\n\r-–—:|")
+    return residual[:12000]
 
 
 def build_chat_debug_log_text(n: int = 200) -> str:
@@ -992,23 +1039,27 @@ def resolve_mentions(text, reverse_map_or_tuple):
 
 
 def maybe_save_memory(chat_id, sender_id, text_content):
-    """Keyword version: if the message contains a 'remember this' trigger, save it
-    permanently for this chat. Fetched separately from chat_history with NO .limit(),
-    so — unlike the rolling 50-message window — it never ages out.
-    Known gap: this is a plain substring match, so it will miss instructions that
-    don't use one of the MEMORY_TRIGGERS words (e.g. "no more jokes, izzat se baat
-    karna" has no trigger word in it and would slip through). See
-    maybe_save_memory_smart() for the fix."""
-    lowered = text_content.lower()
+    """Keyword version: if the message contains a memory trigger, extract the
+    durable body (prefer quoted content) and store it in group_memory.
+
+    Previously this dumped the entire command wrapper + @mention + quote blob,
+    which produced useless notes like 'Always remember @bot\\n\\n[Quoted…]' and
+    also raced the agent save_memory tool into saving a 1-line stub.
+    """
+    lowered = (text_content or "").lower()
     if not any(trigger in lowered for trigger in MEMORY_TRIGGERS):
+        return
+    note = _extract_memory_note_body(text_content)
+    if not note or len(note) < 8:
+        log.info("MEMORY_SKIP empty/too-short after extract from %r", (text_content or "")[:120])
         return
     try:
         supabase.table("group_memory").insert({
             "chat_id": chat_id,
             "sender_id": sender_id,
-            "note": text_content,
+            "note": note,
         }).execute()
-        log.info("MEMORY_SAVED %r", text_content)
+        log.info("MEMORY_SAVED chars=%d preview=%r", len(note), note[:160])
     except Exception as e:
         log.error(f"Error saving memory: {e}")
 

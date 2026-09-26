@@ -289,12 +289,17 @@ _GREETING_TOKENS = frozenset({
     "ye", "yeh", "this",
 })
 
-# Commands / non-video intents — never force-transcribe even if a video URL is present
+# Commands / non-content intents — never force-transcribe/browse even if a URL is present
 _BLOCK_FORCE_VIDEO_PHRASES = frozenset({
     # reminders
     "reminder", "remind", "reminders", "yaad", "alarm",
     "set karo", "set kar", "list reminder", "cancel reminder",
     "cancel karo", "delete reminder", "sab cancel",
+    # permanent memory / standing notes (must not force-browse incidental links)
+    "always remember", "remember this", "remember that",
+    "yaad rakh", "yaad rakho", "yaad rakhna", "yaad kar lo", "yaad karlo",
+    "hamesha yaad", "permanent note", "save this permanently",
+    "from now on remember",
     # admin / ops
     "enable", "disable", "status", "/enable", "/disable", "/status",
     "/help", "/chats", "feature",
@@ -310,6 +315,8 @@ _BLOCK_FORCE_VIDEO_TOKENS = frozenset({
     "reminder", "remind", "reminders", "yaad", "alarm",
     "enable", "disable", "bhejo", "bhej", "delete", "remove",
     "milte", "meeting", "cancel", "forward",
+    # memory tokens (after strip, "remember" alone should still block force URL tools)
+    "remember", "rakh", "rakho", "rakhna",
 })
 
 
@@ -328,7 +335,9 @@ def is_video_url(u: str) -> bool:
 
 
 def _is_blocked_force_command(text_low: str) -> bool:
-    """True when residual is a reminder/admin/imperative — do not force video tools."""
+    """True when residual is a reminder/memory/admin/imperative — do not force
+    video or browse tools (incidental links inside a 'remember this' quote must
+    not hijack the turn into a GitHub profile listing)."""
     t = _strip_intent_noise(text_low).lower()
     if not t:
         return False
@@ -825,6 +834,10 @@ def _build_system_prompt(
    - ye photo kya hai / what is in this image / describe → describe only (image_describe / vision). Do NOT write OneDrive.
    - Never claim "saved"/"noted" unless note_down returned success.
    - Do not ask "kis cheez ko note karna hai?" when quoted/OCR content is already present.
+11c. PERMANENT MEMORY (save_memory / "always remember" / "yaad rakh"):
+   - When the user says always remember / remember this / yaad rakh / permanent note AND a quoted body or long profile/resume is present → call save_memory with the FULL quoted/profile content (not a 1-line stub like "Remember @bot").
+   - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
+   - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
 
 {style_hint}
 {format_block}
@@ -1104,8 +1117,26 @@ def run_agent(
         memory_notes = _get_group_memory(chat_id) if _get_group_memory else []
         memory_block = ""
         if memory_notes:
-            # Cap memory block size too
-            clipped = [str(n)[:200] for n in memory_notes[:12]]
+            # Prefer longer clips for profile/resume notes so later turns
+            # (e.g. "write intro for this job") still see name, skills, exp.
+            # Cap total injected chars so we never blow the context budget.
+            clipped = []
+            budget = 3500
+            for n in memory_notes[:16]:
+                s = str(n or "").strip()
+                if not s:
+                    continue
+                # Profile-like notes get up to 1200 chars; short rules stay short
+                per = 1200 if len(s) > 400 else 280
+                take = s[:per]
+                if len(take) > budget:
+                    take = take[: max(0, budget)]
+                if not take:
+                    break
+                clipped.append(take)
+                budget -= len(take)
+                if budget <= 0:
+                    break
             memory_block = "PERMANENT NOTES FOR THIS CHAT:\n" + "\n".join(
                 f"- {n}" for n in clipped
             )
@@ -1687,7 +1718,7 @@ def run_agent(
                         "video links here. Do NOT invent a transcript or summary."
                     ),
                 })
-            elif can_browse:
+            elif can_browse and not blocked_cmd:
                 print(f"[AGENT] force browse_url for: {urls_in_last}")
                 try:
                     _forced_observation = execute_tool(
@@ -1727,6 +1758,13 @@ def run_agent(
                     ),
                 })
                 tools_for_next = None  # synthesis only — no tool schema payload
+            elif blocked_cmd and urls_in_last:
+                # Remember / reminder / admin intent — do NOT force-browse incidental
+                # links embedded in a quoted resume, job post, or standing note.
+                print(
+                    f"[AGENT] SKIP force URL tools — blocked command intent "
+                    f"{_strip_intent_noise(_intent_low)[:80]!r}"
+                )
             else:
                 # URL present but neither transcribe nor browse is allowed
                 print(
