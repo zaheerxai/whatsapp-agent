@@ -647,22 +647,90 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
 
 # ---------------------------------------------------------------------------
-# Email draft store (per chat+sender; survives process for active session)
+# Email draft store
+# Owner-only; keyed primarily by chat_id so LID vs phone number never misses.
+# Also mirrored under chat|sender_id and chat|sender_num for safety.
+# Optional /tmp JSON so a quick process bounce still has the last draft.
 # ---------------------------------------------------------------------------
 
 _EMAIL_DRAFTS: Dict[str, Dict[str, Any]] = {}
+_EMAIL_DRAFT_FILE = os.environ.get(
+    "EMAIL_DRAFT_FILE", "/tmp/mojo_email_drafts.json"
+)
+
+
+def _draft_keys(ctx: dict) -> List[str]:
+    chat = str((ctx or {}).get("chat_id") or "").strip()
+    sid = str((ctx or {}).get("sender_id") or "").strip()
+    snum = str((ctx or {}).get("sender_num") or "").strip()
+    keys: List[str] = []
+    if chat:
+        keys.append(f"{chat}|owner")  # primary stable key for owner drafts
+        if sid:
+            keys.append(f"{chat}|{sid}")
+        if snum and snum != sid:
+            keys.append(f"{chat}|{snum}")
+    return keys
 
 
 def _draft_key(ctx: dict) -> str:
-    chat = str((ctx or {}).get("chat_id") or "")
-    sender = str((ctx or {}).get("sender_id") or (ctx or {}).get("sender_num") or "")
-    return f"{chat}|{sender}"
+    keys = _draft_keys(ctx)
+    return keys[0] if keys else "unknown"
+
+
+def _load_drafts_from_disk() -> None:
+    if _EMAIL_DRAFTS:
+        return
+    try:
+        if os.path.isfile(_EMAIL_DRAFT_FILE):
+            with open(_EMAIL_DRAFT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _EMAIL_DRAFTS.update(data)
+    except Exception as e:
+        print(f"[email_draft] load failed: {e}")
+
+
+def _save_drafts_to_disk() -> None:
+    try:
+        with open(_EMAIL_DRAFT_FILE, "w", encoding="utf-8") as f:
+            json.dump(_EMAIL_DRAFTS, f)
+    except Exception as e:
+        print(f"[email_draft] save failed: {e}")
+
+
+def _get_draft(ctx: dict) -> Optional[Dict[str, Any]]:
+    _load_drafts_from_disk()
+    for k in _draft_keys(ctx):
+        d = _EMAIL_DRAFTS.get(k)
+        if d:
+            return d
+    return None
+
+
+def _put_draft(ctx: dict, draft: Dict[str, Any]) -> None:
+    _load_drafts_from_disk()
+    for k in _draft_keys(ctx):
+        _EMAIL_DRAFTS[k] = draft
+    _save_drafts_to_disk()
+
+
+def _pop_draft(ctx: dict) -> Optional[Dict[str, Any]]:
+    _load_drafts_from_disk()
+    draft = _get_draft(ctx)
+    for k in list(_EMAIL_DRAFTS.keys()):
+        # drop every key that points at this same draft object / chat
+        chat = str((ctx or {}).get("chat_id") or "")
+        if chat and k.startswith(f"{chat}|"):
+            _EMAIL_DRAFTS.pop(k, None)
+    _save_drafts_to_disk()
+    return draft
 
 
 def _format_draft(d: Dict[str, Any]) -> str:
     attach = d.get("attach_resume") or "ask"
     lines = [
-        "📧 EMAIL DRAFT",
+        "EMAIL DRAFT",
         f"To: {d.get('to') or '(missing)'}",
         f"Subject: {d.get('subject') or '(missing)'}",
         f"Attach resume: {attach}"
@@ -683,9 +751,97 @@ def _format_draft(d: Dict[str, Any]) -> str:
 def _owner_ok(ctx: dict) -> bool:
     if not _OWNER_SENDER_ID:
         return False
-    sid = str((ctx or {}).get("sender_id") or "")
-    snum = str((ctx or {}).get("sender_num") or "")
-    return sid == str(_OWNER_SENDER_ID) or snum == str(_OWNER_SENDER_ID)
+    owner = str(_OWNER_SENDER_ID).strip()
+    sid = str((ctx or {}).get("sender_id") or "").strip()
+    snum = str((ctx or {}).get("sender_num") or "").strip()
+    # Also accept bare number match when LID/server suffix present
+    candidates = {sid, snum}
+    for c in list(candidates):
+        if c and "@" in c:
+            candidates.add(c.split("@")[0])
+        if c and c.isdigit():
+            candidates.add(c)
+    return owner in candidates or any(
+        c == owner or c.endswith(owner) or owner.endswith(c)
+        for c in candidates
+        if c
+    )
+
+
+def parse_direct_email_command(text: str) -> Optional[Dict[str, str]]:
+    """
+    Parse 'email this to a@b.com:' / 'email to a@b.com' / subject+body forms.
+    Returns {to, subject, body} or None.
+    """
+    if not text:
+        return None
+    # Strip bot @mention noise
+    t = re.sub(r"@\d[\d\s]*", " ", text)
+    t = re.sub(r"\[Quoted Message\]:.*", " ", t, flags=re.I | re.S)
+    t = t.strip()
+    low = t.lower()
+
+    # email this to X: / email to X / send email to X
+    m = re.search(
+        r"(?:email\s+this\s+to|email\s+to|send\s+(?:this\s+)?email\s+to|"
+        r"mail\s+this\s+to|mail\s+to)\s*"
+        r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\s*:?\s*",
+        t,
+        flags=re.I,
+    )
+    if not m:
+        return None
+    to = m.group(1).strip()
+    rest = t[m.end() :].strip()
+    subject = ""
+    body = rest
+    # Optional "subject: ..." first line
+    sm = re.match(
+        r"(?is)^(?:subject|subj)\s*:\s*(.+?)(?:\n+|$)(.*)$",
+        rest,
+    )
+    if sm:
+        subject = sm.group(1).strip()
+        body = (sm.group(2) or "").strip()
+    if not body:
+        body = rest or " "
+    if not subject:
+        # First line as subject only if short; else invent later
+        first = (body.split("\n", 1)[0] or "").strip()
+        if first and len(first) <= 80 and "\n" in body:
+            subject = first
+            body = body.split("\n", 1)[1].strip()
+        else:
+            subject = "Quick note"
+    return {"to": to, "subject": subject, "body": body}
+
+
+def is_email_send_confirm(text: str) -> bool:
+    head = re.split(r"\[quoted message\]:", (text or "").lower(), maxsplit=1)[0]
+    head = re.sub(r"@\d[\d\s]*", " ", head)
+    head = re.sub(r"https?://\S+", " ", head)
+    head = re.sub(r"[^\w\s]", " ", head)
+    head = re.sub(r"\s+", " ", head).strip()
+    phrases = (
+        "send it",
+        "send now",
+        "bhej do",
+        "bhej dena",
+        "bhej de",
+        "confirm send",
+        "haan bhej",
+        "han bhej",
+        "yes send",
+        "send email",
+        "send the email",
+        "send the draft",
+        "go ahead send",
+        "approve send",
+    )
+    if any(p in head for p in phrases):
+        return True
+    tokens = head.split()
+    return tokens in (["send"], ["bhej"], ["confirm"])
 
 
 def _tool_draft_email(args: dict, ctx: dict) -> str:
@@ -693,8 +849,7 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
         return "Permission denied: only the bot owner can draft/send emails."
 
     action = (args.get("action") or "create").strip().lower()
-    key = _draft_key(ctx)
-    existing = _EMAIL_DRAFTS.get(key)
+    existing = _get_draft(ctx)
 
     if action == "show":
         if not existing:
@@ -702,8 +857,8 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
         return _format_draft(existing)
 
     if action == "cancel":
-        if key in _EMAIL_DRAFTS:
-            del _EMAIL_DRAFTS[key]
+        if existing:
+            _pop_draft(ctx)
             return "Draft cancelled."
         return "No draft to cancel."
 
@@ -725,7 +880,7 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
         if args.get("purpose"):
             existing["purpose"] = str(args["purpose"]).strip()
         existing["updated_at"] = time.time()
-        _EMAIL_DRAFTS[key] = existing
+        _put_draft(ctx, existing)
         return "Draft updated.\n\n" + _format_draft(existing)
 
     # create
@@ -740,7 +895,6 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
     cc = (args.get("cc") or "").strip() or None
 
     if not to:
-        # try extract from body context is agent's job; we still allow incomplete draft
         return (
             "Missing recipient (to). Extract email from the JD / quoted message "
             "or ask the user for the address, then call draft_email again."
@@ -750,7 +904,6 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
     if not body:
         return "Missing body. Write a concise high-impact email body, then create the draft."
     if not subject:
-        # soft default
         subject = "Introduction / Application"
 
     draft = {
@@ -764,12 +917,15 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
         "created_at": time.time(),
         "updated_at": time.time(),
     }
-    _EMAIL_DRAFTS[key] = draft
+    _put_draft(ctx, draft)
+    logging.getLogger("mojo.agent").info(
+        "EMAIL_DRAFT_SAVED to=%s subject=%r attach=%s", to, subject[:60], attach
+    )
     extra = ""
     if attach == "ask":
         extra = (
-            "\n\n⚠️ Attachment undecided. Confirm: attach resume PDF? "
-            "(yes / no). Reason noted: "
+            "\n\nAttachment undecided. Confirm: attach resume PDF? "
+            "(yes / no). Reason: "
             + (reason or "not specified")
         )
     elif attach == "true":
@@ -778,11 +934,11 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
 
             path, src = eo.resolve_resume_pdf()
             if not path:
-                extra = f"\n\n⚠️ attach_resume=true but resume file missing: {src}"
+                extra = f"\n\nattach_resume=true but resume file missing: {src}"
             else:
-                extra = f"\n\n📎 Resume ready ({src})"
+                extra = f"\n\nResume ready ({src})"
         except Exception as e:
-            extra = f"\n\n⚠️ Resume check failed: {e}"
+            extra = f"\n\nResume check failed: {e}"
 
     return "Draft created.\n\n" + _format_draft(draft) + extra
 
@@ -794,8 +950,7 @@ def _tool_send_email(args: dict, ctx: dict) -> str:
     if not args.get("confirm"):
         return "Send aborted: confirm must be true. Show the draft and wait for user OK."
 
-    key = _draft_key(ctx)
-    draft = _EMAIL_DRAFTS.get(key)
+    draft = _get_draft(ctx)
     if not draft:
         return "No draft to send. Create one with draft_email first."
 
@@ -850,11 +1005,13 @@ def _tool_send_email(args: dict, ctx: dict) -> str:
     except Exception as e:
         return f"Send failed: {e}"
 
-    # clear draft on success
-    _EMAIL_DRAFTS.pop(key, None)
+    _pop_draft(ctx)
     att = "yes" if result.get("attached") else "no"
+    logging.getLogger("mojo.agent").info(
+        "EMAIL_SENT to=%s id=%s attached=%s", result.get("to"), result.get("id"), att
+    )
     return (
-        f"✅ Sent to {result.get('to')}\n"
+        f"Sent to {result.get('to')}\n"
         f"Subject: {result.get('subject')}\n"
         f"Gmail id: {result.get('id')}\n"
         f"Attached resume: {att}"

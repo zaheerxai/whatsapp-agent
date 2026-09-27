@@ -1306,6 +1306,137 @@ def run_agent(
                     ),
                 })
 
+        # --- Force email draft / send (owner) — never invent a draft without the tool ---
+        # Live bug: model replied "I've created a draft" with zero draft_email call,
+        # so send_email later returned "No draft to send".
+        try:
+            from agent_tools import (
+                parse_direct_email_command as _parse_email_cmd,
+                is_email_send_confirm as _is_email_confirm,
+                _get_draft as _email_get_draft,
+            )
+        except Exception:
+            _parse_email_cmd = None  # type: ignore
+            _is_email_confirm = None  # type: ignore
+            _email_get_draft = None  # type: ignore
+
+        _email_src = latest_user_text or extra_user_note or _intent_src or ""
+        if _parse_email_cmd and _tool_allowed_for_chat(chat_id, "draft_email"):
+            parsed = _parse_email_cmd(_email_src)
+            if parsed and parsed.get("to") and parsed.get("body"):
+                print(
+                    f"[AGENT] force draft_email to={parsed['to']!r} "
+                    f"subj={parsed.get('subject', '')[:40]!r}"
+                )
+                try:
+                    obs = execute_tool(
+                        "draft_email",
+                        {
+                            "action": "create",
+                            "to": parsed["to"],
+                            "subject": parsed.get("subject") or "Quick note",
+                            "body": parsed["body"],
+                            "attach_resume": "false",
+                            "purpose": "direct_send",
+                            "reason": "user gave exact body; no CV requested",
+                        },
+                        tool_ctx,
+                    )
+                except Exception as _ee:
+                    obs = f"Tool error: {_ee}"
+                obs_s = str(obs)
+                logging.getLogger("mojo.agent").info(
+                    "FORCE_DRAFT_EMAIL obs=%s", obs_s[:200]
+                )
+                if "Permission denied" in obs_s:
+                    return _reply("Email draft/send sirf bot owner ke liye available hai.")
+                if obs_s.startswith("Draft created") or obs_s.startswith("Draft updated"):
+                    return _reply(
+                        obs_s
+                        + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                    )
+                # Fall through to agent with observation injected
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_forced_draft_email_0",
+                        "type": "function",
+                        "function": {
+                            "name": "draft_email",
+                            "arguments": json.dumps({
+                                "action": "create",
+                                "to": parsed["to"],
+                                "subject": parsed.get("subject") or "Quick note",
+                                "body": parsed["body"],
+                                "attach_resume": "false",
+                            }),
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": "call_forced_draft_email_0",
+                    "content": obs_s,
+                })
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "draft_email already ran. Show the draft result honestly. "
+                        "Do NOT claim a draft exists if the tool failed. "
+                        "Do NOT call draft_email again this turn unless updating."
+                    ),
+                })
+
+        if (
+            _is_email_confirm
+            and _email_get_draft
+            and _is_email_confirm(_email_src)
+            and _tool_allowed_for_chat(chat_id, "send_email")
+        ):
+            existing_draft = None
+            try:
+                existing_draft = _email_get_draft(tool_ctx)
+            except Exception:
+                existing_draft = None
+            if existing_draft:
+                print(
+                    f"[AGENT] force send_email to={existing_draft.get('to')!r}"
+                )
+                send_args = {"confirm": True}
+                # If draft had attach=ask, default false on bare "send it" unless
+                # user said attach/resume/cv in the confirm message.
+                att = (existing_draft.get("attach_resume") or "ask").lower()
+                low_src = (_email_src or "").lower()
+                if att == "ask":
+                    if any(
+                        w in low_src
+                        for w in ("attach", "resume", "cv", "pdf", "with resume")
+                    ):
+                        send_args["attach_resume_override"] = "true"
+                    else:
+                        send_args["attach_resume_override"] = "false"
+                try:
+                    obs = execute_tool("send_email", send_args, tool_ctx)
+                except Exception as _se:
+                    obs = f"Tool error: {_se}"
+                obs_s = str(obs)
+                logging.getLogger("mojo.agent").info(
+                    "FORCE_SEND_EMAIL obs=%s", obs_s[:240]
+                )
+                return _reply(obs_s)
+            else:
+                # Confirm with no draft — tell user clearly (don't invent send)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "User asked to SEND email but there is NO stored draft for this "
+                        "chat. Do NOT claim you sent anything. Ask them to re-state "
+                        "recipient + body (or quote the prior draft request) so "
+                        "draft_email can run first."
+                    ),
+                })
+
         # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
         urls_in_last = list(force_urls or [])
         if not urls_in_last:
