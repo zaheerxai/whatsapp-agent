@@ -780,34 +780,131 @@ def _owner_ok(ctx: dict) -> bool:
     )
 
 
+# Meta instructions that mean "rewrite the body" — NOT part of the email itself.
+# Matched anywhere in the user message (before or after the ':').
+_EMAIL_REWRITE_PATTERNS = (
+    r"make\s+it\s+(?:more\s+)?(?:professional|formal|casual|friendly|polite|short|concise|warm|firm|assertive)",
+    r"rewrite(?:\s+it)?(?:\s+in\s+(?:a\s+)?[\w\s\-]+)?",
+    r"rephrase(?:\s+it)?",
+    r"polish(?:\s+it)?",
+    r"improve(?:\s+it)?",
+    r"formal\s+(?:bana|kar|tone)",
+    r"professional\s+(?:bana|kar|tone|likho|likh)",
+    r"(?:bana|kar)\s+(?:do\s+)?(?:professional|formal|casual|polite)",
+    r"in\s+a\s+[\w\-]+\s+tone",
+    r"tone\s*:\s*\w+",
+    r"more\s+professional",
+    r"more\s+formal",
+    r"keep\s+it\s+(?:short|brief|casual|formal|professional)",
+    r"word\s+it\s+(?:professionally|formally|politely|better)",
+)
+
+
+def extract_email_rewrite_instruction(text: str) -> str:
+    """Return the rewrite instruction phrase if present, else ''."""
+    if not text:
+        return ""
+    found: List[str] = []
+    for pat in _EMAIL_REWRITE_PATTERNS:
+        for m in re.finditer(pat, text, flags=re.I):
+            found.append(m.group(0).strip())
+    # de-dupe preserving order
+    seen = set()
+    out: List[str] = []
+    for f in found:
+        k = f.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return "; ".join(out)
+
+
+def strip_email_rewrite_instruction(text: str) -> str:
+    """Remove meta rewrite phrases so they never land in the email body."""
+    if not text:
+        return ""
+    t = text
+    for pat in _EMAIL_REWRITE_PATTERNS:
+        t = re.sub(pat, " ", t, flags=re.I)
+    # leftover glue: " , " / double spaces / trailing "and"
+    t = re.sub(r"\s*,\s*,+", ",", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r",\s*$", "", t.strip())
+    t = re.sub(r"^(?:and|please|pls)\s+", "", t, flags=re.I)
+    t = re.sub(r"\s+(?:and|please|pls)$", "", t, flags=re.I)
+    return t.strip(" \t\n\r,;:-")
+
+
 def parse_direct_email_command(text: str) -> Optional[Dict[str, str]]:
     """
-    Parse 'email this to a@b.com:' / 'email to a@b.com' / subject+body forms.
-    Returns {to, subject, body} or None.
+    Parse outbound email commands.
+
+    Default policy: body is WORD-FOR-WORD from the user (after stripping
+    recipient / subject / rewrite-meta phrases).
+
+    Returns dict with keys:
+      to, subject, body, rewrite (instruction or ''), exact ('true'|'false')
+    exact=true → force path should store body as-is.
+    exact=false → agent/LLM may rewrite using 'rewrite' instruction.
     """
     if not text:
         return None
-    # Strip bot @mention noise
+    # Strip bot @mention + quoted blocks for parsing (body still from remaining)
     t = re.sub(r"@\d[\d\s]*", " ", text)
     t = re.sub(r"\[Quoted Message\]:.*", " ", t, flags=re.I | re.S)
     t = t.strip()
-    low = t.lower()
+    if not t:
+        return None
 
-    # email this to X: / email to X / send email to X
+    rewrite = extract_email_rewrite_instruction(t)
+
+    # Broad recipient patterns (EN + Roman Urdu)
+    #   send email to X: / email this to X / email X ko: / mail X:
+    #   send Email lucie@x.com ko:
     m = re.search(
-        r"(?:email\s+this\s+to|email\s+to|send\s+(?:this\s+)?email\s+to|"
-        r"mail\s+this\s+to|mail\s+to)\s*"
-        r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\s*:?\s*",
+        r"(?:"
+        r"email\s+this\s+to|email\s+to|send\s+(?:this\s+)?email\s+to|"
+        r"send\s+email|email\s+kar(?:na|o|do)?|"
+        r"mail\s+this\s+to|mail\s+to|mail\s+kar(?:na|o|do)?|"
+        r"email|mail|send"
+        r")"
+        r"\s*"
+        r"(?:to\s+)?"
+        r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})"
+        r"(?:\s*ko)?"
+        r"\s*:?\s*",
         t,
         flags=re.I,
     )
     if not m:
-        return None
-    to = m.group(1).strip()
-    rest = t[m.end() :].strip()
+        # Fallback: any email after a send/email/mail keyword
+        if not re.search(r"\b(?:email|mail|send)\b", t, flags=re.I):
+            return None
+        em = re.search(
+            r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})",
+            t,
+        )
+        if not em:
+            return None
+        to = em.group(1).strip()
+        # body = everything except the email address and command words
+        rest = (t[: em.start()] + " " + t[em.end() :]).strip()
+        rest = re.sub(
+            r"(?i)\b(?:send\s+)?(?:this\s+)?(?:email|mail)(?:\s+this)?(?:\s+to)?\b",
+            " ",
+            rest,
+        )
+        rest = re.sub(r"(?i)\bko\b", " ", rest)
+        rest = re.sub(r"\s{2,}", " ", rest).strip(" \t\n\r:")
+    else:
+        to = m.group(1).strip()
+        rest = t[m.end() :].strip()
+        # Also strip a leading "ko:" leftover
+        rest = re.sub(r"(?i)^ko\s*:?\s*", "", rest).strip()
+
     subject = ""
     body = rest
-    # Optional "subject: ..." first line
     sm = re.match(
         r"(?is)^(?:subject|subj)\s*:\s*(.+?)(?:\n+|$)(.*)$",
         rest,
@@ -815,17 +912,30 @@ def parse_direct_email_command(text: str) -> Optional[Dict[str, str]]:
     if sm:
         subject = sm.group(1).strip()
         body = (sm.group(2) or "").strip()
+
+    # Strip rewrite meta from body (never ship "make it professional" to recipient)
+    body = strip_email_rewrite_instruction(body)
+    if subject:
+        subject = strip_email_rewrite_instruction(subject)
+
     if not body:
-        body = rest or " "
+        # Maybe the only content was a rewrite instruction — still need something
+        body = rest.strip()
+        body = strip_email_rewrite_instruction(body)
+    if not body:
+        return None
+
     if not subject:
-        # First line as subject only if short; else invent later
-        first = (body.split("\n", 1)[0] or "").strip()
-        if first and len(first) <= 80 and "\n" in body:
-            subject = first
-            body = body.split("\n", 1)[1].strip()
-        else:
-            subject = "Quick note"
-    return {"to": to, "subject": subject, "body": body}
+        subject = "Quick note"
+
+    exact = "false" if rewrite else "true"
+    return {
+        "to": to,
+        "subject": subject,
+        "body": body,
+        "rewrite": rewrite,
+        "exact": exact,
+    }
 
 
 def is_email_send_confirm(text: str) -> bool:
@@ -834,6 +944,11 @@ def is_email_send_confirm(text: str) -> bool:
     head = re.sub(r"https?://\S+", " ", head)
     head = re.sub(r"[^\w\s]", " ", head)
     head = re.sub(r"\s+", " ", head).strip()
+    # Don't treat "send email to X" as confirm — that's a new draft
+    if re.search(r"\b(?:email|mail)\s+to\b", head) or re.search(
+        r"\bsend\s+email\b.+\b[a-z0-9._%+\-]+@[a-z0-9.\-]+", head
+    ):
+        return False
     phrases = (
         "send it",
         "send now",
@@ -844,7 +959,6 @@ def is_email_send_confirm(text: str) -> bool:
         "haan bhej",
         "han bhej",
         "yes send",
-        "send email",
         "send the email",
         "send the draft",
         "go ahead send",

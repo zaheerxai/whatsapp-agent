@@ -907,12 +907,13 @@ def _build_system_prompt(
    - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
    - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
 11d. OUTBOUND EMAIL / JOB APPLY (owner only — draft_email + send_email):
-   - Triggers: apply to this / send resume / cover letter / email this to X / invite to collaborate / offer demo / pitch / bhej do email (any language).
-   - Use permanent notes (resume/profile) + quoted JD or recipient. If only a company email is given, draft from notes + user ask; web_search company only when it clearly improves personalization.
-   - Flow: (1) draft_email action=create with to/subject/body/attach_resume (2) show draft (3) iterate action=update until user confirms (4) send_email confirm=true ONLY after explicit send/bhej do/confirm.
-   - attach_resume: true for job apply / send CV / cover letter; false for pure collab invite without CV; ask when unsure and WAIT for yes/no.
-   - Direct form: "email this to a@b.com: subject: …" or subject on first line + body after linebreak → draft then confirm. If no subject, invent a tight one from the body.
-   - Never claim sent unless send_email returned success. Body: concise, high-impact, plain text (no markdown fences). Prefer English for intl roles.
+   - Triggers: apply to this / send resume / cover letter / email this to X / send email X ko / invite to collaborate / offer demo / pitch / bhej do email (any language).
+   - EXACT BODY DEFAULT: When the user gives the email text after "email to X:", put that text WORD-FOR-WORD in draft_email body. Do NOT polish, formalize, or expand it.
+   - REWRITE ONLY ON REQUEST: If they say make it professional / rewrite / polish / formal bana do / in a X tone (before or after the ':'), THEN rewrite the body to match that instruction. Never leave the instruction phrase itself inside the email body.
+   - Job apply / cover letter (no fixed body from user): use permanent notes + JD; write a strong concise body.
+   - Flow: (1) draft_email create (2) show draft with real newlines — never glue *To:*x*Subject:*y on one line (3) update until user confirms (4) send_email confirm=true only after send it / bhej do.
+   - attach_resume: true for job apply / send CV; false for plain messages; ask when unsure.
+   - Never claim sent unless send_email returned success.
 
 {style_hint}
 {format_block}
@@ -1387,69 +1388,106 @@ def run_agent(
         if _parse_email_cmd and _tool_allowed_for_chat(chat_id, "draft_email"):
             parsed = _parse_email_cmd(_email_src)
             if parsed and parsed.get("to") and parsed.get("body"):
-                print(
-                    f"[AGENT] force draft_email to={parsed['to']!r} "
-                    f"subj={parsed.get('subject', '')[:40]!r}"
-                )
-                try:
-                    obs = execute_tool(
-                        "draft_email",
-                        {
-                            "action": "create",
-                            "to": parsed["to"],
-                            "subject": parsed.get("subject") or "Quick note",
-                            "body": parsed["body"],
-                            "attach_resume": "false",
-                            "purpose": "direct_send",
-                            "reason": "user gave exact body; no CV requested",
-                        },
-                        tool_ctx,
+                wants_rewrite = (parsed.get("exact") or "true").lower() == "false"
+                rewrite_instr = (parsed.get("rewrite") or "").strip()
+
+                if wants_rewrite:
+                    # User asked to rewrite (e.g. "make it professional") — do NOT
+                    # force the raw body. Steer the model to draft_email with a
+                    # rewritten body matching the instruction.
+                    print(
+                        f"[AGENT] email rewrite requested to={parsed['to']!r} "
+                        f"instr={rewrite_instr[:60]!r}"
                     )
-                except Exception as _ee:
-                    obs = f"Tool error: {_ee}"
-                obs_s = str(obs)
-                logging.getLogger("mojo.agent").info(
-                    "FORCE_DRAFT_EMAIL obs=%s", obs_s[:200]
-                )
-                if "Permission denied" in obs_s:
-                    return _reply("Email draft/send sirf bot owner ke liye available hai.")
-                if obs_s.startswith("Draft created") or obs_s.startswith("Draft updated"):
-                    return _reply(
-                        obs_s
-                        + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "OUTBOUND EMAIL — REWRITE MODE (user asked for a rewrite).\n"
+                            f"Recipient: {parsed['to']}\n"
+                            f"Rewrite instruction: {rewrite_instr or 'professional tone'}\n"
+                            f"User's raw notes (use as source facts, NOT as final body):\n"
+                            f"{parsed['body']}\n\n"
+                            "You MUST call draft_email action=create with:\n"
+                            f"- to: {parsed['to']}\n"
+                            "- subject: short professional subject (invent if needed)\n"
+                            "- body: rewritten email following the instruction; "
+                            "do NOT paste the raw notes verbatim; do NOT include the "
+                            "rewrite instruction itself in the body\n"
+                            "- attach_resume: false\n"
+                            "After the tool returns, show the draft card as-is "
+                            "(keep newlines). Ask if they want to send."
+                        ),
+                    })
+                else:
+                    # DEFAULT: word-for-word exact body — no LLM rewrite
+                    print(
+                        f"[AGENT] force draft_email EXACT to={parsed['to']!r} "
+                        f"subj={parsed.get('subject', '')[:40]!r}"
                     )
-                # Fall through to agent with observation injected
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": "call_forced_draft_email_0",
-                        "type": "function",
-                        "function": {
-                            "name": "draft_email",
-                            "arguments": json.dumps({
+                    try:
+                        obs = execute_tool(
+                            "draft_email",
+                            {
                                 "action": "create",
                                 "to": parsed["to"],
                                 "subject": parsed.get("subject") or "Quick note",
                                 "body": parsed["body"],
                                 "attach_resume": "false",
-                            }),
-                        },
-                    }],
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": "call_forced_draft_email_0",
-                    "content": obs_s,
-                })
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "draft_email already ran. Show the draft result honestly. "
-                        "Do NOT claim a draft exists if the tool failed. "
-                        "Do NOT call draft_email again this turn unless updating."
-                    ),
-                })
+                                "purpose": "direct_send",
+                                "reason": "exact user body (no rewrite asked)",
+                            },
+                            tool_ctx,
+                        )
+                    except Exception as _ee:
+                        obs = f"Tool error: {_ee}"
+                    obs_s = str(obs)
+                    logging.getLogger("mojo.agent").info(
+                        "FORCE_DRAFT_EMAIL exact=1 obs=%s", obs_s[:200]
+                    )
+                    if "Permission denied" in obs_s:
+                        return _reply(
+                            "Email draft/send sirf bot owner ke liye available hai."
+                        )
+                    if obs_s.startswith("Draft created") or obs_s.startswith(
+                        "Draft updated"
+                    ):
+                        return _reply(
+                            obs_s
+                            + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                        )
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_forced_draft_email_0",
+                            "type": "function",
+                            "function": {
+                                "name": "draft_email",
+                                "arguments": json.dumps({
+                                    "action": "create",
+                                    "to": parsed["to"],
+                                    "subject": parsed.get("subject")
+                                    or "Quick note",
+                                    "body": parsed["body"],
+                                    "attach_resume": "false",
+                                }),
+                            },
+                        }],
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": "call_forced_draft_email_0",
+                        "content": obs_s,
+                    })
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "draft_email already ran with the user's EXACT body. "
+                            "Show the tool result as-is (preserve newlines). "
+                            "Do NOT rewrite the body. Do NOT glue To/Subject/Body "
+                            "onto one line."
+                        ),
+                    })
 
         if (
             _is_email_confirm
