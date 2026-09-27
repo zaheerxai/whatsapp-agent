@@ -910,7 +910,7 @@ def _build_system_prompt(
    - Triggers: apply to this / apply karo / send resume / cover letter / email this to X / send email X ko / invite to collaborate / offer demo / pitch (any language).
    - EXACT BODY DEFAULT: When the user gives the email text after "email to X:", put that text WORD-FOR-WORD in draft_email body. Do NOT polish unless asked.
    - REWRITE ONLY ON REQUEST: make it professional / rewrite / polish / formal bana do / in a X tone → rewrite; never leave the instruction in the body.
-   - JOB APPLY: Extract HR/apply email from the quoted JD (e.g. "Send CV to hr@…"). NEVER ask the user for an email that is already in the JD. Subject from JD "Subject:" line or "Application – {Position}". attach_resume=true. Cover letter from permanent notes + JD via draft_email.
+   - JOB APPLY: Extract HR/apply email from the quoted JD (e.g. "Send CV to hr@…"). NEVER ask the user for an email that is already in the JD. Subject from JD "Subject:" line or "Application – <Position>". attach_resume=true. Cover letter from permanent notes + JD via draft_email.
    - Flow: draft_email → show draft (real newlines) → edit → send_email only after send it / bhej do.
    - Never claim sent unless send_email returned success.
 
