@@ -300,6 +300,11 @@ _BLOCK_FORCE_VIDEO_PHRASES = frozenset({
     "yaad rakh", "yaad rakho", "yaad rakhna", "yaad kar lo", "yaad karlo",
     "hamesha yaad", "permanent note", "save this permanently",
     "from now on remember",
+    # outbound email / job apply (URLs inside JD must not force-browse)
+    "apply to", "apply for", "send my resume", "send resume", "cover letter",
+    "email this", "email them", "draft email", "send email", "bhej do email",
+    "job application", "invite to collaborate", "offer a demo",
+
     # admin / ops
     "enable", "disable", "status", "/enable", "/disable", "/status",
     "/help", "/chats", "feature",
@@ -838,6 +843,13 @@ def _build_system_prompt(
    - When the user says always remember / remember this / yaad rakh / permanent note AND a quoted body or long profile/resume is present → call save_memory with the FULL quoted/profile content (not a 1-line stub like "Remember @bot").
    - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
    - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
+11d. OUTBOUND EMAIL / JOB APPLY (owner only — draft_email + send_email):
+   - Triggers: apply to this / send resume / cover letter / email this to X / invite to collaborate / offer demo / pitch / bhej do email (any language).
+   - Use permanent notes (resume/profile) + quoted JD or recipient. If only a company email is given, draft from notes + user ask; web_search company only when it clearly improves personalization.
+   - Flow: (1) draft_email action=create with to/subject/body/attach_resume (2) show draft (3) iterate action=update until user confirms (4) send_email confirm=true ONLY after explicit send/bhej do/confirm.
+   - attach_resume: true for job apply / send CV / cover letter; false for pure collab invite without CV; ask when unsure and WAIT for yes/no.
+   - Direct form: "email this to a@b.com: subject: …" or subject on first line + body after linebreak → draft then confirm. If no subject, invent a tight one from the body.
+   - Never claim sent unless send_email returned success. Body: concise, high-impact, plain text (no markdown fences). Prefer English for intl roles.
 
 {style_hint}
 {format_block}

@@ -549,12 +549,318 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "draft_email",
+            "description": (
+                "Create, update, show, or cancel an outbound email DRAFT for the owner. "
+                "Use for job applications, cover letters, collab invites, demos, or any "
+                "email the user wants sent. ALWAYS draft first — never send without "
+                "explicit user confirmation (user says 'send it' / 'bhej do' / 'confirm'). "
+                "Pull recipient from JD text / quoted email when possible. "
+                "Body should be personalized, concise, high-impact. "
+                "attach_resume: true | false | ask — reason from intent "
+                "(job apply / send CV → true; pure collab invite without CV request → false; "
+                "unsure → ask). action=create|update|show|cancel."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "update", "show", "cancel"],
+                        "description": "create new draft, update existing, show current, or cancel",
+                        "default": "create",
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient email (required on create unless already drafted)",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Subject line. If empty on create, model should invent one.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Plain-text email body (cover letter / intro / pitch)",
+                    },
+                    "attach_resume": {
+                        "type": "string",
+                        "enum": ["true", "false", "ask"],
+                        "description": (
+                            "true=attach resume PDF, false=no attachment, "
+                            "ask=uncertain — draft is saved but user must confirm attachment"
+                        ),
+                        "default": "ask",
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": (
+                            "Short label e.g. job_apply, collab_invite, demo_offer, "
+                            "direct_send — for logging and attachment heuristics"
+                        ),
+                    },
+                    "cc": {"type": "string", "description": "Optional CC"},
+                    "reason": {
+                        "type": "string",
+                        "description": "Why attach_resume was chosen (shown to user when ask)",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": (
+                "Send the CURRENT confirmed email draft via Gmail (owner-only). "
+                "ONLY call after the user explicitly confirms the draft "
+                "('send it', 'bhej do', 'confirm send', 'haan bhej do'). "
+                "If no draft exists, refuse. If attach_resume was 'ask' and user "
+                "never resolved it, ask again — do not guess."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to actually send",
+                        "default": False,
+                    },
+                    "attach_resume_override": {
+                        "type": "string",
+                        "enum": ["true", "false", ""],
+                        "description": (
+                            "If draft had attach=ask, user answer: true/false. "
+                            "Empty keeps draft setting."
+                        ),
+                    },
+                },
+                "required": ["confirm"],
+            },
+        },
+    },
 ]
 
 
 # ---------------------------------------------------------------------------
-# Executors
+# Email draft store (per chat+sender; survives process for active session)
 # ---------------------------------------------------------------------------
+
+_EMAIL_DRAFTS: Dict[str, Dict[str, Any]] = {}
+
+
+def _draft_key(ctx: dict) -> str:
+    chat = str((ctx or {}).get("chat_id") or "")
+    sender = str((ctx or {}).get("sender_id") or (ctx or {}).get("sender_num") or "")
+    return f"{chat}|{sender}"
+
+
+def _format_draft(d: Dict[str, Any]) -> str:
+    attach = d.get("attach_resume") or "ask"
+    lines = [
+        "📧 EMAIL DRAFT",
+        f"To: {d.get('to') or '(missing)'}",
+        f"Subject: {d.get('subject') or '(missing)'}",
+        f"Attach resume: {attach}"
+        + (f" — {d['reason']}" if d.get("reason") else ""),
+        f"Purpose: {d.get('purpose') or 'general'}",
+        "",
+        "--- Body ---",
+        (d.get("body") or "").strip() or "(empty)",
+        "--- End ---",
+        "",
+        "Reply: edit subject/body, set attach yes/no, or say 'send it' / 'bhej do' to send.",
+    ]
+    if d.get("cc"):
+        lines.insert(2, f"Cc: {d['cc']}")
+    return "\n".join(lines)
+
+
+def _owner_ok(ctx: dict) -> bool:
+    if not _OWNER_SENDER_ID:
+        return False
+    sid = str((ctx or {}).get("sender_id") or "")
+    snum = str((ctx or {}).get("sender_num") or "")
+    return sid == str(_OWNER_SENDER_ID) or snum == str(_OWNER_SENDER_ID)
+
+
+def _tool_draft_email(args: dict, ctx: dict) -> str:
+    if not _owner_ok(ctx):
+        return "Permission denied: only the bot owner can draft/send emails."
+
+    action = (args.get("action") or "create").strip().lower()
+    key = _draft_key(ctx)
+    existing = _EMAIL_DRAFTS.get(key)
+
+    if action == "show":
+        if not existing:
+            return "No email draft for this chat yet. Create one with action=create."
+        return _format_draft(existing)
+
+    if action == "cancel":
+        if key in _EMAIL_DRAFTS:
+            del _EMAIL_DRAFTS[key]
+            return "Draft cancelled."
+        return "No draft to cancel."
+
+    if action == "update":
+        if not existing:
+            return "No draft to update. Use action=create first."
+        if args.get("to"):
+            existing["to"] = str(args["to"]).strip()
+        if args.get("subject") is not None and str(args.get("subject")).strip() != "":
+            existing["subject"] = str(args["subject"]).strip()
+        if args.get("body") is not None and str(args.get("body")).strip() != "":
+            existing["body"] = str(args["body"]).strip()
+        if args.get("cc") is not None:
+            existing["cc"] = str(args.get("cc") or "").strip() or None
+        if args.get("attach_resume") in ("true", "false", "ask"):
+            existing["attach_resume"] = args["attach_resume"]
+        if args.get("reason"):
+            existing["reason"] = str(args["reason"]).strip()
+        if args.get("purpose"):
+            existing["purpose"] = str(args["purpose"]).strip()
+        existing["updated_at"] = time.time()
+        _EMAIL_DRAFTS[key] = existing
+        return "Draft updated.\n\n" + _format_draft(existing)
+
+    # create
+    to = (args.get("to") or "").strip()
+    subject = (args.get("subject") or "").strip()
+    body = (args.get("body") or "").strip()
+    attach = (args.get("attach_resume") or "ask").strip().lower()
+    if attach not in ("true", "false", "ask"):
+        attach = "ask"
+    purpose = (args.get("purpose") or "").strip() or "general"
+    reason = (args.get("reason") or "").strip()
+    cc = (args.get("cc") or "").strip() or None
+
+    if not to:
+        # try extract from body context is agent's job; we still allow incomplete draft
+        return (
+            "Missing recipient (to). Extract email from the JD / quoted message "
+            "or ask the user for the address, then call draft_email again."
+        )
+    if "@" not in to:
+        return f"Invalid recipient email: {to!r}"
+    if not body:
+        return "Missing body. Write a concise high-impact email body, then create the draft."
+    if not subject:
+        # soft default
+        subject = "Introduction / Application"
+
+    draft = {
+        "to": to,
+        "subject": subject,
+        "body": body,
+        "cc": cc,
+        "attach_resume": attach,
+        "purpose": purpose,
+        "reason": reason,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    _EMAIL_DRAFTS[key] = draft
+    extra = ""
+    if attach == "ask":
+        extra = (
+            "\n\n⚠️ Attachment undecided. Confirm: attach resume PDF? "
+            "(yes / no). Reason noted: "
+            + (reason or "not specified")
+        )
+    elif attach == "true":
+        try:
+            import email_ops as eo
+
+            path, src = eo.resolve_resume_pdf()
+            if not path:
+                extra = f"\n\n⚠️ attach_resume=true but resume file missing: {src}"
+            else:
+                extra = f"\n\n📎 Resume ready ({src})"
+        except Exception as e:
+            extra = f"\n\n⚠️ Resume check failed: {e}"
+
+    return "Draft created.\n\n" + _format_draft(draft) + extra
+
+
+def _tool_send_email(args: dict, ctx: dict) -> str:
+    if not _owner_ok(ctx):
+        return "Permission denied: only the bot owner can send emails."
+
+    if not args.get("confirm"):
+        return "Send aborted: confirm must be true. Show the draft and wait for user OK."
+
+    key = _draft_key(ctx)
+    draft = _EMAIL_DRAFTS.get(key)
+    if not draft:
+        return "No draft to send. Create one with draft_email first."
+
+    attach_flag = draft.get("attach_resume") or "ask"
+    override = (args.get("attach_resume_override") or "").strip().lower()
+    if override in ("true", "false"):
+        attach_flag = override
+
+    if attach_flag == "ask":
+        return (
+            "Attachment still undecided (attach_resume=ask). "
+            "Ask the user: attach resume PDF yes or no? Then call send_email "
+            "with attach_resume_override=true|false and confirm=true."
+        )
+
+    to = (draft.get("to") or "").strip()
+    subject = (draft.get("subject") or "").strip()
+    body = (draft.get("body") or "").strip()
+    if not to or not body:
+        return "Draft incomplete (need to + body). Update with draft_email first."
+
+    try:
+        import email_ops as eo
+    except Exception as e:
+        return f"email_ops import failed: {e}"
+
+    if not eo.gmail_configured():
+        return (
+            "Gmail not configured on this host. Set GMAIL_CLIENT_ID, "
+            "GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER."
+        )
+
+    attach_path = None
+    attach_src = None
+    if attach_flag == "true":
+        attach_path, attach_src = eo.resolve_resume_pdf()
+        if not attach_path:
+            return (
+                f"Cannot send with attachment — resume not found: {attach_src}. "
+                "Set RESUME_PDF_PATH or RESUME_ONEDRIVE_PATH, or resend without attach "
+                "(attach_resume_override=false)."
+            )
+
+    try:
+        result = eo.send_email(
+            to=to,
+            subject=subject,
+            body=body,
+            attach_path=attach_path,
+            cc=draft.get("cc"),
+        )
+    except Exception as e:
+        return f"Send failed: {e}"
+
+    # clear draft on success
+    _EMAIL_DRAFTS.pop(key, None)
+    att = "yes" if result.get("attached") else "no"
+    return (
+        f"✅ Sent to {result.get('to')}\n"
+        f"Subject: {result.get('subject')}\n"
+        f"Gmail id: {result.get('id')}\n"
+        f"Attached resume: {att}"
+        + (f" ({attach_src})" if attach_src and result.get("attached") else "")
+    )
+
 
 def _tool_search_knowledge(args: dict, ctx: dict) -> str:
     query = (args.get("query") or "").strip()
@@ -4052,12 +4358,20 @@ TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "image_describe": _tool_image_describe,
     "transcribe_video": _tool_transcribe_video,
     "link_preview": _tool_link_preview,
+    "draft_email": _tool_draft_email,
+    "send_email": _tool_send_email,
 }
 
 
 # Tools that already enforce OWNER_SENDER_ID inside the executor.
 # Owner may use these from any chat even if the group tool flag is OFF.
-_OWNER_GATED_TOOLS = frozenset({"note_down", "python_exec", "send_message_to"})
+_OWNER_GATED_TOOLS = frozenset({
+    "note_down",
+    "python_exec",
+    "send_message_to",
+    "draft_email",
+    "send_email",
+})
 
 
 def execute_tool(name: str, arguments: dict, ctx: dict) -> str:

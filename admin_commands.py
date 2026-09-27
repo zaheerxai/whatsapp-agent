@@ -44,12 +44,16 @@ KNOWN_TOOLS = [
     "transcribe_video",
     "link_preview",      # title/caption/author without ASR
     "image_describe",    # vision caption; no OneDrive write
+    "draft_email",       # owner-only at executor — job apply / outbound mail
+    "send_email",        # owner-only at executor — sends confirmed draft via Gmail
 ]
 
 OWNER_ONLY_TOOLS = frozenset({
     "send_message_to",
     "python_exec",
     "note_down",
+    "draft_email",
+    "send_email",
 })
 
 def _tool_flag_key(tool_name: str) -> str:
