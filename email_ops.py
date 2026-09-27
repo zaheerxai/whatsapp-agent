@@ -7,7 +7,8 @@ Env:
   GMAIL_CLIENT_ID
   GMAIL_CLIENT_SECRET
   GMAIL_REFRESH_TOKEN
-  GMAIL_SENDER          # e.g. xaheeru23@gmail.com (From header / userId=me)
+  GMAIL_SENDER          # e.g. xaheeru23@gmail.com (mailbox address)
+  GMAIL_FROM_NAME       # display name in From header, e.g. Muhammad Zaheeruddin
   RESUME_PDF_PATH       # optional local absolute/relative path to resume PDF
   RESUME_ONEDRIVE_PATH  # optional OneDrive relative path e.g. Documents/Resume/M_Zaheer_Resume.pdf
   RESUME_FILENAME       # attachment filename override (default: basename of path)
@@ -26,6 +27,7 @@ import tempfile
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr, parseaddr
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -101,21 +103,49 @@ def resolve_resume_pdf() -> Tuple[Optional[str], Optional[str]]:
     )
 
 
+def _format_from_header(
+    sender: Optional[str] = None,
+    from_name: Optional[str] = None,
+) -> str:
+    """
+    Build a proper From header: 'Display Name <email@domain>'.
+
+    Without a display name, many clients show only the local-part (e.g. xaheeru23).
+    """
+    raw_sender = (sender or os.getenv("GMAIL_SENDER") or "").strip()
+    if not raw_sender:
+        raise ValueError("GMAIL_SENDER is required")
+
+    # Allow caller/env to already pass "Name <email>"
+    existing_name, existing_email = parseaddr(raw_sender)
+    email_addr = existing_email or raw_sender
+    if "@" not in email_addr:
+        raise ValueError(f"Invalid GMAIL_SENDER: {raw_sender!r}")
+
+    name = (
+        (from_name or "").strip()
+        or (os.getenv("GMAIL_FROM_NAME") or "").strip()
+        or (existing_name or "").strip()
+    )
+    if name:
+        return formataddr((name, email_addr))
+    return email_addr
+
+
 def build_raw_message(
     *,
     to: str,
     subject: str,
     body: str,
     sender: Optional[str] = None,
+    from_name: Optional[str] = None,
     attach_path: Optional[str] = None,
     attach_filename: Optional[str] = None,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
 ) -> str:
     """Build RFC 2822 message, return base64url-encoded raw string for Gmail API."""
-    sender = (sender or os.getenv("GMAIL_SENDER") or "").strip()
-    if not sender:
-        raise ValueError("GMAIL_SENDER is required")
+    from_header = _format_from_header(sender=sender, from_name=from_name)
     to = (to or "").strip()
     if not to or "@" not in to:
         raise ValueError(f"Invalid recipient: {to!r}")
@@ -132,7 +162,7 @@ def build_raw_message(
         ctype, _ = mimetypes.guess_type(fname)
         if not ctype:
             ctype = "application/pdf"
-        maintype, subtype = ctype.split("/", 1)
+        _maintype, subtype = ctype.split("/", 1)
         with open(attach_path, "rb") as f:
             part = MIMEApplication(f.read(), _subtype=subtype)
         part.add_header("Content-Disposition", "attachment", filename=fname)
@@ -141,7 +171,7 @@ def build_raw_message(
         msg = MIMEText(body or "", "plain", "utf-8")  # type: ignore[assignment]
 
     msg["To"] = to
-    msg["From"] = sender
+    msg["From"] = from_header
     msg["Subject"] = subject or "(no subject)"
     if cc:
         msg["Cc"] = cc
