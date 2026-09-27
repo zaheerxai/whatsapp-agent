@@ -907,12 +907,11 @@ def _build_system_prompt(
    - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
    - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
 11d. OUTBOUND EMAIL / JOB APPLY (owner only — draft_email + send_email):
-   - Triggers: apply to this / send resume / cover letter / email this to X / send email X ko / invite to collaborate / offer demo / pitch / bhej do email (any language).
-   - EXACT BODY DEFAULT: When the user gives the email text after "email to X:", put that text WORD-FOR-WORD in draft_email body. Do NOT polish, formalize, or expand it.
-   - REWRITE ONLY ON REQUEST: If they say make it professional / rewrite / polish / formal bana do / in a X tone (before or after the ':'), THEN rewrite the body to match that instruction. Never leave the instruction phrase itself inside the email body.
-   - Job apply / cover letter (no fixed body from user): use permanent notes + JD; write a strong concise body.
-   - Flow: (1) draft_email create (2) show draft with real newlines — never glue *To:*x*Subject:*y on one line (3) update until user confirms (4) send_email confirm=true only after send it / bhej do.
-   - attach_resume: true for job apply / send CV; false for plain messages; ask when unsure.
+   - Triggers: apply to this / apply karo / send resume / cover letter / email this to X / send email X ko / invite to collaborate / offer demo / pitch (any language).
+   - EXACT BODY DEFAULT: When the user gives the email text after "email to X:", put that text WORD-FOR-WORD in draft_email body. Do NOT polish unless asked.
+   - REWRITE ONLY ON REQUEST: make it professional / rewrite / polish / formal bana do / in a X tone → rewrite; never leave the instruction in the body.
+   - JOB APPLY: Extract HR/apply email from the quoted JD (e.g. "Send CV to hr@…"). NEVER ask the user for an email that is already in the JD. Subject from JD "Subject:" line or "Application – {Position}". attach_resume=true. Cover letter from permanent notes + JD via draft_email.
+   - Flow: draft_email → show draft (real newlines) → edit → send_email only after send it / bhej do.
    - Never claim sent unless send_email returned success.
 
 {style_hint}
@@ -1376,15 +1375,64 @@ def run_agent(
         try:
             from agent_tools import (
                 parse_direct_email_command as _parse_email_cmd,
+                parse_job_apply_command as _parse_job_apply,
                 is_email_send_confirm as _is_email_confirm,
                 _get_draft as _email_get_draft,
             )
         except Exception:
             _parse_email_cmd = None  # type: ignore
+            _parse_job_apply = None  # type: ignore
             _is_email_confirm = None  # type: ignore
             _email_get_draft = None  # type: ignore
 
         _email_src = latest_user_text or extra_user_note or _intent_src or ""
+
+        # Job apply: HR email is often inside the quoted JD — extract it, don't ask
+        if _parse_job_apply and _tool_allowed_for_chat(chat_id, "draft_email"):
+            apply = _parse_job_apply(_email_src)
+            if apply is not None:
+                if not apply.get("to"):
+                    print("[AGENT] apply intent but no email in JD")
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "User wants to APPLY but no email was found in the "
+                            "JD/quote. Ask ONCE for the HR email. Do not invent one."
+                        ),
+                    })
+                else:
+                    print(
+                        f"[AGENT] force job-apply to={apply['to']!r} "
+                        f"subj={apply.get('subject', '')[:50]!r}"
+                    )
+                    logging.getLogger("mojo.agent").info(
+                        "FORCE_JOB_APPLY to=%s subject=%r",
+                        apply["to"],
+                        (apply.get("subject") or "")[:80],
+                    )
+                    try:
+                        mem_obs = execute_tool("get_memory", {}, tool_ctx)
+                    except Exception as _me:
+                        mem_obs = f"(memory unavailable: {_me})"
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "JOB APPLY — you MUST call draft_email now. Do NOT ask "
+                            "for the email; it is already known.\n"
+                            f"to: {apply['to']}\n"
+                            f"subject: {apply.get('subject') or 'Job Application'}\n"
+                            "attach_resume: true\n"
+                            "purpose: job_apply\n\n"
+                            "Write a concise high-impact cover letter body from the "
+                            "candidate memory/notes and the JD. Plain text only.\n\n"
+                            f"JD:\n{(apply.get('jd_excerpt') or '')[:3000]}\n\n"
+                            f"CANDIDATE MEMORY / NOTES:\n{str(mem_obs)[:3000]}\n\n"
+                            "After draft_email returns, show the draft with real "
+                            "newlines (never glue To/Subject/Body on one line) and "
+                            "ask if they want to send."
+                        ),
+                    })
+
         if _parse_email_cmd and _tool_allowed_for_chat(chat_id, "draft_email"):
             parsed = _parse_email_cmd(_email_src)
             if parsed and parsed.get("to") and parsed.get("body"):

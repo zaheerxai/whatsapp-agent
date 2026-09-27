@@ -938,6 +938,104 @@ def parse_direct_email_command(text: str) -> Optional[Dict[str, str]]:
     }
 
 
+def is_job_apply_intent(text: str) -> bool:
+    """True when user wants to apply to a quoted/pasted JD."""
+    if not text:
+        return False
+    head = re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
+    head = re.sub(r"@\d[\d\s]*", " ", head)
+    head = re.sub(r"https?://\S+", " ", head)
+    low = head.lower()
+    phrases = (
+        "apply to this",
+        "apply for this",
+        "apply to the job",
+        "apply for the job",
+        "apply karo",
+        "apply kar do",
+        "apply kar dena",
+        "is job pe apply",
+        "is pe apply",
+        "job pe apply",
+        "send my cv",
+        "send my resume",
+        "send cv",
+        "send resume",
+        "cover letter bhej",
+        "application bhej",
+        "apply now",
+    )
+    if any(p in low for p in phrases):
+        return True
+    if re.search(r"(?<!\w)apply(?!\w)", low) and re.search(
+        r"(?i)job|hiring|position|recruiter|vacancy|jd\b|role\b",
+        text,
+    ):
+        return True
+    return False
+
+
+def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
+    """
+    Extract apply target from a message that quotes/pastes a JD.
+
+    Returns {to, subject, jd_excerpt, attach_resume} or None if not apply intent.
+    Email is taken from the JD (e.g. hr@samagroup.com). Never ask the user for
+    an address that is already present in the quoted text.
+    """
+    if not text or not is_job_apply_intent(text):
+        return None
+
+    quoted = ""
+    qm = re.search(r"\[Quoted Message\]:\s*(.+)$", text, flags=re.I | re.S)
+    if qm:
+        quoted = qm.group(1)
+    search_blob = quoted or text
+
+    try:
+        import email_ops as eo
+
+        emails = eo.extract_emails(search_blob) or eo.extract_emails(text)
+    except Exception:
+        emails = re.findall(
+            r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+            search_blob,
+        )
+
+    cleaned: List[str] = []
+    seen = set()
+    for e in emails or []:
+        el = e.lower().strip()
+        if el in seen or el.endswith("@lid") or "whatsapp" in el:
+            continue
+        seen.add(el)
+        cleaned.append(e.strip())
+
+    to = cleaned[0] if cleaned else ""
+
+    subject = ""
+    sm = re.search(r"(?im)^(?:email\s+)?subject\s*:\s*(.+)$", search_blob)
+    if sm:
+        subject = sm.group(1).strip().strip("*").strip()
+    if not subject:
+        pm = re.search(
+            r"(?i)(?:position|role|title)\s*:\s*\*?(.+?)\*?\s*(?:\n|$)",
+            search_blob,
+        )
+        if pm:
+            subject = f"Application – {pm.group(1).strip().strip('*').strip()}"
+    if not subject:
+        subject = "Job Application"
+
+    return {
+        "to": to,
+        "subject": subject,
+        "jd_excerpt": (quoted or search_blob).strip()[:3500],
+        "attach_resume": "true",
+        "emails_found": ",".join(cleaned),
+    }
+
+
 def is_email_send_confirm(text: str) -> bool:
     head = re.split(r"\[quoted message\]:", (text or "").lower(), maxsplit=1)[0]
     head = re.sub(r"@\d[\d\s]*", " ", head)
