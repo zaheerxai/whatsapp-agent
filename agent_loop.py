@@ -589,8 +589,9 @@ Supported syntax (exact — no spaces between marker and text):
 - ~strikethrough~ → corrections, old price / superseded info, light sarcasm.
 - `inline code` (single backtick) → short codes, IDs, commands, order numbers, file names.
 - ```monospace block``` (three backticks on their own lines or around a short block) → multi-line code, aligned data, or a short pasted snippet that must keep spacing.
-- Bulleted list: start a line with "- " or "* " (hyphen/asterisk + space). Use for 2–5 parallel items.
-- Numbered list: start a line with "1. " "2. " etc. Use only for real sequential steps. Hard max 5 items.
+- Bulleted list: start a line with "- " (hyphen + space). Prefer bullets for most multi-item replies.
+- Numbered list: ONLY for real sequential steps. Each item on its OWN line with increasing numbers: "1. " then "2. " then "3. ". NEVER repeat "1." on every row. Hard max 5 items. If unsure, use "- " bullets instead.
+- Labels (To / Subject / Body / etc.): each on its own line — never glue *To:*value*Subject:*value on one line.
 - Block quote: start a line with "> " to set off a short quoted line or key takeaway.
 - Combinations work when nested cleanly, e.g. *_bold italic_*, *~strike bold~*. Close in reverse order of opening. Do not over-nest.
 - Line breaks: one blank line between short paragraphs for readability. Avoid huge gaps.
@@ -697,6 +698,44 @@ def _format_whatsapp_reply(text: str) -> str:
     # ATX headers → bold line on its own
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"*\1*", t)
 
+    # --- Glued field labels (classic email-draft collapse) ---
+    # To:*a@b.com*Subject:*Foo*Body:text → one field per line, clean values
+    _FIELD_RE = (
+        r"To|Cc|Bcc|From|Subject|Body|Attach(?:\s+resume)?|Purpose"
+    )
+    if re.search(rf"(?:\*)?\b(?:{_FIELD_RE})\s*:", t, flags=re.I):
+        parts = re.split(
+            rf"(?:\*)?\b({_FIELD_RE})\s*:\s*\*?",
+            t,
+            flags=re.I,
+        )
+        # parts: [preamble, label1, val1, label2, val2, ...]
+        rebuilt: List[str] = []
+        preamble = (parts[0] or "").strip(" \t*")
+        if preamble:
+            rebuilt.append(preamble)
+        i = 1
+        while i < len(parts):
+            label = parts[i].strip()
+            raw_val = parts[i + 1] if i + 1 < len(parts) else ""
+            # value runs until next label split; strip leftover bold stars
+            val = (raw_val or "").strip()
+            val = re.sub(r"^\*+\s*", "", val)
+            val = re.sub(r"\s*\*+\s*$", "", val)
+            val = val.strip(" \t*")
+            # Keep internal newlines in Body
+            if label.lower() == "body":
+                val = val.strip()
+                rebuilt.append(f"*{label}:*")
+                if val:
+                    rebuilt.append(val)
+            else:
+                # single-line fields: first line only if multi
+                first = val.split("\n", 1)[0].strip().strip("*").strip()
+                rebuilt.append(f"*{label}:* {first}".rstrip())
+            i += 2
+        t = "\n".join(rebuilt)
+
     # Glue fix: *Section**3.1 Title* → *Section*\n\n*3.1 Title*
     t = re.sub(r"\*([^*\n]{2,80})\*\*+(\d+\.\d+[^*\n]*)\*", r"*\1*\n\n*\2*", t)
     t = re.sub(r"\*([^*\n]{2,80})\*\*+([A-Z][^*\n]{2,60})\*", r"*\1*\n\n*\2*", t)
@@ -720,6 +759,25 @@ def _format_whatsapp_reply(text: str) -> str:
         t,
     )
 
+    # Inline "1. foo 1. bar 1. baz" → real multiline list
+    def _split_inline_numbered(line: str) -> List[str]:
+        if not re.search(r"\d{1,2}\.\s+\S.+\d{1,2}\.\s+\S", line):
+            return [line]
+        # Don't touch lines that are already a single clean list item
+        if re.match(r"^\s*\d{1,2}\.\s+\S.*$", line) and line.count(". ") <= 1:
+            return [line]
+        parts = re.split(r"(?=\b\d{1,2}\.\s+)", line)
+        out: List[str] = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if re.match(r"^\d{1,2}\.\s+", p):
+                out.append(p)
+            else:
+                out.append(p)
+        return out if len(out) >= 2 else [line]
+
     # Pipe tables → plain lines
     lines_out: List[str] = []
     for line in t.split("\n"):
@@ -730,7 +788,7 @@ def _format_whatsapp_reply(text: str) -> str:
             cells = [c.strip() for c in s.strip("|").split("|")]
             lines_out.append(" · ".join(c for c in cells if c))
             continue
-        lines_out.append(line)
+        lines_out.extend(_split_inline_numbered(line))
     t = "\n".join(lines_out)
 
     # Bare HTML
@@ -751,21 +809,24 @@ def _format_whatsapp_reply(text: str) -> str:
     # Bullet lines starting with · mid-paragraph → own line with dash
     t = re.sub(r"(?<!\n)·\s+", "\n- ", t)
 
-    # Numbered list soft-cap (keep more for long summaries — 12 not 5)
+    # Numbered list: renumber consecutive items so 1./1./1. becomes 1./2./3.
+    # Prefer bullets when the model stamped every row as "1."
     capped: List[str] = []
     num_count = 0
     for line in t.split("\n"):
-        m = re.match(r"^(\s*)(\d{1,2})\.\s+(.*)$", line)
+        m = re.match(r"^(\s*)(\d{1,2})([.)])\s+(.*)$", line)
         if m:
             num_count += 1
+            body = m.group(4)
+            indent = m.group(1)
             if num_count > 12:
-                capped.append(f"{m.group(1)}- {m.group(3)}")
+                capped.append(f"{indent}- {body}")
             else:
-                capped.append(f"{m.group(1)}{num_count}. {m.group(3)}")
+                capped.append(f"{indent}{num_count}. {body}")
         else:
             if not line.strip():
                 num_count = 0
-            elif not re.match(r"^\s*([-*]|\d{1,2}\.)\s+", line):
+            elif not re.match(r"^\s*([-*]|\d{1,2}[.)])\s+", line):
                 num_count = 0
             capped.append(line)
     t = "\n".join(capped)
@@ -773,6 +834,8 @@ def _format_whatsapp_reply(text: str) -> str:
     # Collapse 3+ blank lines → 2; trim trailing spaces per line
     t = "\n".join(ln.rstrip() for ln in t.split("\n"))
     t = re.sub(r"\n{3,}", "\n\n", t)
+    # Leading newline from field-split cleanup
+    t = t.lstrip("\n")
     # Drop trailing ellipsis-only cut markers that look unfinished mid-word
     t = re.sub(r"(\w)\.\.\.\s*$", r"\1.", t)
     return t.strip()

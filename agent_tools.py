@@ -728,23 +728,35 @@ def _pop_draft(ctx: dict) -> Optional[Dict[str, Any]]:
 
 
 def _format_draft(d: Dict[str, Any]) -> str:
+    """WhatsApp-native draft card — one field per line, no glued *markers*."""
     attach = d.get("attach_resume") or "ask"
+    attach_line = {
+        "true": "yes (resume PDF)",
+        "false": "no",
+        "ask": "undecided — reply yes/no",
+    }.get(attach, attach)
+    if d.get("reason") and attach == "ask":
+        attach_line += f" ({d['reason']})"
+
+    body = (d.get("body") or "").strip() or "(empty)"
     lines = [
-        "EMAIL DRAFT",
-        f"To: {d.get('to') or '(missing)'}",
-        f"Subject: {d.get('subject') or '(missing)'}",
-        f"Attach resume: {attach}"
-        + (f" — {d['reason']}" if d.get("reason") else ""),
-        f"Purpose: {d.get('purpose') or 'general'}",
+        "*Email draft*",
         "",
-        "--- Body ---",
-        (d.get("body") or "").strip() or "(empty)",
-        "--- End ---",
-        "",
-        "Reply: edit subject/body, set attach yes/no, or say 'send it' / 'bhej do' to send.",
+        f"*To:* {d.get('to') or '(missing)'}",
     ]
     if d.get("cc"):
-        lines.insert(2, f"Cc: {d['cc']}")
+        lines.append(f"*Cc:* {d['cc']}")
+    lines.extend(
+        [
+            f"*Subject:* {d.get('subject') or '(missing)'}",
+            f"*Attach:* {attach_line}",
+            "",
+            "*Body:*",
+            body,
+            "",
+            "_Edit karo, ya 'send it' / 'bhej do' likho._",
+        ]
+    )
     return "\n".join(lines)
 
 
