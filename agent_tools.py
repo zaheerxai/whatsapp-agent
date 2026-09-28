@@ -1051,6 +1051,47 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
         )
         if hm:
             role = _clean_title(hm.group(1))
+            # Reject non-titles like "Remote Jobs in Pakistan!"
+            if role and not re.search(
+                r"(?i)developer|engineer|recruiter|executive|manager|"
+                r"designer|analyst|intern|specialist|consultant|lead|"
+                r"sales|marketing|writer|officer|associate",
+                role,
+            ):
+                role = ""
+
+    # Multi-role bullet lists: "- *Graphic Designers*" / "- WordPress Developers"
+    roles_list: List[str] = []
+    for m in re.finditer(
+        r"(?im)^\s*[-•*]\s*\*?([^*\n]{3,60}?)\*?\s*$",
+        search_blob,
+    ):
+        cand = _clean_title(m.group(1))
+        if cand and re.search(
+            r"(?i)developer|engineer|designer|executive|manager|"
+            r"analyst|intern|specialist|consultant|sales|recruiter|"
+            r"writer|officer|associate|lead",
+            cand,
+        ):
+            # de-plural soft: Designers → Designer for subject readability
+            roles_list.append(cand)
+    if not role and roles_list:
+        # Prefer tech-dev titles when several options (candidate is AI/FS)
+        ranked = sorted(
+            roles_list,
+            key=lambda r: (
+                0
+                if re.search(
+                    r"(?i)wordpress|web|full.?stack|software|developer|engineer",
+                    r,
+                )
+                else 1
+            ),
+        )
+        role = ranked[0]
+        if len(ranked) > 1:
+            # Lead with best-fit, keep others for LLM context
+            role = " / ".join(ranked[:3])
 
     # First line often is the title
     if not role:
@@ -1064,18 +1105,31 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
             ):
                 role = first
 
+    # Company name for subject when role is still weak
+    company = ""
+    cm = re.search(
+        r"(?i)\b([A-Z][A-Za-z0-9&.\' ]{2,40}?)\s+(?:is\s+hiring|is\s+looking|"
+        r"are\s+hiring|we're\s+hiring|we\s+are\s+hiring)",
+        search_blob,
+    )
+    if cm:
+        company = cm.group(1).strip().strip("*")
+
     if not subject:
         if role:
             subject = f"Application - {role}"
+        elif company:
+            subject = f"Application - {company}"
         else:
             subject = "Job Application"
 
     return {
         "to": to,
         "subject": subject,
-        "role": role or re.sub(
-            r"(?i)^\s*application\s*[–\-:]\s*", "", subject
-        ).strip(),
+        "role": role
+        or re.sub(r"(?i)^\s*application\s*[–\-:]\s*", "", subject).strip(),
+        "company": company,
+        "roles_list": ",".join(roles_list),
         "jd_excerpt": (quoted or search_blob).strip()[:3500],
         "attach_resume": "true",
         "emails_found": ",".join(cleaned),

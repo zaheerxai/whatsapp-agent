@@ -1369,25 +1369,76 @@ def _compose_email_json(
     temperature: float = 0.2,
     max_tokens: int = 1200,
 ) -> Optional[Dict[str, Any]]:
-    """One-shot LLM call that must return parseable email JSON (single response)."""
+    """
+    LLM-first email compose. Always prefers model output over any template.
+
+    Strategy (research-backed structured-output pattern):
+      1) Single completion with strict JSON schema hint
+      2) Tolerant parse (fences, trailing commas)
+      3) On parse miss: one recovery call ("convert previous output to JSON only")
+      4) Never invent a static cover-letter template in Python
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": system.rstrip() + "\n\n" + _EMAIL_JSON_SCHEMA_HINT,
+        },
+        {"role": "user", "content": user},
+    ]
+    raw = ""
     try:
         msg = _chat_completion(
-            [
-                {
-                    "role": "system",
-                    "content": system.rstrip() + "\n\n" + _EMAIL_JSON_SCHEMA_HINT,
-                },
-                {"role": "user", "content": user},
-            ],
+            messages,
             tools=None,
             temperature=temperature,
             max_tokens=max_tokens,
         )
         raw = (getattr(msg, "content", None) or "").strip()
-        return _parse_email_llm_json(raw)
+        parsed = _parse_email_llm_json(raw)
+        if parsed and len((parsed.get("body") or "")) >= 60:
+            return parsed
+        logging.getLogger("mojo.agent").info(
+            "EMAIL_JSON_PARSE_MISS raw_len=%s preview=%r",
+            len(raw),
+            (raw or "")[:180],
+        )
     except Exception as e:
-        print(f"[AGENT] _compose_email_json failed: {e}")
-        return None
+        print(f"[AGENT] _compose_email_json primary failed: {e}")
+        logging.getLogger("mojo.agent").info(
+            "EMAIL_JSON_PRIMARY_FAIL err=%s", e
+        )
+
+    # Recovery: force JSON-only conversion of whatever we got (or rewrite from user)
+    try:
+        recover_user = raw[:4500] if raw else user[:4500]
+        msg2 = _chat_completion(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Convert the content into the required email JSON object. "
+                        "If the content is incomplete, write a full professional email "
+                        "body from the candidate profile facts in the content. "
+                        + _EMAIL_JSON_SCHEMA_HINT
+                    ),
+                },
+                {"role": "user", "content": recover_user},
+            ],
+            tools=None,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+        raw2 = (getattr(msg2, "content", None) or "").strip()
+        parsed2 = _parse_email_llm_json(raw2)
+        if parsed2 and len((parsed2.get("body") or "")) >= 60:
+            logging.getLogger("mojo.agent").info("EMAIL_JSON_RECOVERED")
+            return parsed2
+        logging.getLogger("mojo.agent").info(
+            "EMAIL_JSON_RECOVER_MISS preview=%r", (raw2 or "")[:180]
+        )
+    except Exception as e2:
+        print(f"[AGENT] _compose_email_json recover failed: {e2}")
+    return None
 
 
 def _chat_completion(
@@ -1952,16 +2003,24 @@ def run_agent(
                     cover_mode, 1100
                 )
                 cover = ""
+                roles_hint = (apply.get("roles_list") or "").strip()
+                company_hint = (apply.get("company") or "").strip()
                 parsed_email = _compose_email_json(
                     system=_email_compose_system(cover_mode, greet_name),
                     user=(
                         f"purpose: job_apply\n"
                         f"cover_mode: {cover_mode}\n"
                         f"user_request: {_email_src[:400]}\n"
-                        f"Role name (use in body): {role_name}\n"
+                        f"Role name (use in body — never say 'Job Application role'): "
+                        f"{role_name or '(infer best-fit role from JD + profile)'}\n"
+                        f"Open roles on this posting (if multi-role): {roles_hint or 'n/a'}\n"
+                        f"Company: {company_hint or 'n/a'}\n"
                         f"Suggested subject: {subject}\n"
                         f"Recipient greeting name: {greet_name}\n"
-                        f"attach_resume: true\n\n"
+                        f"attach_resume: true\n"
+                        "If multiple roles are listed, pick the ONE best fit for the "
+                        "candidate profile and write the subject + body for that role. "
+                        "Never use the phrase 'Job Application role'.\n\n"
                         f"JOB DESCRIPTION (context only — do not claim as experience):\n"
                         f"{jd_clip}\n\n"
                         f"CANDIDATE PROFILE (ONLY source of facts):\n"
@@ -1974,24 +2033,27 @@ def run_agent(
                     cover = parsed_email.get("body") or ""
                     if parsed_email.get("subject"):
                         subject = parsed_email["subject"]
+                        # Keep role_name aligned if model refined subject
+                        rn = re.sub(
+                            r"(?i)^\s*application\s*[–\-:]\s*",
+                            "",
+                            subject,
+                        ).strip()
+                        if rn and rn.lower() != "job application":
+                            role_name = rn
 
-                if not cover or len(cover) < 40:
-                    name = "Muhammad Zaheeruddin"
-                    nm = re.search(
-                        r"(?i)\*?Muhammad\s+Zaheer[^\n*]*",
-                        profile_clip or "",
+                # LLM-first: NO static Python cover-letter template.
+                # If model fails twice, surface a clear retry — never fake a letter.
+                if not cover or len(cover) < 60:
+                    logging.getLogger("mojo.agent").info(
+                        "FORCE_JOB_APPLY_LLM_EMPTY to=%s subject=%r",
+                        apply.get("to"),
+                        subject,
                     )
-                    if nm:
-                        name = re.sub(r"[*]", "", nm.group(0)).strip()
-                    cover = (
-                        f"Hello {greet_name},\n\n"
-                        f"I am writing to apply for the {role_name} role. "
-                        f"I am an AI Engineer and Automation Specialist with hands-on "
-                        f"experience building multi-agent systems, LLM workflows, and "
-                        f"end-to-end operational automations.\n\n"
-                        f"Please find my resume attached for full detail. I would welcome "
-                        f"a short call to discuss how I can contribute.\n\n"
-                        f"Best regards,\n{name}"
+                    return _reply(
+                        "Cover letter LLM se generate nahi ho saki (parse/empty). "
+                        "Ek second baad dobara 'apply to this job' try karo — "
+                        "template use nahi karunga."
                     )
                 cover = _normalize_email_body(cover, greet_name)
                 if not re.search(
