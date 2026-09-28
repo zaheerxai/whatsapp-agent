@@ -1487,8 +1487,9 @@ def run_agent(
                                     "- ONLY facts from CANDIDATE PROFILE. Zero invention.\n"
                                     "- JD is context for wording only — never claim JD duties "
                                     "as personal experience.\n"
-                                    "- 110–160 words. Complete the email through the signature; "
-                                    "NEVER stop mid-sentence or mid-word.\n"
+                                    "- Target ~110–160 words but finish cleanly: full sentences "
+                                    "through Best regards + name in ONE response. Never stop "
+                                    "mid-sentence or mid-word.\n"
                                     "- Plain text only. No markdown. No subject line.\n"
                                     "- Output ONLY the finished email body."
                                 ),
@@ -1506,40 +1507,9 @@ def run_agent(
                         ],
                         tools=None,
                         temperature=0.2,
-                        max_tokens=700,
+                        max_tokens=900,
                     )
                     cover = (getattr(cover_msg, "content", None) or "").strip()
-                    # If model still truncated mid-sentence, one continuation pass
-                    if cover and not re.search(
-                        r"(?i)(best regards|sincerely|kind regards)\s*,?\s*\n",
-                        cover,
-                    ):
-                        try:
-                            cont = _chat_completion(
-                                [
-                                    {
-                                        "role": "system",
-                                        "content": (
-                                            "Continue the email from where it was cut. "
-                                            "Finish the current sentence, add the attach line "
-                                            "if missing, then sign off. Output only the "
-                                            "continuation (no restart)."
-                                        ),
-                                    },
-                                    {
-                                        "role": "user",
-                                        "content": cover[-500:],
-                                    },
-                                ],
-                                tools=None,
-                                temperature=0.1,
-                                max_tokens=200,
-                            )
-                            extra = (getattr(cont, "content", None) or "").strip()
-                            if extra:
-                                cover = (cover.rstrip() + " " + extra).strip()
-                        except Exception:
-                            pass
                 except Exception as _ce:
                     print(f"[AGENT] cover letter LLM failed: {_ce}")
                     cover = ""
