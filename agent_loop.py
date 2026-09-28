@@ -1827,6 +1827,27 @@ def run_agent(
                     working_subj = field_edits["subject"]
                     update_args["subject"] = working_subj
                     did_deterministic = True
+                # Change role in body → swap "interest in the <old> position"
+                if field_edits.get("body_role"):
+                    new_role = field_edits["body_role"]
+                    body2, n = re.subn(
+                        r"(?i)((?:interest in|applying for|apply for|application for)"
+                        r"\s+the\s+)(.+?)(\s+(?:position|role)\b)",
+                        rf"\1{new_role}\3",
+                        working_body,
+                        count=1,
+                    )
+                    if not n:
+                        body2, n = re.subn(
+                            r"(?i)(the\s+)([A-Z][^.]{10,90}?)(\s+position\b)",
+                            rf"\1{new_role}\3",
+                            working_body,
+                            count=1,
+                        )
+                    if n:
+                        working_body = body2
+                        update_args["body"] = working_body
+                        did_deterministic = True
                 find_s = field_edits.get("body_find") or ""
                 repl_s = field_edits.get("body_replace")
                 if find_s and repl_s is not None:

@@ -992,6 +992,17 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
         quoted = qm.group(1)
     search_blob = quoted or text
 
+    # WhatsApp JDs often use Mathematical Bold/Italic Unicode (𝗛𝗶𝗿𝗶𝗻𝗴 / 𝐑𝐨𝐥𝐞).
+    # NFKC maps those to plain ASCII so Role:/Hiring: regexes work.
+    try:
+        import unicodedata as _ud
+
+        search_blob = _ud.normalize("NFKC", search_blob)
+        if quoted:
+            quoted = _ud.normalize("NFKC", quoted)
+    except Exception:
+        pass
+
     try:
         import email_ops as eo
 
@@ -1013,19 +1024,53 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
 
     to = cleaned[0] if cleaned else ""
 
+    _TITLE_TOKEN = (
+        r"developer|engineer|recruiter|executive|manager|designer|analyst|"
+        r"intern|specialist|consultant|lead|sales|marketing|writer|officer|"
+        r"associate|architect|scientist|coordinator"
+    )
+
     def _clean_title(raw: str) -> str:
         s = (raw or "").strip()
         s = re.sub(r"[*_`]", "", s)
-        # "Full-Stack Developer | Pakistan-Remote" → take role before |
         if "|" in s:
-            s = s.split("|", 1)[0].strip()
+            # "Hiring | CAD Application Engineer" → keep side that looks like a title
+            parts = [p.strip() for p in s.split("|")]
+            scored = sorted(
+                parts,
+                key=lambda p: (
+                    0 if re.search(rf"(?i){_TITLE_TOKEN}", p) else 1,
+                    len(p),
+                ),
+            )
+            s = scored[0] if scored else s
         s = re.sub(
-            r"(?i)^\s*(?:we'?re\s+hiring|hiring|position|role|title)\s*[:\-–]?\s*",
+            r"(?i)^\s*(?:we'?re\s+hiring|hiring\s+now|hiring|position|role|title)\s*[:\-–]?\s*",
             "",
             s,
         ).strip()
         s = re.sub(r"\s{2,}", " ", s).strip(" -–|:")
         return s
+
+    def _is_job_title(s: str) -> bool:
+        if not s or len(s) < 3 or len(s) > 70:
+            return False
+        low = s.lower()
+        # Reject skill/responsibility fragments
+        if re.search(
+            r"(?i)^(improve|develop|perform|provide|work|collaborate|generate|"
+            r"maintain|build|create|handle|manage|understand|good|strong|basic|"
+            r"experience|knowledge|understanding|ability|exposure)\b",
+            low,
+        ):
+            return False
+        if re.search(
+            r"(?i)understanding of|knowledge of|experience (?:in|with)|"
+            r"workflows through|drawings and|problem.?solving",
+            low,
+        ):
+            return False
+        return bool(re.search(rf"(?i){_TITLE_TOKEN}", s))
 
     subject = ""
     role = ""
@@ -1034,49 +1079,47 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
     if sm:
         subject = _clean_title(sm.group(1))
 
+    # Explicit Role: / Position: / Title: (after NFKC this catches 𝗥𝗼𝗹𝗲:)
     if not role:
         pm = re.search(
-            r"(?i)(?:position|role|title)\s*:\s*\*?(.+?)\*?\s*(?:\n|$)",
+            r"(?i)(?:position|role|title)\s*:\s*\*?([^\n*]+)",
             search_blob,
         )
         if pm:
-            role = _clean_title(pm.group(1))
+            cand = _clean_title(pm.group(1))
+            if _is_job_title(cand):
+                role = cand
 
-    # "Hiring: *Full-Stack Developer | Pakistan-Remote*"
-    # "We're Hiring: Sales Executive | Remote"
+    # "We're Hiring: Remote B2B Sales Consultants"
+    # "We're Hiring | *CAD Application Engineer*"
     if not role:
         hm = re.search(
-            r"(?i)(?:hiring|looking\s+for)\s*[:\-–]\s*\*?([^*\n|]+)",
+            r"(?i)(?:we'?re\s+hiring|hiring\s+now|hiring|looking\s+for)\s*[:\-–|]\s*\*?([^*\n]+)",
             search_blob,
         )
         if hm:
-            role = _clean_title(hm.group(1))
-            # Reject non-titles like "Remote Jobs in Pakistan!"
-            if role and not re.search(
-                r"(?i)developer|engineer|recruiter|executive|manager|"
-                r"designer|analyst|intern|specialist|consultant|lead|"
-                r"sales|marketing|writer|officer|associate",
-                role,
-            ):
-                role = ""
+            cand = _clean_title(hm.group(1))
+            if _is_job_title(cand):
+                role = cand
 
-    # Multi-role bullet lists: "- *Graphic Designers*" / "- WordPress Developers"
+    # Multi-role hiring lists only (short title-like bullets, not skill lists)
     roles_list: List[str] = []
     for m in re.finditer(
-        r"(?im)^\s*[-•*]\s*\*?([^*\n]{3,60}?)\*?\s*$",
+        r"(?im)^\s*[-•*]\s*\*?([^*\n]{3,50}?)\*?\s*$",
         search_blob,
     ):
         cand = _clean_title(m.group(1))
-        if cand and re.search(
-            r"(?i)developer|engineer|designer|executive|manager|"
-            r"analyst|intern|specialist|consultant|sales|recruiter|"
-            r"writer|officer|associate|lead",
-            cand,
-        ):
-            # de-plural soft: Designers → Designer for subject readability
+        if _is_job_title(cand) and len(cand.split()) <= 5:
             roles_list.append(cand)
+    # Deduplicate preserving order
+    seen_r = set()
+    roles_list = [
+        r
+        for r in roles_list
+        if not (r.lower() in seen_r or seen_r.add(r.lower()))
+    ]
+
     if not role and roles_list:
-        # Prefer tech-dev titles when several options (candidate is AI/FS)
         ranked = sorted(
             roles_list,
             key=lambda r: (
@@ -1090,22 +1133,15 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
         )
         role = ranked[0]
         if len(ranked) > 1:
-            # Lead with best-fit, keep others for LLM context
             role = " / ".join(ranked[:3])
 
     # First line often is the title
     if not role:
         first = (search_blob.strip().split("\n", 1)[0] or "").strip()
         first = _clean_title(first)
-        if first and 3 < len(first) < 80:
-            if re.search(
-                r"(?i)developer|engineer|recruiter|executive|manager|"
-                r"designer|analyst|intern|specialist|consultant|lead",
-                first,
-            ):
-                role = first
+        if _is_job_title(first):
+            role = first
 
-    # Company name for subject when role is still weak
     company = ""
     cm = re.search(
         r"(?i)\b([A-Z][A-Za-z0-9&.\' ]{2,40}?)\s+(?:is\s+hiring|is\s+looking|"
@@ -1116,8 +1152,11 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
         company = cm.group(1).strip().strip("*")
 
     if not subject:
-        if role:
+        if role and " / " not in role:
             subject = f"Application - {role}"
+        elif role:
+            # Multi-role: subject uses best-fit (first segment)
+            subject = f"Application - {role.split(' / ')[0].strip()}"
         elif company:
             subject = f"Application - {company}"
         else:
@@ -1155,21 +1194,42 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
 
     out: Dict[str, str] = {}
 
+    # Prefer quoted subject: Change subject to "Application - CAD …"
     sm = re.search(
-        r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*([^\n]+)",
+        r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*"
+        r'[""\']([^""\']+)[""\']',
         t,
     )
+    if not sm:
+        sm = re.search(
+            r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*"
+            r"([^\n]+)",
+            t,
+        )
     if sm:
         subj = sm.group(1).strip().strip("\"'").rstrip(".,;")
+        # Stop before "and role…" / "and the body…"
         subj = re.split(
-            r"(?i)\s+and\s+(?:the\s+)?(?:second\s+line|body|line)\b",
+            r"(?i)\s+and\s+(?:(?:the\s+)?role\b|(?:the\s+)?(?:second\s+line|body|line)\b)",
             subj,
             maxsplit=1,
         )[0].strip()
+        subj = subj.strip("\"'").rstrip(".,;")
         if subj and len(subj) < 120:
             out["subject"] = subj
 
-    # "old" to "new" — never cross newlines (prevents instruction-dump replace)
+    # Change role in email body to "CAD Application Engineer"
+    role_m = re.search(
+        r"(?i)(?:change\s+)?role\s+(?:in\s+(?:the\s+)?(?:email\s+)?body\s+)?"
+        r"to\s+[:\-]?\s*[""\']?([^""\'\n]{3,80})[""\']?",
+        t,
+    )
+    if role_m:
+        new_role = role_m.group(1).strip().strip("\"'").rstrip(".,;")
+        if new_role and " and " not in new_role.lower():
+            out["body_role"] = new_role
+
+    # "old" to "new" — never cross newlines
     rm = re.search(
         r"(?i)(?:change|replace|update)?\s*[\"']([^\"'\n]{2,80})[\"']\s+"
         r"(?:to|with|->)\s+[\"']?([^\"'\n]{1,80})[\"']?",
@@ -1179,8 +1239,10 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
         find_s = rm.group(1).strip()
         repl_s = rm.group(2).strip().rstrip(".,;")
         if find_s and repl_s and "\n" not in repl_s and len(repl_s) <= 80:
-            out["body_find"] = find_s
-            out["body_replace"] = repl_s
+            # Don't treat subject-line quotes as body find/replace
+            if find_s.lower() not in (out.get("subject") or "").lower():
+                out["body_find"] = find_s
+                out["body_replace"] = repl_s
 
     low = t.lower()
     rewrite_cues = (
@@ -1204,7 +1266,9 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
     if any(c in low for c in rewrite_cues):
         out["wants_rewrite"] = "true"
 
-    if not any(k in out for k in ("subject", "body_find", "wants_rewrite")):
+    if not any(
+        k in out for k in ("subject", "body_find", "body_role", "wants_rewrite")
+    ):
         return None
     return out
 
