@@ -1445,27 +1445,42 @@ def run_agent(
                             {
                                 "role": "system",
                                 "content": (
-                                    "Write a concise plain-text job application email body "
-                                    "(cover letter). 120–180 words. No markdown, no subject "
-                                    "line, no 'Dear Sir/Madam' generic fluff if a name is "
-                                    "unknown — use Hello Hiring Team. Tie 2–3 concrete "
-                                    "candidate strengths to the role. End with a short close "
-                                    "and the candidate name if present in the profile. "
-                                    "Output ONLY the email body."
+                                    "You write plain-text job application email bodies.\n\n"
+                                    "HARD RULES (never break):\n"
+                                    "1. ONLY use facts present in CANDIDATE PROFILE. If a "
+                                    "skill, tool, job title, metric, or responsibility is "
+                                    "not in the profile, you MUST NOT claim it.\n"
+                                    "2. The JOB DESCRIPTION is for alignment only — do NOT "
+                                    "copy JD requirements into the candidate's experience. "
+                                    "Never invent recruiter/sourcing/job-board experience "
+                                    "unless the profile explicitly has it.\n"
+                                    "3. Map real profile strengths to the role in honest "
+                                    "language (e.g. automation + data workflows → efficiency "
+                                    "in high-volume processes) without fabricating domain "
+                                    "experience the candidate does not have.\n"
+                                    "4. If the role is a weak fit, still apply honestly: "
+                                    "state relevant transferable strengths and willingness "
+                                    "to learn — do not role-play as an expert in the JD.\n"
+                                    "5. 120–180 words. No markdown. No subject line. "
+                                    "Greeting: Hello Hiring Team (unless a name is known). "
+                                    "Sign off with the candidate name from the profile.\n"
+                                    "6. Output ONLY the email body text."
                                 ),
                             },
                             {
                                 "role": "user",
                                 "content": (
                                     f"Role / subject: {subject}\n\n"
-                                    f"JOB DESCRIPTION:\n{jd_clip}\n\n"
-                                    f"CANDIDATE PROFILE:\n{profile_clip or '(see notes)'}"
+                                    f"JOB DESCRIPTION (context only — not candidate facts):\n"
+                                    f"{jd_clip}\n\n"
+                                    f"CANDIDATE PROFILE (ONLY source of facts):\n"
+                                    f"{profile_clip or '(limited notes — stay minimal and honest)'}"
                                 ),
                             },
                         ],
                         tools=None,
-                        temperature=0.4,
-                        max_tokens=500,
+                        temperature=0.2,
+                        max_tokens=450,
                     )
                     cover = (getattr(cover_msg, "content", None) or "").strip()
                 except Exception as _ce:
