@@ -967,7 +967,7 @@ def _build_system_prompt(
 11d. OUTBOUND EMAIL / JOB APPLY (owner only — draft_email + send_email):
    - Triggers: apply / cover letter / email this to X / outreach / intro / pitch (any language).
    - EXACT BODY DEFAULT: user-supplied text after "email to X:" is stored WORD-FOR-WORD unless they ask to rewrite.
-   - When YOU compose (apply, rewrite, personalize, outreach): reason in JSON shape subject+body+attach_resume, then call draft_email with those fields. Never invent experience not in permanent notes.
+   - When YOU compose (apply, rewrite, personalize, outreach): reason in JSON shape subject+body+attach_resume, then call draft_email. Facts come from the attached resume PDF text + permanent notes — never invent experience.
    - JOB APPLY: Extract HR email from JD; subject from title/position; attach_resume=true.
    - Flow: draft_email → show card → edit (update) → send_email only after send it / bhej do.
    - Never claim sent unless send_email returned success.
@@ -1342,8 +1342,9 @@ def _email_compose_system(mode: str, greeting_name: str) -> str:
         "and outreach.\n\n"
         f"{structure}\n\n"
         "HARD ANTI-HALLUCINATION RULES:\n"
-        "- ONLY facts present in CANDIDATE PROFILE. Zero invention.\n"
-        "- NEVER invent metrics (%, revenue, headcount) unless in the profile.\n"
+        "- ONLY facts present in CANDIDATE FACTS (resume PDF + notes). Zero invention.\n"
+        "- The RESUME PDF section is the primary source of truth; notes are secondary.\n"
+        "- NEVER invent metrics (%, revenue, headcount) unless in the resume/notes.\n"
         "- NEVER claim sales/recruiter/logistics years you do not have.\n"
         "- JD is context for wording only — never claim JD duties as your experience.\n"
         "- You MAY map real automation/AI/outreach work as transferable value.\n"
@@ -1360,6 +1361,67 @@ def _is_email_draft_card(text: str) -> bool:
         re.search(r"(?i)email draft", text)
         and re.search(r"(?m)^\*To:\*", text)
     )
+
+
+def _load_candidate_facts(
+    memory_block: str = "",
+    mem_obs: str = "",
+    *,
+    notes_cap: int = 2000,
+    resume_cap: int = 12000,
+) -> str:
+    """
+    Build the fact block for cover/outreach compose.
+
+    Priority: full resume PDF (same file attached on send) + permanent notes.
+    Resume text is the primary source of truth; notes fill gaps.
+    """
+    notes = mem_obs or ""
+    if "[Chat note]" in notes or len(notes) > notes_cap + 400:
+        notes = re.sub(r"\[Chat note\][^\n]*\n?", " ", notes)
+        notes = re.sub(r"\[Quoted Message\]:\s*", "", notes)
+        notes = re.sub(r"\s{2,}", " ", notes).strip()
+    notes = (notes or memory_block or "").strip()[:notes_cap]
+
+    resume_text = ""
+    resume_src = ""
+    try:
+        import email_ops as eo
+
+        resume_text, resume_src = eo.extract_resume_text(max_chars=resume_cap)
+    except Exception as e:
+        resume_src = f"resume load error: {e}"
+        resume_text = ""
+
+    if resume_text:
+        logging.getLogger("mojo.agent").info(
+            "RESUME_TEXT_LOADED src=%s chars=%s",
+            resume_src,
+            len(resume_text),
+        )
+        parts = [
+            "=== RESUME PDF (same file that will be attached — PRIMARY FACTS) ===",
+            resume_text,
+        ]
+        if notes:
+            parts.extend(
+                [
+                    "",
+                    "=== PERMANENT NOTES (supplementary) ===",
+                    notes,
+                ]
+            )
+        return "\n".join(parts)
+
+    logging.getLogger("mojo.agent").info(
+        "RESUME_TEXT_MISSING reason=%s — falling back to notes only",
+        resume_src,
+    )
+    if notes:
+        return (
+            "=== PERMANENT NOTES (resume PDF text unavailable) ===\n" + notes
+        )
+    return "(no resume PDF text and no permanent notes — stay minimal and honest)"
 
 
 def _compose_email_json(
@@ -1896,11 +1958,9 @@ def run_agent(
                 mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
             except Exception:
                 mem_obs = ""
-            profile_clip = re.sub(r"\[Chat note\][^\n]*\n?", " ", mem_obs)
-            profile_clip = re.sub(r"\[Quoted Message\]:\s*", "", profile_clip)
-            profile_clip = re.sub(r"\s{2,}", " ", profile_clip).strip()[:1600]
-            if not profile_clip:
-                profile_clip = (memory_block or "")[:1600]
+            candidate_facts = _load_candidate_facts(
+                memory_block or "", mem_obs
+            )
             role_hint = (existing.get("subject") or "").strip()
             role_hint = re.sub(
                 r"(?i)^\s*application\s*[–\-:]\s*", "", role_hint
@@ -1923,8 +1983,8 @@ def run_agent(
                     f"Recipient greeting name: {greet_name}\n"
                     f"attach_resume: {existing.get('attach_resume') or 'true'}\n"
                     f"Current body:\n{existing.get('body') or ''}\n\n"
-                    f"CANDIDATE PROFILE (ONLY source of facts):\n"
-                    f"{profile_clip or '(limited)'}"
+                    f"CANDIDATE FACTS (resume PDF + notes — ONLY source of facts):\n"
+                    f"{candidate_facts}"
                 ),
                 temperature=0.25,
                 max_tokens=tok_budget,
@@ -1991,26 +2051,16 @@ def run_agent(
                     apply["to"],
                     (apply.get("subject") or "")[:80],
                 )
-                # Compact profile for cover letter (cap hard — full notes already in prompt)
+                # Resume PDF (attachment source) + permanent notes → LLM facts
                 try:
                     mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
                 except Exception as _me:
                     mem_obs = ""
-                # Prefer the always-on memory_block already injected if get_memory is noisy
-                profile_clip = mem_obs
-                if "[Chat note]" in profile_clip or len(profile_clip) > 1800:
-                    # Strip repeated chat-note wrappers; keep substance
-                    profile_clip = re.sub(
-                        r"\[Chat note\][^\n]*\n?", " ", profile_clip
-                    )
-                    profile_clip = re.sub(
-                        r"\[Quoted Message\]:\s*", "", profile_clip
-                    )
-                    profile_clip = re.sub(r"\s{2,}", " ", profile_clip).strip()
-                profile_clip = (profile_clip or memory_block or "")[:1600]
+                candidate_facts = _load_candidate_facts(
+                    memory_block or "", mem_obs
+                )
                 jd_clip = (apply.get("jd_excerpt") or "")[:1800]
                 subject = apply.get("subject") or "Job Application"
-                # Prefer explicit role from JD parser; else strip Application - prefix
                 role_name = (apply.get("role") or "").strip() or re.sub(
                     r"(?i)^\s*application\s*[–\-:]\s*", "", subject
                 ).strip() or subject
@@ -2033,19 +2083,19 @@ def run_agent(
                         f"cover_mode: {cover_mode}\n"
                         f"user_request: {_email_src[:400]}\n"
                         f"Role name (use in body — never say 'Job Application role'): "
-                        f"{role_name or '(infer best-fit role from JD + profile)'}\n"
+                        f"{role_name or '(infer best-fit role from JD + resume)'}\n"
                         f"Open roles on this posting (if multi-role): {roles_hint or 'n/a'}\n"
                         f"Company: {company_hint or 'n/a'}\n"
                         f"Suggested subject: {subject}\n"
                         f"Recipient greeting name: {greet_name}\n"
                         f"attach_resume: true\n"
                         "If multiple roles are listed, pick the ONE best fit for the "
-                        "candidate profile and write the subject + body for that role. "
+                        "candidate resume and write the subject + body for that role. "
                         "Never use the phrase 'Job Application role'.\n\n"
                         f"JOB DESCRIPTION (context only — do not claim as experience):\n"
                         f"{jd_clip}\n\n"
-                        f"CANDIDATE PROFILE (ONLY source of facts):\n"
-                        f"{profile_clip or '(limited notes — stay minimal and honest)'}"
+                        f"CANDIDATE FACTS (resume PDF is primary — ONLY source of facts):\n"
+                        f"{candidate_facts}"
                     ),
                     temperature=0.25 if cover_mode == "detailed" else 0.2,
                     max_tokens=tok_budget,

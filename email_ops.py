@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
+import re
 import tempfile
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -101,6 +102,62 @@ def resolve_resume_pdf() -> Tuple[Optional[str], Optional[str]]:
         "No resume PDF configured. Set RESUME_PDF_PATH (local) or "
         "RESUME_ONEDRIVE_PATH (OneDrive relative path)."
     )
+
+
+# Soft cache: path+mtime → extracted text (avoid re-parse on every apply)
+_RESUME_TEXT_CACHE: Dict[str, Any] = {"key": "", "text": ""}
+
+
+def extract_resume_text(max_chars: int = 14000) -> Tuple[str, str]:
+    """
+    Read the same resume PDF used for email attachment and return plain text.
+
+    Returns (text, source_label). text is empty on failure; source_label explains why.
+    Uses pypdf when available. Cached by path+mtime for low latency across applies.
+    """
+    path, src = resolve_resume_pdf()
+    if not path:
+        return "", src or "resume not configured"
+
+    try:
+        mtime = os.path.getmtime(path)
+        size = os.path.getsize(path)
+    except OSError as e:
+        return "", f"resume stat failed: {e}"
+
+    cache_key = f"{path}|{mtime}|{size}|{max_chars}"
+    if (
+        _RESUME_TEXT_CACHE.get("key") == cache_key
+        and isinstance(_RESUME_TEXT_CACHE.get("text"), str)
+        and _RESUME_TEXT_CACHE["text"]
+    ):
+        return _RESUME_TEXT_CACHE["text"], f"{src} (cached)"
+
+    text = ""
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(path)
+        parts: List[str] = []
+        for page in reader.pages[:40]:
+            t = page.extract_text() or ""
+            if t.strip():
+                parts.append(t.strip())
+        text = "\n\n".join(parts)
+    except Exception as e:
+        return "", f"resume PDF extract failed ({src}): {e}"
+
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n… [resume truncated]"
+
+    if not text:
+        return "", f"resume PDF had no extractable text ({src})"
+
+    _RESUME_TEXT_CACHE["key"] = cache_key
+    _RESUME_TEXT_CACHE["text"] = text
+    return text, src
 
 
 def _format_from_header(
