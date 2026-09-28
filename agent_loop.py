@@ -514,12 +514,25 @@ def _is_bad_post_tool_reply(text: str) -> bool:
 
 
 def _last_tool_obs_for_user(messages: List[dict], max_len: int = 3500) -> Optional[str]:
-    """Strip Source header from last tool OBS so it can be sent to the user as-is."""
+    """Strip Source header from last tool OBS so it can be sent to the user as-is.
+
+    Never dump raw permanent-memory / chat-note blobs (common after a failed
+    job-apply turn that mistakenly called search_knowledge).
+    """
     for m in reversed(messages or []):
         if m.get("role") != "tool":
             continue
         obs = str(m.get("content") or "").strip()
         if not obs:
+            continue
+        low = obs[:200].lower()
+        # Memory / knowledge dumps are not user-facing replies
+        if (
+            low.startswith("[chat note]")
+            or "always remember" in low
+            or obs.count("[Chat note]") >= 2
+            or (low.startswith("permission denied"))
+        ):
             continue
         # Drop "Source: … | mode=…" first line if present
         lines = obs.split("\n")
@@ -528,10 +541,8 @@ def _last_tool_obs_for_user(messages: List[dict], max_len: int = 3500) -> Option
         obs = obs.strip()
         if not obs:
             continue
-        # Auto-raise cap when this OBS is a full transcript (not a short summary)
         use_len = max_len
         if max_len <= 3500 and len(obs) > 3500:
-            # Prefer full speech when available (transcribe_video mode=transcript)
             use_len = max(max_len, MAX_OBS_CHARS_TRANSCRIPT)
         if len(obs) > use_len:
             obs = obs[:use_len].rstrip() + "…"
@@ -1387,51 +1398,138 @@ def run_agent(
 
         _email_src = latest_user_text or extra_user_note or _intent_src or ""
 
-        # Job apply: HR email is often inside the quoted JD — extract it, don't ask
+        # Job apply: hard-force draft (no multi-tool loop — avoids search_knowledge
+        # distraction, 413 from huge memory dumps, and RETURNING_TOOL_OBS of notes).
         if _parse_job_apply and _tool_allowed_for_chat(chat_id, "draft_email"):
             apply = _parse_job_apply(_email_src)
             if apply is not None:
                 if not apply.get("to"):
                     print("[AGENT] apply intent but no email in JD")
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "User wants to APPLY but no email was found in the "
-                            "JD/quote. Ask ONCE for the HR email. Do not invent one."
-                        ),
-                    })
-                else:
-                    print(
-                        f"[AGENT] force job-apply to={apply['to']!r} "
-                        f"subj={apply.get('subject', '')[:50]!r}"
+                    return _reply(
+                        "Is JD mein apply email nahi mili. HR/recruiter ka email "
+                        "bhej do, phir apply kar deta hoon."
                     )
-                    logging.getLogger("mojo.agent").info(
-                        "FORCE_JOB_APPLY to=%s subject=%r",
-                        apply["to"],
-                        (apply.get("subject") or "")[:80],
+                print(
+                    f"[AGENT] force job-apply HARD to={apply['to']!r} "
+                    f"subj={apply.get('subject', '')[:50]!r}"
+                )
+                logging.getLogger("mojo.agent").info(
+                    "FORCE_JOB_APPLY to=%s subject=%r",
+                    apply["to"],
+                    (apply.get("subject") or "")[:80],
+                )
+                # Compact profile for cover letter (cap hard — full notes already in prompt)
+                try:
+                    mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
+                except Exception as _me:
+                    mem_obs = ""
+                # Prefer the always-on memory_block already injected if get_memory is noisy
+                profile_clip = mem_obs
+                if "[Chat note]" in profile_clip or len(profile_clip) > 1800:
+                    # Strip repeated chat-note wrappers; keep substance
+                    profile_clip = re.sub(
+                        r"\[Chat note\][^\n]*\n?", " ", profile_clip
                     )
-                    try:
-                        mem_obs = execute_tool("get_memory", {}, tool_ctx)
-                    except Exception as _me:
-                        mem_obs = f"(memory unavailable: {_me})"
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "JOB APPLY — you MUST call draft_email now. Do NOT ask "
-                            "for the email; it is already known.\n"
-                            f"to: {apply['to']}\n"
-                            f"subject: {apply.get('subject') or 'Job Application'}\n"
-                            "attach_resume: true\n"
-                            "purpose: job_apply\n\n"
-                            "Write a concise high-impact cover letter body from the "
-                            "candidate memory/notes and the JD. Plain text only.\n\n"
-                            f"JD:\n{(apply.get('jd_excerpt') or '')[:3000]}\n\n"
-                            f"CANDIDATE MEMORY / NOTES:\n{str(mem_obs)[:3000]}\n\n"
-                            "After draft_email returns, show the draft with real "
-                            "newlines (never glue To/Subject/Body on one line) and "
-                            "ask if they want to send."
-                        ),
-                    })
+                    profile_clip = re.sub(
+                        r"\[Quoted Message\]:\s*", "", profile_clip
+                    )
+                    profile_clip = re.sub(r"\s{2,}", " ", profile_clip).strip()
+                profile_clip = (profile_clip or memory_block or "")[:1600]
+                jd_clip = (apply.get("jd_excerpt") or "")[:1800]
+                subject = apply.get("subject") or "Job Application"
+
+                cover = ""
+                try:
+                    cover_msg = _chat_completion(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Write a concise plain-text job application email body "
+                                    "(cover letter). 120–180 words. No markdown, no subject "
+                                    "line, no 'Dear Sir/Madam' generic fluff if a name is "
+                                    "unknown — use Hello Hiring Team. Tie 2–3 concrete "
+                                    "candidate strengths to the role. End with a short close "
+                                    "and the candidate name if present in the profile. "
+                                    "Output ONLY the email body."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Role / subject: {subject}\n\n"
+                                    f"JOB DESCRIPTION:\n{jd_clip}\n\n"
+                                    f"CANDIDATE PROFILE:\n{profile_clip or '(see notes)'}"
+                                ),
+                            },
+                        ],
+                        tools=None,
+                        temperature=0.4,
+                        max_tokens=500,
+                    )
+                    cover = (getattr(cover_msg, "content", None) or "").strip()
+                except Exception as _ce:
+                    print(f"[AGENT] cover letter LLM failed: {_ce}")
+                    cover = ""
+
+                if not cover or len(cover) < 40:
+                    # Deterministic fallback so apply never dies on 429/503
+                    name = "Muhammad Zaheeruddin"
+                    nm = re.search(
+                        r"(?i)\*?Muhammad\s+Zaheer[^\n*]*",
+                        profile_clip or "",
+                    )
+                    if nm:
+                        name = re.sub(r"[*]", "", nm.group(0)).strip()
+                    cover = (
+                        f"Hello Hiring Team,\n\n"
+                        f"I am writing to apply for the {subject} role. "
+                        f"I bring hands-on experience in AI engineering, automation, "
+                        f"and data-driven operations — including multi-agent systems, "
+                        f"LLM workflows, and structured client delivery.\n\n"
+                        f"I am self-motivated, comfortable owning end-to-end processes, "
+                        f"and ready to contribute immediately in a remote setup with "
+                        f"strong Excel/Sheets and sourcing discipline where needed.\n\n"
+                        f"Please find my resume attached. Happy to share more detail "
+                        f"or join a short call at your convenience.\n\n"
+                        f"Best regards,\n{name}"
+                    )
+
+                try:
+                    obs = execute_tool(
+                        "draft_email",
+                        {
+                            "action": "create",
+                            "to": apply["to"],
+                            "subject": subject,
+                            "body": cover,
+                            "attach_resume": "true",
+                            "purpose": "job_apply",
+                            "reason": "job application — resume attached",
+                        },
+                        tool_ctx,
+                    )
+                except Exception as _de:
+                    obs = f"Tool error: {_de}"
+                obs_s = str(obs)
+                logging.getLogger("mojo.agent").info(
+                    "FORCE_JOB_APPLY_DRAFT obs=%s", obs_s[:240]
+                )
+                if "Permission denied" in obs_s:
+                    return _reply(
+                        "Job apply / email sirf bot owner ke liye available hai."
+                    )
+                if obs_s.startswith("Draft created") or obs_s.startswith(
+                    "Draft updated"
+                ):
+                    return _reply(
+                        obs_s
+                        + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                    )
+                return _reply(
+                    "Draft banane mein issue aaya. Dobara 'apply to this job' "
+                    "try karo ya HR email confirm karo."
+                )
 
         if _parse_email_cmd and _tool_allowed_for_chat(chat_id, "draft_email"):
             parsed = _parse_email_cmd(_email_src)
