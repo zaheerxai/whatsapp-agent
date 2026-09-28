@@ -1086,8 +1086,10 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
     """
     Deterministic draft edits from instructions like:
       Change subject to Application - Full Stack Developer
-      and the second line "Job Application" to Full Stack Developer
-    Returns {subject?, body_find?, body_replace?} — at least one key set.
+      Change "Hello Hiring Team" to Hello Sana
+
+    Replacement values are SAME-LINE only so following paragraphs
+    (personalize / format instructions) are never swallowed into body_replace.
     """
     if not text:
         return None
@@ -1099,49 +1101,58 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
 
     out: Dict[str, str] = {}
 
-    # change/set subject to X
     sm = re.search(
-        r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*(.+?)(?:\s+and\s+(?:the\s+)?(?:second\s+line|body|line)\b|\s*$)",
+        r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*([^\n]+)",
         t,
     )
     if sm:
         subj = sm.group(1).strip().strip("\"'").rstrip(".,;")
-        # stop at "and the second line..."
         subj = re.split(
             r"(?i)\s+and\s+(?:the\s+)?(?:second\s+line|body|line)\b",
             subj,
             maxsplit=1,
         )[0].strip()
-        if subj:
+        if subj and len(subj) < 120:
             out["subject"] = subj
 
-    # replace "old" with/to "new"  OR  second line "old" to "new"
+    # "old" to "new" — never cross newlines (prevents instruction-dump replace)
     rm = re.search(
-        r"(?i)(?:(?:second\s+line|body|line)\s+)?[\"']([^\"']+)[\"']\s+"
-        r"(?:to|with|->)\s+[\"']?([^\"']+?)[\"']?\s*$",
+        r"(?i)(?:change|replace|update)?\s*[\"']([^\"'\n]{2,80})[\"']\s+"
+        r"(?:to|with|->)\s+[\"']?([^\"'\n]{1,80})[\"']?",
         t,
     )
-    if not rm:
-        rm = re.search(
-            r"(?i)(?:replace|change)\s+[\"']([^\"']+)[\"']\s+"
-            r"(?:to|with)\s+[\"']?([^\"']+?)[\"']?\s*$",
-            t,
-        )
     if rm:
-        out["body_find"] = rm.group(1).strip()
-        out["body_replace"] = rm.group(2).strip().rstrip(".,;")
+        find_s = rm.group(1).strip()
+        repl_s = rm.group(2).strip().rstrip(".,;")
+        if find_s and repl_s and "\n" not in repl_s and len(repl_s) <= 80:
+            out["body_find"] = find_s
+            out["body_replace"] = repl_s
 
-    # "Job Application" to Full Stack Developer (without replace keyword)
-    if "body_find" not in out:
-        rm2 = re.search(
-            r"(?i)[\"']([^\"']{3,80})[\"']\s+to\s+[\"']?([^\"'\n,]{2,80})[\"']?",
-            t,
-        )
-        if rm2:
-            out["body_find"] = rm2.group(1).strip()
-            out["body_replace"] = rm2.group(2).strip().rstrip(".,;")
+    low = t.lower()
+    rewrite_cues = (
+        "personalize",
+        "personalized",
+        "personalise",
+        "high impact",
+        "high-impact",
+        "rewrite",
+        "rephrase",
+        "polish",
+        "paragraph",
+        "line break",
+        "line breaks",
+        "better format",
+        "format the body",
+        "more relevant",
+        "relevantly",
+        "improve",
+    )
+    if any(c in low for c in rewrite_cues):
+        out["wants_rewrite"] = "true"
 
-    return out or None
+    if not any(k in out for k in ("subject", "body_find", "wants_rewrite")):
+        return None
+    return out
 
 
 def is_email_send_confirm(text: str) -> bool:

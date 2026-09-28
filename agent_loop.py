@@ -1578,7 +1578,9 @@ def run_agent(
                     "Koi draft save nahi hai. Pehle apply / email draft banao, "
                     "phir personalize karo."
                 )
-            # 1) Deterministic field edits (change subject to X, replace "a" to "b")
+            # 1) Deterministic field edits (subject / "a"→"b").
+            #    If user also asked to personalize/format, apply tweaks then continue
+            #    to JSON rewrite — never swallow following paragraphs as replace text.
             field_edits = None
             try:
                 from agent_tools import parse_draft_field_edits as _parse_fields
@@ -1592,31 +1594,41 @@ def run_agent(
                 "attach_resume": existing.get("attach_resume") or "true",
             }
             did_deterministic = False
+            wants_rewrite = bool(
+                field_edits and field_edits.get("wants_rewrite") == "true"
+            )
+            working_body = existing.get("body") or ""
+            working_subj = existing.get("subject") or ""
+
             if field_edits:
                 if field_edits.get("subject"):
-                    update_args["subject"] = field_edits["subject"]
+                    working_subj = field_edits["subject"]
+                    update_args["subject"] = working_subj
                     did_deterministic = True
-                body = existing.get("body") or ""
                 find_s = field_edits.get("body_find") or ""
                 repl_s = field_edits.get("body_replace")
-                if find_s and repl_s is not None and find_s in body:
-                    body = body.replace(find_s, repl_s)
-                    update_args["body"] = body
-                    did_deterministic = True
-                elif find_s and repl_s is not None:
-                    # case-insensitive replace
+                if find_s and repl_s is not None:
                     body2, n = re.subn(
                         re.escape(find_s),
                         repl_s,
-                        body,
+                        working_body,
                         count=0,
                         flags=re.I,
                     )
+                    if not n:
+                        body2, n = re.subn(
+                            re.escape(find_s.rstrip(",")),
+                            repl_s,
+                            working_body,
+                            count=1,
+                            flags=re.I,
+                        )
                     if n:
-                        update_args["body"] = body2
+                        working_body = body2
+                        update_args["body"] = working_body
                         did_deterministic = True
 
-            if did_deterministic:
+            if did_deterministic and not wants_rewrite:
                 try:
                     obs = execute_tool("draft_email", update_args, tool_ctx)
                 except Exception as _ue:
@@ -1628,6 +1640,13 @@ def run_agent(
                 return _reply(
                     obs_s + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
                 )
+
+            if did_deterministic:
+                existing = {
+                    **existing,
+                    "body": working_body,
+                    "subject": working_subj,
+                }
 
             # 2) Full rewrite personalization via structured JSON LLM
             try:
