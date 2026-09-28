@@ -965,11 +965,11 @@ def _build_system_prompt(
    - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
    - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
 11d. OUTBOUND EMAIL / JOB APPLY (owner only — draft_email + send_email):
-   - Triggers: apply to this / apply karo / send resume / cover letter / email this to X / send email X ko / invite to collaborate / offer demo / pitch (any language).
-   - EXACT BODY DEFAULT: When the user gives the email text after "email to X:", put that text WORD-FOR-WORD in draft_email body. Do NOT polish unless asked.
-   - REWRITE ONLY ON REQUEST: make it professional / rewrite / polish / formal bana do / in a X tone → rewrite; never leave the instruction in the body.
-   - JOB APPLY: Extract HR/apply email from the quoted JD (e.g. "Send CV to hr@…"). NEVER ask the user for an email that is already in the JD. Subject from JD "Subject:" line or "Application – <Position>". attach_resume=true. Cover letter from permanent notes + JD via draft_email.
-   - Flow: draft_email → show draft (real newlines) → edit → send_email only after send it / bhej do.
+   - Triggers: apply / cover letter / email this to X / outreach / intro / pitch (any language).
+   - EXACT BODY DEFAULT: user-supplied text after "email to X:" is stored WORD-FOR-WORD unless they ask to rewrite.
+   - When YOU compose (apply, rewrite, personalize, outreach): reason in JSON shape subject+body+attach_resume, then call draft_email with those fields. Never invent experience not in permanent notes.
+   - JOB APPLY: Extract HR email from JD; subject from title/position; attach_resume=true.
+   - Flow: draft_email → show card → edit (update) → send_email only after send it / bhej do.
    - Never claim sent unless send_email returned success.
 
 {style_hint}
@@ -1122,6 +1122,101 @@ def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
             m = {**m, "content": c[:cap] + "…"}
         out.append(m)
     return out
+
+
+def _parse_email_llm_json(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse structured email JSON from an LLM response.
+
+    Expected shape (all email use-cases: apply, cover, intro, outreach, general):
+      {
+        "subject": "...",
+        "body": "...",
+        "attach_resume": true | false | "ask"   // optional
+      }
+
+    Tolerates fenced ```json blocks and leading/trailing prose.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    # Strip markdown fences
+    if "```" in s:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.I)
+        if m:
+            s = m.group(1).strip()
+    # Extract outermost { ... }
+    if not s.startswith("{"):
+        i, j = s.find("{"), s.rfind("}")
+        if i >= 0 and j > i:
+            s = s[i : j + 1]
+    try:
+        data = json.loads(s)
+    except Exception:
+        # Trailing commas / soft failures
+        try:
+            s2 = re.sub(r",\s*}", "}", s)
+            s2 = re.sub(r",\s*]", "]", s2)
+            data = json.loads(s2)
+        except Exception:
+            return None
+    if not isinstance(data, dict):
+        return None
+    body = data.get("body")
+    if body is None:
+        body = data.get("email_body") or data.get("message") or data.get("text")
+    if not isinstance(body, str) or len(body.strip()) < 20:
+        return None
+    out: Dict[str, Any] = {"body": body.strip()}
+    subj = data.get("subject") or data.get("email_subject")
+    if isinstance(subj, str) and subj.strip():
+        out["subject"] = subj.strip()
+    att = data.get("attach_resume")
+    if att is True or att is False:
+        out["attach_resume"] = "true" if att else "false"
+    elif isinstance(att, str) and att.strip().lower() in ("true", "false", "ask"):
+        out["attach_resume"] = att.strip().lower()
+    return out
+
+
+_EMAIL_JSON_SCHEMA_HINT = (
+    "Respond with ONLY a single JSON object (no markdown fences, no prose):\n"
+    "{\n"
+    '  "subject": "string — email subject line",\n'
+    '  "body": "string — full plain-text email body including greeting and sign-off",\n'
+    '  "attach_resume": true\n'
+    "}\n"
+    "Rules: body must be complete through the signature; never truncate mid-sentence; "
+    "plain text only inside body (no markdown); JSON only as the entire response."
+)
+
+
+def _compose_email_json(
+    *,
+    system: str,
+    user: str,
+    temperature: float = 0.2,
+    max_tokens: int = 1000,
+) -> Optional[Dict[str, Any]]:
+    """One-shot LLM call that must return parseable email JSON (single response)."""
+    try:
+        msg = _chat_completion(
+            [
+                {
+                    "role": "system",
+                    "content": system.rstrip() + "\n\n" + _EMAIL_JSON_SCHEMA_HINT,
+                },
+                {"role": "user", "content": user},
+            ],
+            tools=None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        raw = (getattr(msg, "content", None) or "").strip()
+        return _parse_email_llm_json(raw)
+    except Exception as e:
+        print(f"[AGENT] _compose_email_json failed: {e}")
+        return None
 
 
 def _chat_completion(
@@ -1483,6 +1578,58 @@ def run_agent(
                     "Koi draft save nahi hai. Pehle apply / email draft banao, "
                     "phir personalize karo."
                 )
+            # 1) Deterministic field edits (change subject to X, replace "a" to "b")
+            field_edits = None
+            try:
+                from agent_tools import parse_draft_field_edits as _parse_fields
+
+                field_edits = _parse_fields(_email_src)
+            except Exception:
+                field_edits = None
+
+            update_args: Dict[str, Any] = {
+                "action": "update",
+                "attach_resume": existing.get("attach_resume") or "true",
+            }
+            did_deterministic = False
+            if field_edits:
+                if field_edits.get("subject"):
+                    update_args["subject"] = field_edits["subject"]
+                    did_deterministic = True
+                body = existing.get("body") or ""
+                find_s = field_edits.get("body_find") or ""
+                repl_s = field_edits.get("body_replace")
+                if find_s and repl_s is not None and find_s in body:
+                    body = body.replace(find_s, repl_s)
+                    update_args["body"] = body
+                    did_deterministic = True
+                elif find_s and repl_s is not None:
+                    # case-insensitive replace
+                    body2, n = re.subn(
+                        re.escape(find_s),
+                        repl_s,
+                        body,
+                        count=0,
+                        flags=re.I,
+                    )
+                    if n:
+                        update_args["body"] = body2
+                        did_deterministic = True
+
+            if did_deterministic:
+                try:
+                    obs = execute_tool("draft_email", update_args, tool_ctx)
+                except Exception as _ue:
+                    obs = f"Tool error: {_ue}"
+                obs_s = str(obs)
+                logging.getLogger("mojo.agent").info(
+                    "FORCE_DRAFT_EDIT deterministic obs=%s", obs_s[:240]
+                )
+                return _reply(
+                    obs_s + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                )
+
+            # 2) Full rewrite personalization via structured JSON LLM
             try:
                 mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
             except Exception:
@@ -1496,45 +1643,34 @@ def run_agent(
             role_hint = re.sub(
                 r"(?i)^\s*application\s*[–\-:]\s*", "", role_hint
             ).strip() or role_hint
-            new_body = ""
-            try:
-                edit_msg = _chat_completion(
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Rewrite this job/outreach email body to be higher-impact "
-                                "and more personalized to the candidate's real experience.\n"
-                                "HARD RULES:\n"
-                                "- ONLY facts from CANDIDATE PROFILE + existing body.\n"
-                                "- Do not invent sales/recruiter experience not in profile.\n"
-                                "- Keep structure: greeting, 2 short proof lines, resume "
-                                "attach line, soft CTA, Best regards + name.\n"
-                                "- 110–160 words. Complete through signature in ONE response.\n"
-                                "- Plain text only. Output ONLY the new body."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"User edit request: {_email_src[:300]}\n"
-                                f"Role/subject: {role_hint}\n"
-                                f"Current body:\n{existing.get('body') or ''}\n\n"
-                                f"CANDIDATE PROFILE:\n{profile_clip or '(limited)'}"
-                            ),
-                        },
-                    ],
-                    tools=None,
-                    temperature=0.25,
-                    max_tokens=900,
-                )
-                new_body = (getattr(edit_msg, "content", None) or "").strip()
-            except Exception as _ee:
-                print(f"[AGENT] draft edit LLM failed: {_ee}")
+            parsed = _compose_email_json(
+                system=(
+                    "You rewrite job/outreach/intro emails for higher impact.\n"
+                    "HARD RULES:\n"
+                    "- ONLY facts from CANDIDATE PROFILE + current body.\n"
+                    "- Do not invent experience not in the profile.\n"
+                    "- Body structure: greeting, 2 proof lines, resume attach line "
+                    "if attach_resume is true, soft CTA, Best regards + name.\n"
+                    "- Complete body through signature; never truncate."
+                ),
+                user=(
+                    f"User edit request: {_email_src[:300]}\n"
+                    f"Current subject: {existing.get('subject') or ''}\n"
+                    f"Role hint: {role_hint}\n"
+                    f"attach_resume: {existing.get('attach_resume') or 'true'}\n"
+                    f"Current body:\n{existing.get('body') or ''}\n\n"
+                    f"CANDIDATE PROFILE:\n{profile_clip or '(limited)'}"
+                ),
+                temperature=0.25,
+                max_tokens=1000,
+            )
+            new_body = (parsed or {}).get("body") or ""
+            new_subj = (parsed or {}).get("subject") or existing.get("subject") or ""
             if not new_body or len(new_body) < 40:
                 return _reply(
-                    "Rewrite fail ho gaya. Dobara bolo kya change chahiye, "
-                    "ya 'send it' se current draft bhej do."
+                    "Rewrite fail ho gaya. Subject/body clearly bolo, e.g.\n"
+                    "Change subject to Application - Full Stack Developer\n"
+                    'and "Job Application" to Full Stack Developer'
                 )
             if not re.search(r"(?i)resume|cv|attached", new_body) and (
                 (existing.get("attach_resume") or "") == "true"
@@ -1548,7 +1684,7 @@ def run_agent(
                     {
                         "action": "update",
                         "body": new_body,
-                        "subject": existing.get("subject") or "",
+                        "subject": new_subj,
                         "attach_resume": existing.get("attach_resume") or "true",
                     },
                     tool_ctx,
@@ -1557,9 +1693,13 @@ def run_agent(
                 obs = f"Tool error: {_ue}"
             obs_s = str(obs)
             logging.getLogger("mojo.agent").info(
-                "FORCE_DRAFT_EDIT obs=%s", obs_s[:240]
+                "FORCE_DRAFT_EDIT json obs=%s", obs_s[:240]
             )
-            if obs_s.startswith("Draft updated") or "EMAIL DRAFT" in obs_s.upper() or "Email draft" in obs_s:
+            if (
+                obs_s.startswith("Draft updated")
+                or "EMAIL DRAFT" in obs_s.upper()
+                or "Email draft" in obs_s
+            ):
                 return _reply(
                     obs_s + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
                 )
@@ -1604,62 +1744,47 @@ def run_agent(
                 profile_clip = (profile_clip or memory_block or "")[:1600]
                 jd_clip = (apply.get("jd_excerpt") or "")[:1800]
                 subject = apply.get("subject") or "Job Application"
-                # Body should say "Sales Executive", not "Application – Sales Executive"
-                role_name = re.sub(
+                # Prefer explicit role from JD parser; else strip Application - prefix
+                role_name = (apply.get("role") or "").strip() or re.sub(
                     r"(?i)^\s*application\s*[–\-:]\s*", "", subject
                 ).strip() or subject
 
-                # Optimized application email (resume attached):
-                # short, fact-locked, complete through signature, points to CV.
+                # Application / cover / outreach via structured JSON (single shot)
                 cover = ""
-                try:
-                    cover_msg = _chat_completion(
-                        [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You write high-response job application emails when a "
-                                    "resume PDF is attached.\n\n"
-                                    "STRUCTURE (all required, in order):\n"
-                                    "1) Greeting — Hello Hiring Team,\n"
-                                    "2) Hook (1–2 sentences) — role + who you are from PROFILE only\n"
-                                    "3) Proof (2 short sentences) — only real profile facts, "
-                                    "lightly framed toward the role without inventing duties\n"
-                                    "4) Attach line — exactly: "
-                                    "Please find my resume attached for full detail.\n"
-                                    "5) Soft CTA — open to a short call / next step\n"
-                                    "6) Sign-off — Best regards, + candidate name from profile\n\n"
-                                    "HARD RULES:\n"
-                                    "- ONLY facts from CANDIDATE PROFILE. Zero invention.\n"
-                                    "- JD is context for wording only — never claim JD duties "
-                                    "as personal experience.\n"
-                                    "- Target ~110–160 words but finish cleanly: full sentences "
-                                    "through Best regards + name in ONE response. Never stop "
-                                    "mid-sentence or mid-word.\n"
-                                    "- Plain text only. No markdown. No subject line.\n"
-                                    "- Output ONLY the finished email body."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"Role name (use this in the body): {role_name}\n"
-                                    f"Email subject line (do not repeat awkwardly): {subject}\n"
-                                    "Resume: WILL BE ATTACHED as PDF — body must mention it.\n\n"
-                                    f"JOB DESCRIPTION (context only):\n{jd_clip}\n\n"
-                                    f"CANDIDATE PROFILE (ONLY source of facts):\n"
-                                    f"{profile_clip or '(limited notes — stay minimal and honest)'}"
-                                ),
-                            },
-                        ],
-                        tools=None,
-                        temperature=0.2,
-                        max_tokens=900,
-                    )
-                    cover = (getattr(cover_msg, "content", None) or "").strip()
-                except Exception as _ce:
-                    print(f"[AGENT] cover letter LLM failed: {_ce}")
-                    cover = ""
+                parsed_email = _compose_email_json(
+                    system=(
+                        "You write high-response emails for job applications, cover "
+                        "letters, intros, and outreach when a resume PDF may be attached.\n\n"
+                        "BODY STRUCTURE (all required, in order):\n"
+                        "1) Greeting — Hello Hiring Team,\n"
+                        "2) Hook — role + who you are from PROFILE only\n"
+                        "3) Proof — 2 short sentences, real profile facts only\n"
+                        "4) Attach line — Please find my resume attached for full detail.\n"
+                        "5) Soft CTA — short call / next step\n"
+                        "6) Sign-off — Best regards, + candidate name from profile\n\n"
+                        "HARD RULES:\n"
+                        "- ONLY facts from CANDIDATE PROFILE. Zero invention.\n"
+                        "- JD is context only — never claim JD duties as experience.\n"
+                        "- subject: prefer the provided subject; refine only if empty/generic.\n"
+                        "- attach_resume: true when resume will be attached.\n"
+                        "- Complete body through signature in one response."
+                    ),
+                    user=(
+                        f"purpose: job_apply\n"
+                        f"Role name (use in body): {role_name}\n"
+                        f"Suggested subject: {subject}\n"
+                        f"attach_resume: true\n\n"
+                        f"JOB DESCRIPTION (context only):\n{jd_clip}\n\n"
+                        f"CANDIDATE PROFILE (ONLY source of facts):\n"
+                        f"{profile_clip or '(limited notes — stay minimal and honest)'}"
+                    ),
+                    temperature=0.2,
+                    max_tokens=1000,
+                )
+                if parsed_email:
+                    cover = parsed_email.get("body") or ""
+                    if parsed_email.get("subject"):
+                        subject = parsed_email["subject"]
 
                 if not cover or len(cover) < 40:
                     name = "Muhammad Zaheeruddin"

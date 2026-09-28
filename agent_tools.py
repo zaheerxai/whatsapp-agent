@@ -1013,27 +1013,135 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
 
     to = cleaned[0] if cleaned else ""
 
+    def _clean_title(raw: str) -> str:
+        s = (raw or "").strip()
+        s = re.sub(r"[*_`]", "", s)
+        # "Full-Stack Developer | Pakistan-Remote" → take role before |
+        if "|" in s:
+            s = s.split("|", 1)[0].strip()
+        s = re.sub(
+            r"(?i)^\s*(?:we'?re\s+hiring|hiring|position|role|title)\s*[:\-–]?\s*",
+            "",
+            s,
+        ).strip()
+        s = re.sub(r"\s{2,}", " ", s).strip(" -–|:")
+        return s
+
     subject = ""
+    role = ""
+
     sm = re.search(r"(?im)^(?:email\s+)?subject\s*:\s*(.+)$", search_blob)
     if sm:
-        subject = sm.group(1).strip().strip("*").strip()
-    if not subject:
+        subject = _clean_title(sm.group(1))
+
+    if not role:
         pm = re.search(
             r"(?i)(?:position|role|title)\s*:\s*\*?(.+?)\*?\s*(?:\n|$)",
             search_blob,
         )
         if pm:
-            subject = f"Application – {pm.group(1).strip().strip('*').strip()}"
+            role = _clean_title(pm.group(1))
+
+    # "Hiring: *Full-Stack Developer | Pakistan-Remote*"
+    # "We're Hiring: Sales Executive | Remote"
+    if not role:
+        hm = re.search(
+            r"(?i)(?:hiring|looking\s+for)\s*[:\-–]\s*\*?([^*\n|]+)",
+            search_blob,
+        )
+        if hm:
+            role = _clean_title(hm.group(1))
+
+    # First line often is the title
+    if not role:
+        first = (search_blob.strip().split("\n", 1)[0] or "").strip()
+        first = _clean_title(first)
+        if first and 3 < len(first) < 80:
+            if re.search(
+                r"(?i)developer|engineer|recruiter|executive|manager|"
+                r"designer|analyst|intern|specialist|consultant|lead",
+                first,
+            ):
+                role = first
+
     if not subject:
-        subject = "Job Application"
+        if role:
+            subject = f"Application - {role}"
+        else:
+            subject = "Job Application"
 
     return {
         "to": to,
         "subject": subject,
+        "role": role or re.sub(
+            r"(?i)^\s*application\s*[–\-:]\s*", "", subject
+        ).strip(),
         "jd_excerpt": (quoted or search_blob).strip()[:3500],
         "attach_resume": "true",
         "emails_found": ",".join(cleaned),
     }
+
+
+def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
+    """
+    Deterministic draft edits from instructions like:
+      Change subject to Application - Full Stack Developer
+      and the second line "Job Application" to Full Stack Developer
+    Returns {subject?, body_find?, body_replace?} — at least one key set.
+    """
+    if not text:
+        return None
+    t = re.sub(r"@\d[\d\s]*", " ", text)
+    t = re.sub(r"\[Quoted Message\]:.*", " ", t, flags=re.I | re.S)
+    t = t.strip()
+    if not t:
+        return None
+
+    out: Dict[str, str] = {}
+
+    # change/set subject to X
+    sm = re.search(
+        r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*(.+?)(?:\s+and\s+(?:the\s+)?(?:second\s+line|body|line)\b|\s*$)",
+        t,
+    )
+    if sm:
+        subj = sm.group(1).strip().strip("\"'").rstrip(".,;")
+        # stop at "and the second line..."
+        subj = re.split(
+            r"(?i)\s+and\s+(?:the\s+)?(?:second\s+line|body|line)\b",
+            subj,
+            maxsplit=1,
+        )[0].strip()
+        if subj:
+            out["subject"] = subj
+
+    # replace "old" with/to "new"  OR  second line "old" to "new"
+    rm = re.search(
+        r"(?i)(?:(?:second\s+line|body|line)\s+)?[\"']([^\"']+)[\"']\s+"
+        r"(?:to|with|->)\s+[\"']?([^\"']+?)[\"']?\s*$",
+        t,
+    )
+    if not rm:
+        rm = re.search(
+            r"(?i)(?:replace|change)\s+[\"']([^\"']+)[\"']\s+"
+            r"(?:to|with)\s+[\"']?([^\"']+?)[\"']?\s*$",
+            t,
+        )
+    if rm:
+        out["body_find"] = rm.group(1).strip()
+        out["body_replace"] = rm.group(2).strip().rstrip(".,;")
+
+    # "Job Application" to Full Stack Developer (without replace keyword)
+    if "body_find" not in out:
+        rm2 = re.search(
+            r"(?i)[\"']([^\"']{3,80})[\"']\s+to\s+[\"']?([^\"'\n,]{2,80})[\"']?",
+            t,
+        )
+        if rm2:
+            out["body_find"] = rm2.group(1).strip()
+            out["body_replace"] = rm2.group(2).strip().rstrip(".,;")
+
+    return out or None
 
 
 def is_email_send_confirm(text: str) -> bool:
