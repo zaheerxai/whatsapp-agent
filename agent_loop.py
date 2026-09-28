@@ -687,6 +687,28 @@ def _format_whatsapp_reply(text: str) -> str:
         return text or ""
     t = text.replace("\r\n", "\n").replace("\r", "\n")
 
+    # Email draft cards: preserve structure; only light GFM cleanup.
+    # Full field-unglue path was collapsing already-correct multi-line cards.
+    if re.search(r"(?i)email draft", t) and re.search(
+        r"(?m)^\*To:\*", t
+    ):
+        for _ in range(2):
+            t2 = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"*\1*", t, flags=re.S)
+            if t2 == t:
+                break
+            t = t2
+        t = re.sub(r"\*{3,}", "*", t)
+        # Ensure space after *Label:*
+        t = re.sub(
+            r"(\*(?:To|Cc|Bcc|From|Subject|Body|Attach):\*)(\S)",
+            r"\1 \2",
+            t,
+            flags=re.I,
+        )
+        t = "\n".join(ln.rstrip() for ln in t.split("\n"))
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
     # Horizontal rules / section dividers → blank line
     t = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", t)
     t = re.sub(r"\s*---+\s*", "\n\n", t)
@@ -1413,15 +1435,135 @@ def run_agent(
                 parse_direct_email_command as _parse_email_cmd,
                 parse_job_apply_command as _parse_job_apply,
                 is_email_send_confirm as _is_email_confirm,
+                is_email_draft_edit_intent as _is_email_edit,
+                is_email_draft_cancel_intent as _is_email_cancel,
                 _get_draft as _email_get_draft,
             )
         except Exception:
             _parse_email_cmd = None  # type: ignore
             _parse_job_apply = None  # type: ignore
             _is_email_confirm = None  # type: ignore
+            _is_email_edit = None  # type: ignore
+            _is_email_cancel = None  # type: ignore
             _email_get_draft = None  # type: ignore
 
         _email_src = latest_user_text or extra_user_note or _intent_src or ""
+
+        # Cancel draft (hard force — no LLM round-trip)
+        if (
+            _is_email_cancel
+            and _email_get_draft
+            and _is_email_cancel(_email_src)
+            and _tool_allowed_for_chat(chat_id, "draft_email")
+        ):
+            try:
+                obs = execute_tool(
+                    "draft_email", {"action": "cancel"}, tool_ctx
+                )
+            except Exception as _ce:
+                obs = f"Tool error: {_ce}"
+            return _reply(str(obs))
+
+        # Edit / personalize existing draft — MUST call draft_email update
+        # (live bug: model showed a rewritten body in chat but never saved it,
+        # so "send it" dispatched the old generic draft).
+        if (
+            _is_email_edit
+            and _email_get_draft
+            and _is_email_edit(_email_src)
+            and _tool_allowed_for_chat(chat_id, "draft_email")
+        ):
+            existing = None
+            try:
+                existing = _email_get_draft(tool_ctx)
+            except Exception:
+                existing = None
+            if not existing:
+                return _reply(
+                    "Koi draft save nahi hai. Pehle apply / email draft banao, "
+                    "phir personalize karo."
+                )
+            try:
+                mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
+            except Exception:
+                mem_obs = ""
+            profile_clip = re.sub(r"\[Chat note\][^\n]*\n?", " ", mem_obs)
+            profile_clip = re.sub(r"\[Quoted Message\]:\s*", "", profile_clip)
+            profile_clip = re.sub(r"\s{2,}", " ", profile_clip).strip()[:1600]
+            if not profile_clip:
+                profile_clip = (memory_block or "")[:1600]
+            role_hint = (existing.get("subject") or "").strip()
+            role_hint = re.sub(
+                r"(?i)^\s*application\s*[–\-:]\s*", "", role_hint
+            ).strip() or role_hint
+            new_body = ""
+            try:
+                edit_msg = _chat_completion(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Rewrite this job/outreach email body to be higher-impact "
+                                "and more personalized to the candidate's real experience.\n"
+                                "HARD RULES:\n"
+                                "- ONLY facts from CANDIDATE PROFILE + existing body.\n"
+                                "- Do not invent sales/recruiter experience not in profile.\n"
+                                "- Keep structure: greeting, 2 short proof lines, resume "
+                                "attach line, soft CTA, Best regards + name.\n"
+                                "- 110–160 words. Complete through signature in ONE response.\n"
+                                "- Plain text only. Output ONLY the new body."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"User edit request: {_email_src[:300]}\n"
+                                f"Role/subject: {role_hint}\n"
+                                f"Current body:\n{existing.get('body') or ''}\n\n"
+                                f"CANDIDATE PROFILE:\n{profile_clip or '(limited)'}"
+                            ),
+                        },
+                    ],
+                    tools=None,
+                    temperature=0.25,
+                    max_tokens=900,
+                )
+                new_body = (getattr(edit_msg, "content", None) or "").strip()
+            except Exception as _ee:
+                print(f"[AGENT] draft edit LLM failed: {_ee}")
+            if not new_body or len(new_body) < 40:
+                return _reply(
+                    "Rewrite fail ho gaya. Dobara bolo kya change chahiye, "
+                    "ya 'send it' se current draft bhej do."
+                )
+            if not re.search(r"(?i)resume|cv|attached", new_body) and (
+                (existing.get("attach_resume") or "") == "true"
+            ):
+                new_body = new_body.rstrip() + (
+                    "\n\nPlease find my resume attached for full detail."
+                )
+            try:
+                obs = execute_tool(
+                    "draft_email",
+                    {
+                        "action": "update",
+                        "body": new_body,
+                        "subject": existing.get("subject") or "",
+                        "attach_resume": existing.get("attach_resume") or "true",
+                    },
+                    tool_ctx,
+                )
+            except Exception as _ue:
+                obs = f"Tool error: {_ue}"
+            obs_s = str(obs)
+            logging.getLogger("mojo.agent").info(
+                "FORCE_DRAFT_EDIT obs=%s", obs_s[:240]
+            )
+            if obs_s.startswith("Draft updated") or "EMAIL DRAFT" in obs_s.upper() or "Email draft" in obs_s:
+                return _reply(
+                    obs_s + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                )
+            return _reply(obs_s)
 
         # Job apply: hard-force draft (no multi-tool loop — avoids search_knowledge
         # distraction, 413 from huge memory dumps, and RETURNING_TOOL_OBS of notes).
@@ -1462,6 +1604,10 @@ def run_agent(
                 profile_clip = (profile_clip or memory_block or "")[:1600]
                 jd_clip = (apply.get("jd_excerpt") or "")[:1800]
                 subject = apply.get("subject") or "Job Application"
+                # Body should say "Sales Executive", not "Application – Sales Executive"
+                role_name = re.sub(
+                    r"(?i)^\s*application\s*[–\-:]\s*", "", subject
+                ).strip() or subject
 
                 # Optimized application email (resume attached):
                 # short, fact-locked, complete through signature, points to CV.
@@ -1497,7 +1643,8 @@ def run_agent(
                             {
                                 "role": "user",
                                 "content": (
-                                    f"Role / subject: {subject}\n"
+                                    f"Role name (use this in the body): {role_name}\n"
+                                    f"Email subject line (do not repeat awkwardly): {subject}\n"
                                     "Resume: WILL BE ATTACHED as PDF — body must mention it.\n\n"
                                     f"JOB DESCRIPTION (context only):\n{jd_clip}\n\n"
                                     f"CANDIDATE PROFILE (ONLY source of facts):\n"

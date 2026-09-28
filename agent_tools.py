@@ -1068,6 +1068,75 @@ def is_email_send_confirm(text: str) -> bool:
     return tokens in (["send"], ["bhej"], ["confirm"])
 
 
+def is_email_draft_edit_intent(text: str) -> bool:
+    """User wants the stored draft body/subject rewritten (not a new apply)."""
+    if not text:
+        return False
+    head = re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
+    head = re.sub(r"@\d[\d\s]*", " ", head)
+    low = head.lower()
+    # New apply / new email commands are not edits
+    if is_job_apply_intent(text) or parse_direct_email_command(text):
+        return False
+    phrases = (
+        "personalize",
+        "personalized",
+        "personalise",
+        "high impact",
+        "high-impact",
+        "rewrite",
+        "rephrase",
+        "polish",
+        "improve",
+        "update draft",
+        "edit draft",
+        "edit the draft",
+        "update the draft",
+        "draft update",
+        "banao",
+        "bana do",
+        "better banao",
+        "zyada better",
+        "more relevant",
+        "relevantly",
+        "relevant banao",
+        "experience ke sath",
+        "experience k sath",
+        "experience ke saat",
+        "experience k saat",
+        "mera experience",
+        "mere experience",
+        "stronger",
+        "make it better",
+        "make it stronger",
+        "subject change",
+        "change subject",
+        "body change",
+        "change body",
+    )
+    return any(p in low for p in phrases)
+
+
+def is_email_draft_cancel_intent(text: str) -> bool:
+    if not text:
+        return False
+    head = re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
+    head = re.sub(r"@\d[\d\s]*", " ", head)
+    low = head.lower()
+    return any(
+        p in low
+        for p in (
+            "cancel draft",
+            "draft cancel",
+            "cancel the draft",
+            "discard draft",
+            "delete draft",
+            "draft hatao",
+            "draft cancel karo",
+        )
+    )
+
+
 def _tool_draft_email(args: dict, ctx: dict) -> str:
     if not _owner_ok(ctx):
         return "Permission denied: only the bot owner can draft/send emails."
