@@ -710,17 +710,38 @@ def _format_whatsapp_reply(text: str) -> str:
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"*\1*", t)
 
     # --- Glued field labels (classic email-draft collapse) ---
-    # To:*a@b.com*Subject:*Foo*Body:text → one field per line, clean values
+    # Only rewrite when labels are GLUED on one line. Never touch an already
+    # well-formatted draft card (multi-line *To:* / *Subject:* / *Body:*).
     _FIELD_RE = (
         r"To|Cc|Bcc|From|Subject|Body|Attach(?:\s+resume)?|Purpose"
     )
-    if re.search(rf"(?:\*)?\b(?:{_FIELD_RE})\s*:", t, flags=re.I):
+    _already_structured = bool(
+        re.search(
+            # Matches our draft card lines: *To:* value
+            rf"(?m)^\*(?:{_FIELD_RE}):\*\s+\S",
+            t,
+            flags=re.I,
+        )
+    ) and ("\n" in t)
+    _glued = bool(
+        re.search(
+            rf"(?:\*)?(?:{_FIELD_RE})\s*:\s*\S[^\n]{{0,80}}\*(?:{_FIELD_RE})\s*:",
+            t,
+            flags=re.I,
+        )
+    ) or bool(
+        re.search(
+            rf"(?:\*)?(?:{_FIELD_RE})\s*:\s*[^\n]{{0,60}}(?:\*)?(?:{_FIELD_RE})\s*:",
+            t,
+            flags=re.I,
+        )
+    )
+    if _glued and not _already_structured:
         parts = re.split(
             rf"(?:\*)?\b({_FIELD_RE})\s*:\s*\*?",
             t,
             flags=re.I,
         )
-        # parts: [preamble, label1, val1, label2, val2, ...]
         rebuilt: List[str] = []
         preamble = (parts[0] or "").strip(" \t*")
         if preamble:
@@ -729,23 +750,27 @@ def _format_whatsapp_reply(text: str) -> str:
         while i < len(parts):
             label = parts[i].strip()
             raw_val = parts[i + 1] if i + 1 < len(parts) else ""
-            # value runs until next label split; strip leftover bold stars
             val = (raw_val or "").strip()
             val = re.sub(r"^\*+\s*", "", val)
             val = re.sub(r"\s*\*+\s*$", "", val)
             val = val.strip(" \t*")
-            # Keep internal newlines in Body
             if label.lower() == "body":
                 val = val.strip()
                 rebuilt.append(f"*{label}:*")
                 if val:
                     rebuilt.append(val)
             else:
-                # single-line fields: first line only if multi
                 first = val.split("\n", 1)[0].strip().strip("*").strip()
                 rebuilt.append(f"*{label}:* {first}".rstrip())
             i += 2
         t = "\n".join(rebuilt)
+    # Ensure a space after *Label:* when missing (*To:*email → *To:* email)
+    t = re.sub(
+        rf"(\*(?:{_FIELD_RE}):\*)(\S)",
+        r"\1 \2",
+        t,
+        flags=re.I,
+    )
 
     # Glue fix: *Section**3.1 Title* → *Section*\n\n*3.1 Title*
     t = re.sub(r"\*([^*\n]{2,80})\*\*+(\d+\.\d+[^*\n]*)\*", r"*\1*\n\n*\2*", t)
@@ -1438,6 +1463,8 @@ def run_agent(
                 jd_clip = (apply.get("jd_excerpt") or "")[:1800]
                 subject = apply.get("subject") or "Job Application"
 
+                # Optimized application email (resume attached):
+                # short, fact-locked, complete through signature, points to CV.
                 cover = ""
                 try:
                     cover_msg = _chat_completion(
@@ -1445,34 +1472,33 @@ def run_agent(
                             {
                                 "role": "system",
                                 "content": (
-                                    "You write plain-text job application email bodies.\n\n"
-                                    "HARD RULES (never break):\n"
-                                    "1. ONLY use facts present in CANDIDATE PROFILE. If a "
-                                    "skill, tool, job title, metric, or responsibility is "
-                                    "not in the profile, you MUST NOT claim it.\n"
-                                    "2. The JOB DESCRIPTION is for alignment only — do NOT "
-                                    "copy JD requirements into the candidate's experience. "
-                                    "Never invent recruiter/sourcing/job-board experience "
-                                    "unless the profile explicitly has it.\n"
-                                    "3. Map real profile strengths to the role in honest "
-                                    "language (e.g. automation + data workflows → efficiency "
-                                    "in high-volume processes) without fabricating domain "
-                                    "experience the candidate does not have.\n"
-                                    "4. If the role is a weak fit, still apply honestly: "
-                                    "state relevant transferable strengths and willingness "
-                                    "to learn — do not role-play as an expert in the JD.\n"
-                                    "5. 120–180 words. No markdown. No subject line. "
-                                    "Greeting: Hello Hiring Team (unless a name is known). "
-                                    "Sign off with the candidate name from the profile.\n"
-                                    "6. Output ONLY the email body text."
+                                    "You write high-response job application emails when a "
+                                    "resume PDF is attached.\n\n"
+                                    "STRUCTURE (all required, in order):\n"
+                                    "1) Greeting — Hello Hiring Team,\n"
+                                    "2) Hook (1–2 sentences) — role + who you are from PROFILE only\n"
+                                    "3) Proof (2 short sentences) — only real profile facts, "
+                                    "lightly framed toward the role without inventing duties\n"
+                                    "4) Attach line — exactly: "
+                                    "Please find my resume attached for full detail.\n"
+                                    "5) Soft CTA — open to a short call / next step\n"
+                                    "6) Sign-off — Best regards, + candidate name from profile\n\n"
+                                    "HARD RULES:\n"
+                                    "- ONLY facts from CANDIDATE PROFILE. Zero invention.\n"
+                                    "- JD is context for wording only — never claim JD duties "
+                                    "as personal experience.\n"
+                                    "- 110–160 words. Complete the email through the signature; "
+                                    "NEVER stop mid-sentence or mid-word.\n"
+                                    "- Plain text only. No markdown. No subject line.\n"
+                                    "- Output ONLY the finished email body."
                                 ),
                             },
                             {
                                 "role": "user",
                                 "content": (
-                                    f"Role / subject: {subject}\n\n"
-                                    f"JOB DESCRIPTION (context only — not candidate facts):\n"
-                                    f"{jd_clip}\n\n"
+                                    f"Role / subject: {subject}\n"
+                                    "Resume: WILL BE ATTACHED as PDF — body must mention it.\n\n"
+                                    f"JOB DESCRIPTION (context only):\n{jd_clip}\n\n"
                                     f"CANDIDATE PROFILE (ONLY source of facts):\n"
                                     f"{profile_clip or '(limited notes — stay minimal and honest)'}"
                                 ),
@@ -1480,15 +1506,45 @@ def run_agent(
                         ],
                         tools=None,
                         temperature=0.2,
-                        max_tokens=450,
+                        max_tokens=700,
                     )
                     cover = (getattr(cover_msg, "content", None) or "").strip()
+                    # If model still truncated mid-sentence, one continuation pass
+                    if cover and not re.search(
+                        r"(?i)(best regards|sincerely|kind regards)\s*,?\s*\n",
+                        cover,
+                    ):
+                        try:
+                            cont = _chat_completion(
+                                [
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "Continue the email from where it was cut. "
+                                            "Finish the current sentence, add the attach line "
+                                            "if missing, then sign off. Output only the "
+                                            "continuation (no restart)."
+                                        ),
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": cover[-500:],
+                                    },
+                                ],
+                                tools=None,
+                                temperature=0.1,
+                                max_tokens=200,
+                            )
+                            extra = (getattr(cont, "content", None) or "").strip()
+                            if extra:
+                                cover = (cover.rstrip() + " " + extra).strip()
+                        except Exception:
+                            pass
                 except Exception as _ce:
                     print(f"[AGENT] cover letter LLM failed: {_ce}")
                     cover = ""
 
                 if not cover or len(cover) < 40:
-                    # Deterministic fallback so apply never dies on 429/503
                     name = "Muhammad Zaheeruddin"
                     nm = re.search(
                         r"(?i)\*?Muhammad\s+Zaheer[^\n*]*",
@@ -1499,15 +1555,20 @@ def run_agent(
                     cover = (
                         f"Hello Hiring Team,\n\n"
                         f"I am writing to apply for the {subject} role. "
-                        f"I bring hands-on experience in AI engineering, automation, "
-                        f"and data-driven operations — including multi-agent systems, "
-                        f"LLM workflows, and structured client delivery.\n\n"
-                        f"I am self-motivated, comfortable owning end-to-end processes, "
-                        f"and ready to contribute immediately in a remote setup with "
-                        f"strong Excel/Sheets and sourcing discipline where needed.\n\n"
-                        f"Please find my resume attached. Happy to share more detail "
-                        f"or join a short call at your convenience.\n\n"
+                        f"I am an AI Engineer and Automation Specialist with hands-on "
+                        f"experience building multi-agent systems, LLM workflows, and "
+                        f"end-to-end operational automations.\n\n"
+                        f"Please find my resume attached for full detail. I would welcome "
+                        f"a short call to discuss how I can contribute.\n\n"
                         f"Best regards,\n{name}"
+                    )
+                # Guarantee attach mention when resume is on
+                if not re.search(
+                    r"(?i)resume|cv|attached|attachment",
+                    cover,
+                ):
+                    cover = cover.rstrip() + (
+                        "\n\nPlease find my resume attached for full detail."
                     )
 
                 try:
