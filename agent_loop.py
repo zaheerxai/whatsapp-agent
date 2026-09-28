@@ -1183,12 +1183,183 @@ _EMAIL_JSON_SCHEMA_HINT = (
     "Respond with ONLY a single JSON object (no markdown fences, no prose):\n"
     "{\n"
     '  "subject": "string — email subject line",\n'
-    '  "body": "string — full plain-text email body including greeting and sign-off",\n'
+    '  "body": "string — full plain-text email body with real newline characters '
+    'between paragraphs",\n'
     '  "attach_resume": true\n'
     "}\n"
     "Rules: body must be complete through the signature; never truncate mid-sentence; "
-    "plain text only inside body (no markdown); JSON only as the entire response."
+    "plain text only inside body (no markdown); use \\n\\n between paragraphs inside "
+    "the JSON string; JSON only as the entire response."
 )
+
+
+def _email_recipient_first_name(to_email: str, jd_text: str = "") -> str:
+    """Best-effort greeting name from local-part or JD (Sana, Bushra, Hiring Team)."""
+    local = ""
+    if to_email and "@" in to_email:
+        local = to_email.split("@", 1)[0].strip()
+    local = re.sub(r"[0-9._+\-]+$", "", local)
+    local = re.sub(r"[._+\-]+", " ", local).strip()
+    skip = {
+        "hr",
+        "jobs",
+        "careers",
+        "recruit",
+        "recruiting",
+        "talent",
+        "apply",
+        "info",
+        "contact",
+        "hello",
+        "team",
+        "admin",
+        "support",
+    }
+    if local and local.lower() not in skip and 2 <= len(local.split()[0]) <= 20:
+        first = local.split()[0]
+        if first.isalpha():
+            return first[:1].upper() + first[1:].lower()
+    # JD: Dear Sana / Hi Bushra
+    m = re.search(
+        r"(?i)(?:dear|hi|hello)\s+([A-Z][a-z]{1,20})\b",
+        jd_text or "",
+    )
+    if m and m.group(1).lower() not in skip:
+        return m.group(1)
+    return "Hiring Team"
+
+
+def _email_cover_mode(user_text: str) -> str:
+    """brief | standard | detailed — driven by user wording."""
+    low = (user_text or "").lower()
+    if any(
+        p in low
+        for p in (
+            "detailed",
+            "in depth",
+            "in-depth",
+            "thorough",
+            "long cover",
+            "2 paragraph",
+            "two paragraph",
+            "atleast 2",
+            "at least 2",
+            "personalized",
+            "personalised",
+            "personalize",
+            "relevantly",
+            "high impact",
+            "high-impact",
+        )
+    ):
+        return "detailed"
+    if any(p in low for p in ("short", "brief", "concise", "chota", "mukhtasir")):
+        return "brief"
+    return "standard"
+
+
+def _normalize_email_body(body: str, greeting_name: str = "") -> str:
+    """Ensure readable paragraph breaks and a complete sign-off skeleton."""
+    if not body:
+        return body
+    t = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    # If the model emitted literal \n sequences, turn them into real newlines
+    if "\\n" in t and t.count("\n") < 2:
+        t = t.replace("\\n", "\n")
+    # Collapse 3+ newlines → 2
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    # If almost no newlines (single block), split on sentence boundaries lightly
+    if t.count("\n") < 2 and len(t) > 220:
+        # Insert break after greeting comma-line
+        t = re.sub(
+            r"(?i)^(hello[^,\n]*,)\s+",
+            r"\1\n\n",
+            t,
+            count=1,
+        )
+        t = re.sub(
+            r"(?i)(please find my (?:resume|cv) attached[^.]*\.)\s*",
+            r"\1\n\n",
+            t,
+            count=1,
+        )
+        t = re.sub(
+            r"(?i)\s*(best regards,?)\s*",
+            r"\n\n\1\n",
+            t,
+            count=1,
+        )
+    # Greeting override if still generic and we know a name
+    if greeting_name and greeting_name.lower() != "hiring team":
+        t = re.sub(
+            r"(?i)^hello\s+hiring\s+team\s*,",
+            f"Hello {greeting_name},",
+            t,
+            count=1,
+        )
+    # Ensure attach line present is caller's job; ensure sign-off has newline before name
+    t = re.sub(r"(?i)(best regards,)\s*(\S)", r"\1\n\2", t, count=1)
+    return t.strip()
+
+
+def _email_compose_system(mode: str, greeting_name: str) -> str:
+    greet = f"Hello {greeting_name}," if greeting_name else "Hello Hiring Team,"
+    if mode == "detailed":
+        structure = (
+            "BODY STRUCTURE (required, use blank lines between blocks):\n"
+            f"1) Greeting — {greet}\n"
+            "2) Paragraph 1 (4–6 sentences) — role + who you are + 2–3 REAL profile "
+            "facts framed toward the role's needs (transferable skills only)\n"
+            "3) Paragraph 2 (3–5 sentences) — more proof from profile; honest alignment "
+            "with JD themes without inventing duties you never did\n"
+            "4) Attach line — Please find my resume attached for full detail.\n"
+            "5) Soft CTA — brief call / next step\n"
+            "6) Sign-off — Best regards,\\n<name from profile>\n"
+            "Target ~180–280 words. Proper \\n\\n paragraph breaks."
+        )
+    elif mode == "brief":
+        structure = (
+            "BODY STRUCTURE:\n"
+            f"1) {greet}\n"
+            "2) 2–3 sentences: role + who you are + one real proof point\n"
+            "3) Attach line\n"
+            "4) Soft CTA + Best regards\\n<name>\n"
+            "Target ~70–110 words."
+        )
+    else:
+        structure = (
+            "BODY STRUCTURE (blank line between blocks):\n"
+            f"1) {greet}\n"
+            "2) Hook (2 sentences) — role + who you are from PROFILE\n"
+            "3) Proof (2–3 sentences) — only real profile facts, framed to the role\n"
+            "4) Attach line — Please find my resume attached for full detail.\n"
+            "5) Soft CTA\n"
+            "6) Best regards,\\n<name from profile>\n"
+            "Target ~120–180 words. Use \\n\\n between paragraphs."
+        )
+    return (
+        "You write high-response emails for job applications, cover letters, intros, "
+        "and outreach.\n\n"
+        f"{structure}\n\n"
+        "HARD ANTI-HALLUCINATION RULES:\n"
+        "- ONLY facts present in CANDIDATE PROFILE. Zero invention.\n"
+        "- NEVER invent metrics (%, revenue, headcount) unless in the profile.\n"
+        "- NEVER claim sales/recruiter/logistics years you do not have.\n"
+        "- JD is context for wording only — never claim JD duties as your experience.\n"
+        "- You MAY map real automation/AI/outreach work as transferable value.\n"
+        "- subject: use suggested subject unless empty/generic.\n"
+        "- attach_resume: true when resume will be attached.\n"
+        "- Complete through signature in ONE response."
+    )
+
+
+def _is_email_draft_card(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(r"(?i)email draft", text)
+        and re.search(r"(?m)^\*To:\*", text)
+    )
 
 
 def _compose_email_json(
@@ -1196,7 +1367,7 @@ def _compose_email_json(
     system: str,
     user: str,
     temperature: float = 0.2,
-    max_tokens: int = 1000,
+    max_tokens: int = 1200,
 ) -> Optional[Dict[str, Any]]:
     """One-shot LLM call that must return parseable email JSON (single response)."""
     try:
@@ -1662,26 +1833,29 @@ def run_agent(
             role_hint = re.sub(
                 r"(?i)^\s*application\s*[–\-:]\s*", "", role_hint
             ).strip() or role_hint
+            cover_mode = _email_cover_mode(_email_src)
+            greet_name = _email_recipient_first_name(
+                existing.get("to") or "", existing.get("body") or ""
+            )
+            tok_budget = {"brief": 700, "standard": 1100, "detailed": 1600}.get(
+                cover_mode, 1200
+            )
             parsed = _compose_email_json(
-                system=(
-                    "You rewrite job/outreach/intro emails for higher impact.\n"
-                    "HARD RULES:\n"
-                    "- ONLY facts from CANDIDATE PROFILE + current body.\n"
-                    "- Do not invent experience not in the profile.\n"
-                    "- Body structure: greeting, 2 proof lines, resume attach line "
-                    "if attach_resume is true, soft CTA, Best regards + name.\n"
-                    "- Complete body through signature; never truncate."
-                ),
+                system=_email_compose_system(cover_mode, greet_name)
+                + "\nYou are REWRITING an existing draft per the user request.",
                 user=(
-                    f"User edit request: {_email_src[:300]}\n"
+                    f"User edit request: {_email_src[:500]}\n"
+                    f"cover_mode: {cover_mode}\n"
                     f"Current subject: {existing.get('subject') or ''}\n"
                     f"Role hint: {role_hint}\n"
+                    f"Recipient greeting name: {greet_name}\n"
                     f"attach_resume: {existing.get('attach_resume') or 'true'}\n"
                     f"Current body:\n{existing.get('body') or ''}\n\n"
-                    f"CANDIDATE PROFILE:\n{profile_clip or '(limited)'}"
+                    f"CANDIDATE PROFILE (ONLY source of facts):\n"
+                    f"{profile_clip or '(limited)'}"
                 ),
                 temperature=0.25,
-                max_tokens=1000,
+                max_tokens=tok_budget,
             )
             new_body = (parsed or {}).get("body") or ""
             new_subj = (parsed or {}).get("subject") or existing.get("subject") or ""
@@ -1691,6 +1865,7 @@ def run_agent(
                     "Change subject to Application - Full Stack Developer\n"
                     'and "Job Application" to Full Stack Developer'
                 )
+            new_body = _normalize_email_body(new_body, greet_name)
             if not re.search(r"(?i)resume|cv|attached", new_body) and (
                 (existing.get("attach_resume") or "") == "true"
             ):
@@ -1768,37 +1943,32 @@ def run_agent(
                     r"(?i)^\s*application\s*[–\-:]\s*", "", subject
                 ).strip() or subject
 
-                # Application / cover / outreach via structured JSON (single shot)
+                # Application / cover via structured JSON (mode-aware, single shot)
+                cover_mode = _email_cover_mode(_email_src)
+                greet_name = _email_recipient_first_name(
+                    apply.get("to") or "", jd_clip
+                )
+                tok_budget = {"brief": 700, "standard": 1100, "detailed": 1600}.get(
+                    cover_mode, 1100
+                )
                 cover = ""
                 parsed_email = _compose_email_json(
-                    system=(
-                        "You write high-response emails for job applications, cover "
-                        "letters, intros, and outreach when a resume PDF may be attached.\n\n"
-                        "BODY STRUCTURE (all required, in order):\n"
-                        "1) Greeting — Hello Hiring Team,\n"
-                        "2) Hook — role + who you are from PROFILE only\n"
-                        "3) Proof — 2 short sentences, real profile facts only\n"
-                        "4) Attach line — Please find my resume attached for full detail.\n"
-                        "5) Soft CTA — short call / next step\n"
-                        "6) Sign-off — Best regards, + candidate name from profile\n\n"
-                        "HARD RULES:\n"
-                        "- ONLY facts from CANDIDATE PROFILE. Zero invention.\n"
-                        "- JD is context only — never claim JD duties as experience.\n"
-                        "- subject: prefer the provided subject; refine only if empty/generic.\n"
-                        "- attach_resume: true when resume will be attached.\n"
-                        "- Complete body through signature in one response."
-                    ),
+                    system=_email_compose_system(cover_mode, greet_name),
                     user=(
                         f"purpose: job_apply\n"
+                        f"cover_mode: {cover_mode}\n"
+                        f"user_request: {_email_src[:400]}\n"
                         f"Role name (use in body): {role_name}\n"
                         f"Suggested subject: {subject}\n"
+                        f"Recipient greeting name: {greet_name}\n"
                         f"attach_resume: true\n\n"
-                        f"JOB DESCRIPTION (context only):\n{jd_clip}\n\n"
+                        f"JOB DESCRIPTION (context only — do not claim as experience):\n"
+                        f"{jd_clip}\n\n"
                         f"CANDIDATE PROFILE (ONLY source of facts):\n"
                         f"{profile_clip or '(limited notes — stay minimal and honest)'}"
                     ),
-                    temperature=0.2,
-                    max_tokens=1000,
+                    temperature=0.25 if cover_mode == "detailed" else 0.2,
+                    max_tokens=tok_budget,
                 )
                 if parsed_email:
                     cover = parsed_email.get("body") or ""
@@ -1814,8 +1984,8 @@ def run_agent(
                     if nm:
                         name = re.sub(r"[*]", "", nm.group(0)).strip()
                     cover = (
-                        f"Hello Hiring Team,\n\n"
-                        f"I am writing to apply for the {subject} role. "
+                        f"Hello {greet_name},\n\n"
+                        f"I am writing to apply for the {role_name} role. "
                         f"I am an AI Engineer and Automation Specialist with hands-on "
                         f"experience building multi-agent systems, LLM workflows, and "
                         f"end-to-end operational automations.\n\n"
@@ -1823,7 +1993,7 @@ def run_agent(
                         f"a short call to discuss how I can contribute.\n\n"
                         f"Best regards,\n{name}"
                     )
-                # Guarantee attach mention when resume is on
+                cover = _normalize_email_body(cover, greet_name)
                 if not re.search(
                     r"(?i)resume|cv|attached|attachment",
                     cover,
@@ -2663,6 +2833,9 @@ def run_agent(
                     if name == "transcribe_video"
                     else MAX_OBS_CHARS
                 )
+                # Draft cards must never be truncated — synthesis was gluing fields
+                if name in ("draft_email", "send_email"):
+                    obs_cap = max(obs_cap, 12000)
                 if len(obs_str) > obs_cap:
                     obs_str = (
                         obs_str[:obs_cap]
@@ -2678,6 +2851,24 @@ def run_agent(
                         "content": obs_str,
                     }
                 )
+                # Hard-return email draft/send cards — never let a 429/synthesis
+                # pass re-format or truncate the structured card.
+                if name in ("draft_email", "send_email") and (
+                    _is_email_draft_card(obs_str)
+                    or obs_str.startswith("Draft created")
+                    or obs_str.startswith("Draft updated")
+                    or obs_str.startswith("Draft cancelled")
+                    or obs_str.startswith("Sent to ")
+                ):
+                    logging.getLogger("mojo.agent").info(
+                        "FORCE_EMAIL_CARD_RETURN tool=%s", name
+                    )
+                    if obs_str.startswith("Draft ") and "Bhejna" not in obs_str:
+                        return _reply(
+                            obs_str
+                            + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
+                        )
+                    return _reply(obs_str)
             # After tools ran this step → next step is synthesis only (no schema payload)
             tools_for_next = None
 
