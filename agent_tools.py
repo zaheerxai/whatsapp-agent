@@ -1268,7 +1268,7 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
         if new_role and " and " not in new_role.lower():
             out["body_role"] = new_role
 
-    # "old" to "new" — never cross newlines
+    # "old" to "new" — quoted, never cross newlines
     rm = re.search(
         r"(?i)(?:change|replace|update)?\s*[\"']([^\"'\n]{2,80})[\"']\s+"
         r"(?:to|with|->)\s+[\"']?([^\"'\n]{1,80})[\"']?",
@@ -1279,6 +1279,34 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
         repl_s = rm.group(2).strip().rstrip(".,;")
         if find_s and repl_s and "\n" not in repl_s and len(repl_s) <= 80:
             if find_s.lower() not in (out.get("subject") or "").lower():
+                out["body_find"] = find_s
+                out["body_replace"] = repl_s
+
+    # Unquoted surgical replace (phone / LID fixes):
+    #   replace the 73109... number with +923161545875
+    #   replace 73109738680505 with +923161545875, everything else as is
+    if "body_find" not in out:
+        rm2 = re.search(
+            r"(?i)replace\s+(?:the\s+)?([+\d][\d.\s…]{3,30}?)\s*"
+            r"(?:number\s+)?(?:with|to|->|=)\s*([+\d][\d\s\-()]{6,24})",
+            t,
+        )
+        if not rm2:
+            rm2 = re.search(
+                r"(?i)replace\s+(?:the\s+)?(.{2,40}?)\s+"
+                r"(?:with|to|->)\s+(.{1,40}?)(?:\s*,?\s*(?:everything|keep|no change)|$)",
+                t,
+            )
+        if rm2:
+            find_s = rm2.group(1).strip().strip("\"'")
+            find_s = re.sub(r"(?i)\s*(?:number|instead)\s*$", "", find_s).strip()
+            repl_s = rm2.group(2).strip().strip("\"'").rstrip(".,;")
+            repl_s = re.sub(
+                r"(?i)\s*(?:instead|everything|as is|no change).*$",
+                "",
+                repl_s,
+            ).strip()
+            if find_s and repl_s and len(find_s) <= 40 and len(repl_s) <= 40:
                 out["body_find"] = find_s
                 out["body_replace"] = repl_s
 
@@ -1481,9 +1509,13 @@ def is_email_draft_edit_intent(text: str) -> bool:
         "change body",
         # surgical preserve edits
         "remove ",
+        "replace ",
+        "replace the",
         "keep everything else",
         "keep the rest",
         "as is",
+        "no change",
+        "everything else",
         "position is only",
         "role is only",
         "title is only",
@@ -1492,6 +1524,7 @@ def is_email_draft_edit_intent(text: str) -> bool:
         "from subject",
         "from body",
         "from role",
+        "number with",
     )
     return any(p in low for p in phrases)
 

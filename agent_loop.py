@@ -1279,7 +1279,7 @@ def _candidate_display_name(facts: str) -> str:
 
 
 def _scrub_fake_identity(body: str, real_name: str) -> str:
-    """Strip placeholder identities (John Doe, example.com) from LLM output."""
+    """Strip placeholder identities and WhatsApp LIDs from LLM output."""
     if not body:
         return body
     t = body
@@ -1294,17 +1294,46 @@ def _scrub_fake_identity(body: str, real_name: str) -> str:
         "",
         t,
     )
-    t = re.sub(
-        r"(?i)Phone:\s*\+?[\d\s\-()]{6,}\s*",
-        "",
-        t,
-    )
+    # WhatsApp LID (13–15 pure digits, often starting 7) is not a phone number —
+    # replace with owner phone when available, else drop the clause fragment.
+    owner_phone = ""
+    try:
+        import os as _os
+
+        owner_phone = (
+            _os.getenv("OWNER_PHONE")
+            or _os.getenv("GMAIL_CONTACT_PHONE")
+            or ""
+        ).strip()
+        if not owner_phone:
+            oid = (_os.getenv("OWNER_SENDER_ID") or "").strip()
+            # OWNER_SENDER_ID may itself be a phone (92…) not a LID (73…)
+            if oid.isdigit() and oid.startswith("92") and len(oid) >= 11:
+                owner_phone = "+" + oid if not oid.startswith("+") else oid
+    except Exception:
+        owner_phone = ""
+
+    def _lid_sub(m: re.Match) -> str:
+        raw = m.group(0)
+        digits = re.sub(r"\D", "", raw)
+        # Real PK mobile: 92 + 10 digits, or 03xx… — keep those
+        if digits.startswith("92") and 11 <= len(digits) <= 13:
+            return raw
+        if digits.startswith("03") and len(digits) == 11:
+            return raw
+        if owner_phone:
+            return owner_phone
+        return ""
+
+    t = re.sub(r"(?<!\d)(?:\+?73\d{10,14})(?!\d)", _lid_sub, t)
+    t = re.sub(r"(?i)Phone:\s*\+?[\d\s\-()]{6,}\s*", "", t)
     # Drop junk signature lines the model invents under a fake name
     t = re.sub(
         r"(?im)^\s*Computer Science Graduate\s*\|\s*AI Engineer\s*$",
         "",
         t,
     )
+    t = re.sub(r"\s{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     # Ensure real name appears in sign-off
     if real_name and not re.search(re.escape(real_name), t, flags=re.I):
@@ -2106,13 +2135,35 @@ def run_agent(
                 find_s = field_edits.get("body_find") or ""
                 repl_s = field_edits.get("body_replace")
                 if find_s and repl_s is not None:
+                    # Expand truncated finds: "73109..." → full digit run in body
+                    resolved = find_s
+                    if "…" in find_s or "..." in find_s or find_s.endswith("."):
+                        core = re.sub(r"[.…]+$", "", find_s).strip()
+                        digits = re.sub(r"\D", "", core)
+                        if digits and len(digits) >= 4:
+                            for m in re.finditer(
+                                r"\+?\d[\d\s\-()]{5,}", working_body
+                            ):
+                                cand = m.group(0)
+                                cand_d = re.sub(r"\D", "", cand)
+                                if cand_d.startswith(digits) or digits in cand_d:
+                                    resolved = cand
+                                    break
                     body2, n = re.subn(
-                        re.escape(find_s),
+                        re.escape(resolved),
                         repl_s,
                         working_body,
                         count=0,
                         flags=re.I,
                     )
+                    if not n and resolved != find_s:
+                        body2, n = re.subn(
+                            re.escape(find_s),
+                            repl_s,
+                            working_body,
+                            count=0,
+                            flags=re.I,
+                        )
                     if not n:
                         body2, n = re.subn(
                             re.escape(find_s.rstrip(",")),
@@ -2121,6 +2172,16 @@ def run_agent(
                             count=1,
                             flags=re.I,
                         )
+                    # Digit-prefix fallback: any long number starting with find digits
+                    if not n:
+                        dig = re.sub(r"\D", "", find_s)
+                        if dig and len(dig) >= 4:
+                            body2, n = re.subn(
+                                rf"(?<!\d){re.escape(dig)}\d*",
+                                repl_s,
+                                working_body,
+                                count=0,
+                            )
                     if n:
                         working_body = body2
                         update_args["body"] = working_body
