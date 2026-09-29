@@ -2038,44 +2038,51 @@ def run_agent(
                         working_body = body2
                         update_args["body"] = working_body
                         did_deterministic = True
-                # Surgical remove_phrase (e.g. remove LinkedIn) — preserve rest byte-stable
-                if field_edits.get("remove_phrase"):
-                    phrase = field_edits["remove_phrase"]
-                    # Subject: drop phrase and tidy separators
+                # Surgical remove_phrase(s) — preserve rest of letter byte-stable
+                remove_list = []
+                if field_edits.get("remove_phrases"):
+                    remove_list = [
+                        p.strip()
+                        for p in str(field_edits["remove_phrases"]).split("|||")
+                        if p.strip()
+                    ]
+                elif field_edits.get("remove_phrase"):
+                    remove_list = [str(field_edits["remove_phrase"]).strip()]
+                if remove_list:
                     subj2 = working_subj
-                    if phrase.lower() in subj2.lower():
-                        subj2 = re.sub(
-                            re.escape(phrase), "", subj2, flags=re.I
-                        )
-                        subj2 = re.sub(
-                            r"\s*[—–\-|/]\s*$", "", subj2
-                        )
-                        subj2 = re.sub(
-                            r"\s*[—–\-|/]\s*", " ", subj2
-                        )
-                        subj2 = re.sub(r"\s{2,}", " ", subj2).strip(" -—–|/")
-                        working_subj = subj2
-                        update_args["subject"] = working_subj
-                        did_deterministic = True
                     body2 = working_body
-                    if phrase.lower() in body2.lower():
-                        body2 = re.sub(
-                            re.escape(phrase), "", body2, flags=re.I
-                        )
-                        # Clean " — " / " - " left by removal
+                    changed = False
+                    for phrase in remove_list:
+                        if not phrase:
+                            continue
+                        if phrase.lower() in subj2.lower():
+                            subj2 = re.sub(
+                                re.escape(phrase), "", subj2, flags=re.I
+                            )
+                            changed = True
+                        if phrase.lower() in body2.lower():
+                            body2 = re.sub(
+                                re.escape(phrase), "", body2, flags=re.I
+                            )
+                            changed = True
+                    if changed:
+                        subj2 = re.sub(r"\s*[—–\-|/]\s*", " ", subj2)
+                        subj2 = re.sub(r"\s{2,}", " ", subj2).strip(" -—–|/")
                         body2 = re.sub(
                             r"\s*[—–]\s*(?=\s*(?:position|role)\b)",
                             " ",
                             body2,
                             flags=re.I,
                         )
-                        body2 = re.sub(r"\s{2,}", " ", body2)
+                        body2 = re.sub(r"[ \t]{2,}", " ", body2)
                         body2 = re.sub(r" \n", "\n", body2)
                         body2 = re.sub(r"\n{3,}", "\n\n", body2).strip()
+                        working_subj = subj2
                         working_body = body2
+                        update_args["subject"] = working_subj
                         update_args["body"] = working_body
                         did_deterministic = True
-                # Change role in body → swap "interest in the <old> position"
+# Change role in body → swap "interest in the <old> position"
                 if field_edits.get("body_role"):
                     new_role = field_edits["body_role"]
                     body2, n = re.subn(

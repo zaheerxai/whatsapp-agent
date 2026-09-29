@@ -1175,19 +1175,58 @@ def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
     }
 
 
+def _edit_instruction_text(text: str) -> str:
+    """
+    Prefer quoted instruction when the live message is only a mention/empty.
+
+    WhatsApp UX: user types the edit, then replies to it with @bot — the real
+    instruction lives in [Quoted Message], not the mention line.
+    """
+    if not text:
+        return ""
+    quoted = ""
+    qm = re.search(r"\[Quoted Message\]:\s*(.+)$", text, flags=re.I | re.S)
+    if qm:
+        quoted = qm.group(1).strip()
+    live = re.split(r"\[Quoted Message\]:", text, maxsplit=1, flags=re.I)[0]
+    live = re.sub(r"@\d[\d\s]*", " ", live)
+    live = re.sub(r"\s+", " ", live).strip()
+    if quoted and (not live or len(live) < 8):
+        return quoted
+    if live and quoted:
+        low = live.lower()
+        if not any(
+            k in low
+            for k in (
+                "remove",
+                "change",
+                "subject",
+                "rewrite",
+                "personalize",
+                "edit",
+                "update",
+                "keep",
+            )
+        ):
+            return f"{live}\n{quoted}"
+        return live
+    return live or quoted
+
+
 def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
     """
     Deterministic draft edits from instructions like:
       Change subject to Application - Full Stack Developer
-      Change "Hello Hiring Team" to Hello Sana
+      Remove (0-2 years) wherever it is
+      Remove LinkedIn from subject and body, keep everything else
 
     Replacement values are SAME-LINE only so following paragraphs
     (personalize / format instructions) are never swallowed into body_replace.
     """
     if not text:
         return None
-    t = re.sub(r"@\d[\d\s]*", " ", text)
-    t = re.sub(r"\[Quoted Message\]:.*", " ", t, flags=re.I | re.S)
+    t = _edit_instruction_text(text)
+    t = re.sub(r"@\d[\d\s]*", " ", t)
     t = t.strip()
     if not t:
         return None
@@ -1243,20 +1282,52 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
                 out["body_find"] = find_s
                 out["body_replace"] = repl_s
 
-    # Surgical remove: "remove LinkedIn from subject and body, keep everything else"
-    rem = re.search(
-        r"(?i)remove\s+[\"']?([^\"'\n,]{2,60}?)[\"']?\s+"
+    # Collect ALL surgical remove phrases in one message
+    remove_phrases: List[str] = []
+
+    def _add_remove(p: str) -> None:
+        p = (p or "").strip().strip("\"'").rstrip(".,;")
+        p = re.sub(r"(?i)\s+from\s+(?:role|subject|body|title).*$", "", p).strip()
+        p = re.sub(r"(?i)\s+wherever\s+it\s+is.*$", "", p).strip()
+        if p and 1 < len(p) <= 80 and p.lower() not in {
+            x.lower() for x in remove_phrases
+        }:
+            remove_phrases.append(p)
+
+    # remove X from subject/body/role
+    for m in re.finditer(
+        r"(?i)remove\s+[\"']?([^\"'\n]{1,80}?)[\"']?\s+"
         r"from\s+(?:the\s+)?(?:role\s+in\s+)?(?:subject|body|title|role)",
         t,
-    )
-    if rem:
-        phrase = rem.group(1).strip().strip("\"'").rstrip(".,;")
-        # drop trailing "from role" fragments if captured
-        phrase = re.sub(
-            r"(?i)\s+from\s+(?:role|subject|body).*$", "", phrase
-        ).strip()
-        if phrase and len(phrase) <= 60:
-            out["remove_phrase"] = phrase
+    ):
+        _add_remove(m.group(1))
+    # remove X wherever it is / remove the "Y"
+    for m in re.finditer(
+        r"(?i)remove\s+(?:the\s+)?[\"']([^\"'\n]{1,80})[\"']",
+        t,
+    ):
+        _add_remove(m.group(1))
+    for m in re.finditer(
+        r"(?i)remove\s+(\([^)\n]{1,40}\))\s*(?:wherever\s+it\s+is)?",
+        t,
+    ):
+        _add_remove(m.group(1))
+    for m in re.finditer(
+        r"(?i)remove\s+([A-Za-z0-9][^,\n]{0,60}?)\s+wherever\s+it\s+is",
+        t,
+    ):
+        _add_remove(m.group(1))
+    # also remove the "..."
+    for m in re.finditer(
+        r"(?i)(?:also\s+)?remove\s+(?:the\s+)?[\"']([^\"'\n]{1,80})[\"']",
+        t,
+    ):
+        _add_remove(m.group(1))
+
+    if remove_phrases:
+        # Primary single + joined list for multi-remove
+        out["remove_phrase"] = remove_phrases[0]
+        out["remove_phrases"] = "|||".join(remove_phrases)
 
     # "The position is only Business Development Executive"
     only_m = re.search(
@@ -1365,7 +1436,9 @@ def is_email_draft_edit_intent(text: str) -> bool:
     """User wants the stored draft body/subject rewritten (not a new apply)."""
     if not text:
         return False
-    head = re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
+    # Prefer quoted instruction when mention-only (user replies to their own edit note)
+    instr = _edit_instruction_text(text)
+    head = instr or re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
     head = re.sub(r"@\d[\d\s]*", " ", head)
     low = head.lower()
     # New apply / new email commands are not edits
