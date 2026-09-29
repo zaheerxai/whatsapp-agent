@@ -2020,6 +2020,61 @@ def run_agent(
                     working_subj = field_edits["subject"]
                     update_args["subject"] = working_subj
                     did_deterministic = True
+                # position is only X → also align body role phrase
+                if field_edits.get("position_only"):
+                    only = field_edits["position_only"]
+                    if "subject" not in update_args:
+                        working_subj = f"Application - {only}"
+                        update_args["subject"] = working_subj
+                        did_deterministic = True
+                    body2, n = re.subn(
+                        r"(?i)((?:interest in|applying for|apply for|application for)"
+                        r"\s+the\s+)(.+?)(\s+(?:position|role)\b)",
+                        rf"\1{only}\3",
+                        working_body,
+                        count=1,
+                    )
+                    if n:
+                        working_body = body2
+                        update_args["body"] = working_body
+                        did_deterministic = True
+                # Surgical remove_phrase (e.g. remove LinkedIn) — preserve rest byte-stable
+                if field_edits.get("remove_phrase"):
+                    phrase = field_edits["remove_phrase"]
+                    # Subject: drop phrase and tidy separators
+                    subj2 = working_subj
+                    if phrase.lower() in subj2.lower():
+                        subj2 = re.sub(
+                            re.escape(phrase), "", subj2, flags=re.I
+                        )
+                        subj2 = re.sub(
+                            r"\s*[—–\-|/]\s*$", "", subj2
+                        )
+                        subj2 = re.sub(
+                            r"\s*[—–\-|/]\s*", " ", subj2
+                        )
+                        subj2 = re.sub(r"\s{2,}", " ", subj2).strip(" -—–|/")
+                        working_subj = subj2
+                        update_args["subject"] = working_subj
+                        did_deterministic = True
+                    body2 = working_body
+                    if phrase.lower() in body2.lower():
+                        body2 = re.sub(
+                            re.escape(phrase), "", body2, flags=re.I
+                        )
+                        # Clean " — " / " - " left by removal
+                        body2 = re.sub(
+                            r"\s*[—–]\s*(?=\s*(?:position|role)\b)",
+                            " ",
+                            body2,
+                            flags=re.I,
+                        )
+                        body2 = re.sub(r"\s{2,}", " ", body2)
+                        body2 = re.sub(r" \n", "\n", body2)
+                        body2 = re.sub(r"\n{3,}", "\n\n", body2).strip()
+                        working_body = body2
+                        update_args["body"] = working_body
+                        did_deterministic = True
                 # Change role in body → swap "interest in the <old> position"
                 if field_edits.get("body_role"):
                     new_role = field_edits["body_role"]

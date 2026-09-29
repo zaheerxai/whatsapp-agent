@@ -1239,12 +1239,56 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
         find_s = rm.group(1).strip()
         repl_s = rm.group(2).strip().rstrip(".,;")
         if find_s and repl_s and "\n" not in repl_s and len(repl_s) <= 80:
-            # Don't treat subject-line quotes as body find/replace
             if find_s.lower() not in (out.get("subject") or "").lower():
                 out["body_find"] = find_s
                 out["body_replace"] = repl_s
 
+    # Surgical remove: "remove LinkedIn from subject and body, keep everything else"
+    rem = re.search(
+        r"(?i)remove\s+[\"']?([^\"'\n,]{2,60}?)[\"']?\s+"
+        r"from\s+(?:the\s+)?(?:role\s+in\s+)?(?:subject|body|title|role)",
+        t,
+    )
+    if rem:
+        phrase = rem.group(1).strip().strip("\"'").rstrip(".,;")
+        # drop trailing "from role" fragments if captured
+        phrase = re.sub(
+            r"(?i)\s+from\s+(?:role|subject|body).*$", "", phrase
+        ).strip()
+        if phrase and len(phrase) <= 60:
+            out["remove_phrase"] = phrase
+
+    # "The position is only Business Development Executive"
+    only_m = re.search(
+        r"(?i)(?:position|role|title)\s+is\s+only\s+[:\-]?\s*"
+        r"[\"']?([^\"'\n,]{3,80})[\"']?",
+        t,
+    )
+    if only_m:
+        only_role = only_m.group(1).strip().strip("\"'").rstrip(".,;")
+        only_role = re.split(
+            r"(?i)\s*,\s*remove\b|\s+remove\b|\s+and\s+remove\b",
+            only_role,
+            maxsplit=1,
+        )[0].strip()
+        if only_role:
+            out["position_only"] = only_role
+            if "subject" not in out:
+                out["subject"] = f"Application - {only_role}"
+
     low = t.lower()
+    # Preserve-as-is cues: do NOT trigger full rewrite
+    preserve_cues = (
+        "keep everything else",
+        "keep the rest",
+        "rest as is",
+        "as is",
+        "same body",
+        "only change",
+        "just remove",
+        "sirf remove",
+        "bas remove",
+    )
     rewrite_cues = (
         "personalize",
         "personalized",
@@ -1263,11 +1307,23 @@ def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
         "relevantly",
         "improve",
     )
-    if any(c in low for c in rewrite_cues):
+    if any(c in low for c in rewrite_cues) and not any(
+        c in low for c in preserve_cues
+    ):
         out["wants_rewrite"] = "true"
+    if any(c in low for c in preserve_cues):
+        out.pop("wants_rewrite", None)
 
     if not any(
-        k in out for k in ("subject", "body_find", "body_role", "wants_rewrite")
+        k in out
+        for k in (
+            "subject",
+            "body_find",
+            "body_role",
+            "remove_phrase",
+            "position_only",
+            "wants_rewrite",
+        )
     ):
         return None
     return out
@@ -1350,6 +1406,19 @@ def is_email_draft_edit_intent(text: str) -> bool:
         "change subject",
         "body change",
         "change body",
+        # surgical preserve edits
+        "remove ",
+        "keep everything else",
+        "keep the rest",
+        "as is",
+        "position is only",
+        "role is only",
+        "title is only",
+        "sirf ",
+        "bas remove",
+        "from subject",
+        "from body",
+        "from role",
     )
     return any(p in low for p in phrases)
 
@@ -1400,7 +1469,33 @@ def _tool_draft_email(args: dict, ctx: dict) -> str:
         if args.get("subject") is not None and str(args.get("subject")).strip() != "":
             existing["subject"] = str(args["subject"]).strip()
         if args.get("body") is not None and str(args.get("body")).strip() != "":
-            existing["body"] = str(args["body"]).strip()
+            new_body = str(args["body"]).strip()
+            old_body = (existing.get("body") or "").strip()
+            # Reject truncated/rewritten-short bodies (LLM tool-arg cutoffs)
+            truncated = (
+                new_body.endswith("…")
+                or new_body.endswith("...")
+                or new_body.endswith("…")
+                or bool(re.search(r"(?i)\bclients?\s*…\s*$", new_body))
+            )
+            too_short = (
+                old_body
+                and len(new_body) < max(120, int(len(old_body) * 0.7))
+                and not args.get("force_short")
+            )
+            if truncated or too_short:
+                logging.getLogger("mojo.agent").info(
+                    "EMAIL_UPDATE_BODY_REJECTED truncated=%s old_len=%s new_len=%s",
+                    truncated,
+                    len(old_body),
+                    len(new_body),
+                )
+                return (
+                    "Update rejected: body looks truncated or incomplete. "
+                    "Do not shorten the letter. Re-send the FULL body, or use a "
+                    "surgical edit (e.g. remove a phrase / change subject only)."
+                )
+            existing["body"] = new_body
         if args.get("cc") is not None:
             existing["cc"] = str(args.get("cc") or "").strip() or None
         if args.get("attach_resume") in ("true", "false", "ask"):
