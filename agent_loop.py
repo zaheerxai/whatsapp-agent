@@ -1193,14 +1193,15 @@ _EMAIL_JSON_SCHEMA_HINT = (
 )
 
 
-def _email_recipient_first_name(to_email: str, jd_text: str = "") -> str:
-    """Best-effort greeting name from local-part or JD (Sana, Bushra, Hiring Team)."""
-    local = ""
-    if to_email and "@" in to_email:
-        local = to_email.split("@", 1)[0].strip()
-    local = re.sub(r"[0-9._+\-]+$", "", local)
-    local = re.sub(r"[._+\-]+", " ", local).strip()
-    skip = {
+def _looks_like_person_first_name(name: str) -> bool:
+    """Heuristic: real given names, not mailbox tags like bgreen / careers."""
+    n = (name or "").strip()
+    if not n or not n.isalpha():
+        return False
+    if len(n) < 3 or len(n) > 18:
+        return False
+    low = n.lower()
+    if low in {
         "hr",
         "jobs",
         "careers",
@@ -1214,19 +1215,124 @@ def _email_recipient_first_name(to_email: str, jd_text: str = "") -> str:
         "team",
         "admin",
         "support",
-    }
-    if local and local.lower() not in skip and 2 <= len(local.split()[0]) <= 20:
+        "sales",
+        "office",
+        "noreply",
+        "no-reply",
+    }:
+        return False
+    # Must contain a vowel (filters bgreen, xkcd-style tags)
+    if not re.search(r"[aeiou]", low):
+        return False
+    # Reject initial+surname glue without separator (bgreen, jsmith) when
+    # first char + rest looks like surname-only mailbox: 1 letter + consonant-heavy
+    if len(n) >= 5 and low[0] not in "aeiou" and not re.search(
+        r"[aeiou].*[aeiou]", low
+    ):
+        # e.g. bgreen has only one vowel cluster 'ee' — still has vowels
+        pass
+    # Single leading initial pattern: Xname where X is 1 letter and rest is long
+    # Prefer "Hiring Team" for ambiguous local-parts like bgreen, jdoe
+    if re.match(r"^[a-z]\.?[a-z]{4,}$", low) and low[0] not in "aeiou":
+        # bgreen, jsmith, mwilliams — mailbox style, not a first name
+        return False
+    return True
+
+
+def _email_recipient_first_name(to_email: str, jd_text: str = "") -> str:
+    """Greeting name from local-part or JD; else Hiring Team."""
+    local = ""
+    if to_email and "@" in to_email:
+        local = to_email.split("@", 1)[0].strip()
+    local = re.sub(r"[0-9._+\-]+$", "", local)
+    local = re.sub(r"[._+\-]+", " ", local).strip()
+    if local:
         first = local.split()[0]
-        if first.isalpha():
+        if _looks_like_person_first_name(first):
             return first[:1].upper() + first[1:].lower()
-    # JD: Dear Sana / Hi Bushra
     m = re.search(
         r"(?i)(?:dear|hi|hello)\s+([A-Z][a-z]{1,20})\b",
         jd_text or "",
     )
-    if m and m.group(1).lower() not in skip:
+    if m and _looks_like_person_first_name(m.group(1)):
         return m.group(1)
     return "Hiring Team"
+
+
+def _candidate_display_name(facts: str) -> str:
+    """Pull real candidate name from resume/notes text."""
+    if not facts:
+        return "Muhammad Zaheeruddin"
+    # Prefer explicit full name near top of resume
+    for pat in (
+        r"(?im)^\s*(Muhammad\s+Zaheeruddin)\b",
+        r"(?im)^\s*(Muhammad\s+Zaheer[\w]*)\b",
+        r"(?i)\b(Muhammad\s+Zaheeruddin)\b",
+        r"(?i)\b(name)\s*[:\-]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})",
+    ):
+        m = re.search(pat, facts)
+        if m:
+            if m.lastindex and m.lastindex >= 2:
+                return m.group(2).strip()
+            return m.group(1).strip()
+    return "Muhammad Zaheeruddin"
+
+
+def _scrub_fake_identity(body: str, real_name: str) -> str:
+    """Strip placeholder identities (John Doe, example.com) from LLM output."""
+    if not body:
+        return body
+    t = body
+    # Common LLM placeholders
+    t = re.sub(
+        r"(?i)\bJohn\s+Doe\b|\bJane\s+Doe\b|\bFoo\s+Bar\b",
+        real_name,
+        t,
+    )
+    t = re.sub(
+        r"(?i)[a-z0-9._%+\-]*@example\.com",
+        "",
+        t,
+    )
+    t = re.sub(
+        r"(?i)Phone:\s*\+?[\d\s\-()]{6,}\s*",
+        "",
+        t,
+    )
+    # Drop junk signature lines the model invents under a fake name
+    t = re.sub(
+        r"(?im)^\s*Computer Science Graduate\s*\|\s*AI Engineer\s*$",
+        "",
+        t,
+    )
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    # Ensure real name appears in sign-off
+    if real_name and not re.search(re.escape(real_name), t, flags=re.I):
+        if re.search(r"(?i)best regards,?\s*$", t):
+            t = re.sub(
+                r"(?i)(best regards,?)\s*$",
+                rf"\1\n{real_name}",
+                t,
+            )
+        else:
+            t = t.rstrip() + f"\n\nBest regards,\n{real_name}"
+    return t
+
+
+def _is_weak_email_subject(subject: str) -> bool:
+    s = (subject or "").strip()
+    if not s or s.lower() in {"job application", "application"}:
+        return True
+    if re.search(r"(?i)john\s+doe|jane\s+doe|example\.com", s):
+        return True
+    # Country/city alone after Application -
+    core = re.sub(r"(?i)^\s*application\s*[–\-:]\s*", "", s).strip()
+    if re.fullmatch(
+        r"(?i)pakistan|india|remote|lahore|islamabad|karachi|onsite|hybrid",
+        core or "",
+    ):
+        return True
+    return False
 
 
 def _email_cover_mode(user_text: str) -> str:
@@ -1348,7 +1454,11 @@ def _email_compose_system(mode: str, greeting_name: str) -> str:
         "- NEVER claim sales/recruiter/logistics years you do not have.\n"
         "- JD is context for wording only — never claim JD duties as your experience.\n"
         "- You MAY map real automation/AI/outreach work as transferable value.\n"
-        "- subject: use suggested subject unless empty/generic.\n"
+        "- subject MUST be: Application - <exact job title from the JD>. "
+        "Never a country/city alone (not 'Application - Pakistan'). "
+        "Never invent placeholder names (no John Doe / Jane Doe).\n"
+        "- Sign-off name MUST be the real candidate name from CANDIDATE FACTS "
+        "(never John Doe, never example.com emails).\n"
         "- attach_resume: true when resume will be attached.\n"
         "- Complete through signature in ONE response."
     )
@@ -1430,20 +1540,31 @@ def _compose_email_json(
     user: str,
     temperature: float = 0.2,
     max_tokens: int = 1200,
+    real_name: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     LLM-first email compose. Always prefers model output over any template.
 
-    Strategy (research-backed structured-output pattern):
+    Strategy:
       1) Single completion with strict JSON schema hint
       2) Tolerant parse (fences, trailing commas)
-      3) On parse miss: one recovery call ("convert previous output to JSON only")
+      3) On parse miss: recovery with identity lock + original user context
       4) Never invent a static cover-letter template in Python
     """
+    identity_lock = ""
+    if real_name:
+        identity_lock = (
+            f"\nIDENTITY LOCK: Candidate name is exactly \"{real_name}\". "
+            "Never use John Doe, Jane Doe, or @example.com. "
+            f"Sign every email as {real_name}."
+        )
     messages = [
         {
             "role": "system",
-            "content": system.rstrip() + "\n\n" + _EMAIL_JSON_SCHEMA_HINT,
+            "content": system.rstrip()
+            + identity_lock
+            + "\n\n"
+            + _EMAIL_JSON_SCHEMA_HINT,
         },
         {"role": "user", "content": user},
     ]
@@ -1470,21 +1591,31 @@ def _compose_email_json(
             "EMAIL_JSON_PRIMARY_FAIL err=%s", e
         )
 
-    # Recovery: force JSON-only conversion of whatever we got (or rewrite from user)
+    # Recovery: re-parse / finish using ORIGINAL user brief (facts intact)
     try:
-        recover_user = raw[:4500] if raw else user[:4500]
+        recover_blob = (
+            "Fix into valid email JSON only.\n"
+            f"Real candidate name: {real_name or '(from CANDIDATE FACTS)'}\n"
+            "Rules: no John Doe, no example.com, subject = Application - "
+            "<exact JD job title>, body complete through Best regards + real name.\n\n"
+            "--- PREVIOUS MODEL OUTPUT ---\n"
+            f"{(raw or '')[:3000]}\n\n"
+            "--- ORIGINAL BRIEF (authoritative facts) ---\n"
+            f"{user[:5000]}"
+        )
         msg2 = _chat_completion(
             [
                 {
                     "role": "system",
                     "content": (
-                        "Convert the content into the required email JSON object. "
-                        "If the content is incomplete, write a full professional email "
-                        "body from the candidate profile facts in the content. "
+                        "You repair broken email JSON. Preserve real candidate identity "
+                        "from CANDIDATE FACTS. Never invent placeholder people. "
+                        + identity_lock
+                        + "\n\n"
                         + _EMAIL_JSON_SCHEMA_HINT
                     ),
                 },
-                {"role": "user", "content": recover_user},
+                {"role": "user", "content": recover_blob},
             ],
             tools=None,
             temperature=0.1,
@@ -1961,6 +2092,7 @@ def run_agent(
             candidate_facts = _load_candidate_facts(
                 memory_block or "", mem_obs
             )
+            real_name = _candidate_display_name(candidate_facts)
             role_hint = (existing.get("subject") or "").strip()
             role_hint = re.sub(
                 r"(?i)^\s*application\s*[–\-:]\s*", "", role_hint
@@ -1978,6 +2110,7 @@ def run_agent(
                 user=(
                     f"User edit request: {_email_src[:500]}\n"
                     f"cover_mode: {cover_mode}\n"
+                    f"Candidate real name (sign-off MUST use this): {real_name}\n"
                     f"Current subject: {existing.get('subject') or ''}\n"
                     f"Role hint: {role_hint}\n"
                     f"Recipient greeting name: {greet_name}\n"
@@ -1988,15 +2121,19 @@ def run_agent(
                 ),
                 temperature=0.25,
                 max_tokens=tok_budget,
+                real_name=real_name,
             )
             new_body = (parsed or {}).get("body") or ""
             new_subj = (parsed or {}).get("subject") or existing.get("subject") or ""
+            if new_subj and _is_weak_email_subject(new_subj):
+                new_subj = existing.get("subject") or new_subj
             if not new_body or len(new_body) < 40:
                 return _reply(
                     "Rewrite fail ho gaya. Subject/body clearly bolo, e.g.\n"
                     "Change subject to Application - Full Stack Developer\n"
                     'and "Job Application" to Full Stack Developer'
                 )
+            new_body = _scrub_fake_identity(new_body, real_name)
             new_body = _normalize_email_body(new_body, greet_name)
             if not re.search(r"(?i)resume|cv|attached", new_body) and (
                 (existing.get("attach_resume") or "") == "true"
@@ -2059,13 +2196,18 @@ def run_agent(
                 candidate_facts = _load_candidate_facts(
                     memory_block or "", mem_obs
                 )
-                jd_clip = (apply.get("jd_excerpt") or "")[:1800]
+                real_name = _candidate_display_name(candidate_facts)
+                jd_clip = (apply.get("jd_excerpt") or "")[:2200]
                 subject = apply.get("subject") or "Job Application"
                 role_name = (apply.get("role") or "").strip() or re.sub(
                     r"(?i)^\s*application\s*[–\-:]\s*", "", subject
                 ).strip() or subject
+                if _is_weak_email_subject(subject):
+                    # Let the LLM own the subject from the JD text
+                    subject = ""
+                    if _is_weak_email_subject(role_name):
+                        role_name = ""
 
-                # Application / cover via structured JSON (mode-aware, single shot)
                 cover_mode = _email_cover_mode(_email_src)
                 greet_name = _email_recipient_first_name(
                     apply.get("to") or "", jd_clip
@@ -2081,17 +2223,19 @@ def run_agent(
                     user=(
                         f"purpose: job_apply\n"
                         f"cover_mode: {cover_mode}\n"
-                        f"user_request: {_email_src[:400]}\n"
-                        f"Role name (use in body — never say 'Job Application role'): "
-                        f"{role_name or '(infer best-fit role from JD + resume)'}\n"
+                        f"user_request: {_email_src[:500]}\n"
+                        f"Candidate real name (sign-off MUST use this): {real_name}\n"
+                        f"Role hint (may be empty — extract exact title from JD): "
+                        f"{role_name or '(extract from JD)'}\n"
                         f"Open roles on this posting (if multi-role): {roles_hint or 'n/a'}\n"
                         f"Company: {company_hint or 'n/a'}\n"
-                        f"Suggested subject: {subject}\n"
+                        f"Suggested subject (may be empty — YOU must set "
+                        f"'Application - <exact JD title>'): {subject or '(set from JD)'}\n"
                         f"Recipient greeting name: {greet_name}\n"
                         f"attach_resume: true\n"
                         "If multiple roles are listed, pick the ONE best fit for the "
-                        "candidate resume and write the subject + body for that role. "
-                        "Never use the phrase 'Job Application role'.\n\n"
+                        "candidate resume and write subject + body for that role only. "
+                        "Never say 'Job Application role'. Never use placeholder names.\n\n"
                         f"JOB DESCRIPTION (context only — do not claim as experience):\n"
                         f"{jd_clip}\n\n"
                         f"CANDIDATE FACTS (resume PDF is primary — ONLY source of facts):\n"
@@ -2099,22 +2243,27 @@ def run_agent(
                     ),
                     temperature=0.25 if cover_mode == "detailed" else 0.2,
                     max_tokens=tok_budget,
+                    real_name=real_name,
                 )
                 if parsed_email:
                     cover = parsed_email.get("body") or ""
-                    if parsed_email.get("subject"):
+                    if parsed_email.get("subject") and not _is_weak_email_subject(
+                        parsed_email["subject"]
+                    ):
                         subject = parsed_email["subject"]
-                        # Keep role_name aligned if model refined subject
                         rn = re.sub(
                             r"(?i)^\s*application\s*[–\-:]\s*",
                             "",
                             subject,
                         ).strip()
-                        if rn and rn.lower() != "job application":
+                        if rn:
                             role_name = rn
+                    elif parsed_email.get("subject"):
+                        logging.getLogger("mojo.agent").info(
+                            "EMAIL_SUBJECT_REJECTED weak=%r",
+                            parsed_email.get("subject"),
+                        )
 
-                # LLM-first: NO static Python cover-letter template.
-                # If model fails twice, surface a clear retry — never fake a letter.
                 if not cover or len(cover) < 60:
                     logging.getLogger("mojo.agent").info(
                         "FORCE_JOB_APPLY_LLM_EMPTY to=%s subject=%r",
@@ -2126,7 +2275,21 @@ def run_agent(
                         "Ek second baad dobara 'apply to this job' try karo — "
                         "template use nahi karunga."
                     )
+                cover = _scrub_fake_identity(cover, real_name)
                 cover = _normalize_email_body(cover, greet_name)
+                if not subject or _is_weak_email_subject(subject):
+                    # Last resort: derive from body first mention of position
+                    m = re.search(
+                        r"(?i)(?:interest in|applying for|apply for)\s+the\s+"
+                        r"(.+?)\s+(?:position|role)\b",
+                        cover,
+                    )
+                    if m:
+                        subject = f"Application - {m.group(1).strip()}"
+                    elif role_name and not _is_weak_email_subject(role_name):
+                        subject = f"Application - {role_name}"
+                    else:
+                        subject = "Job Application"
                 if not re.search(
                     r"(?i)resume|cv|attached|attachment",
                     cover,
