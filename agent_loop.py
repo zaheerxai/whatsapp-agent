@@ -639,6 +639,79 @@ _GREETING_ONLY_RE = re.compile(
 )
 
 
+# Owner "send this / forward this to +92..." with a quoted body -> force send_message_to.
+# Model otherwise rephrased the quote instead of calling the tool (live log 2026-10-02).
+# Prefer the LAST "to|ko <phone>" so "word to word, to +92..." still works.
+_SEND_PHONE_RE = re.compile(
+    r"(?i)(?:\bto\b|\bko\b)\s*(?P<phone>\+?\d[\d\s\-]{7,18}\d)\s*$"
+)
+_SEND_VERB_RE = re.compile(
+    r"(?i)\b("
+    r"send(?:\s+this|\s+the\s+msg|\s+the\s+message|\s+msg|\s+message|\s+it)?"
+    r"(?:\s+word\s+to\s+word)?|"
+    r"forward(?:\s+this|\s+it)?|"
+    r"bhej(?:o| do| dena)?|send\s*karo|forward\s*karo"
+    r")\b"
+)
+_PHONE_FIRST_RE = re.compile(
+    r"(?i)(?P<phone>\+?\d[\d\s\-]{7,18}\d)\s*(?:ko|pe|par)?\s*"
+    r"(?:ye|this|msg|message)?\s*(?:bhej|bhejo|bhej\s*do|send\s*karo|forward)"
+)
+
+
+def _parse_send_to_command(text: str):
+    """Return {phone, body} when owner asks to send the quoted/live body to a number."""
+    raw = text or ""
+    live = raw
+    body = ""
+    m_q = re.search(r"\[Quoted Message\]:\s*(.+)$", raw, flags=re.I | re.S)
+    if m_q:
+        body = (m_q.group(1) or "").strip()
+        live = raw[: m_q.start()]
+    live_s = live.strip()
+    phone = None
+    m = _SEND_PHONE_RE.search(live_s)
+    if m and _SEND_VERB_RE.search(live_s):
+        phone = re.sub(r"\D", "", m.group("phone"))
+    if not phone:
+        m2 = _PHONE_FIRST_RE.search(live_s)
+        if m2:
+            phone = re.sub(r"\D", "", m2.group("phone"))
+    if not phone and _SEND_VERB_RE.search(live_s):
+        # "bhej do isko +92312…" — verb present, phone at end without explicit to/ko
+        m3 = re.search(r"(?P<phone>\+?\d[\d\s\-]{7,18}\d)\s*$", live_s)
+        if m3:
+            phone = re.sub(r"\D", "", m3.group("phone"))
+    if not phone:
+        return None
+    if phone.startswith("00"):
+        phone = phone[2:]
+    if phone.startswith("0") and len(phone) == 11:
+        phone = "92" + phone[1:]
+    if not phone.isdigit() or len(phone) < 10:
+        return None
+    if not body:
+        residual = _SEND_PHONE_RE.sub(" ", live_s)
+        residual = _PHONE_FIRST_RE.sub(" ", residual)
+        residual = _SEND_VERB_RE.sub(" ", residual)
+        residual = re.sub(r"\+?\d[\d\s\-]{7,}", " ", residual)
+        residual = re.sub(r"\s+", " ", residual).strip(" :-–—,.")
+        body = residual
+    if not body or len(body) < 1:
+        return None
+    return {"phone": phone, "body": body[:4000]}
+
+
+def _phone_to_wa_jid(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    return f"{digits}@s.whatsapp.net"
+
+
+
+
+
 def _needs_format_guide(
     latest_user_text: Optional[str] = None,
     force_urls: Optional[List[str]] = None,
@@ -949,7 +1022,8 @@ def _build_system_prompt(
 3. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
 4. GREETINGS / SMALL TALK ("hi", "hello", "hows it going", "kya haal", "salam") → reply naturally in ONE short line. Do NOT call any tool. Do NOT dump agency stats or founder bio.
 5. PURE @mention only (message is just "@mojo" / "@aimojo" / a number tag with no real question) → reply "Haan, boliye?" Do NOT call any tool. Do NOT continue a previous website topic from history.
-6. Call search_knowledge ONLY when the user actually asks about agency services, portfolio, founder background, pricing, or "what can you do". Never on a plain greeting or pure mention.
+6. Call search_knowledge ONLY when the user actually asks about agency services, portfolio, founder background, pricing, or "what can you do". Never on a plain greeting ("hi"/"hey"/"salam") or pure mention. Never call it just because history mentioned capabilities.
+6b. SEND / FORWARD: When the owner says "send this to +92…", "bhej do is number pe", "forward this to …" (with or without a quoted message) you MUST call send_message_to with the EXACT quoted/body text word-for-word and the target phone/chat_id. Do NOT rewrite, summarize, or reply with the text in this chat instead of sending.
 7. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
 8. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
@@ -2686,9 +2760,53 @@ def run_agent(
             )
             return any(m in head for m in markers)
 
+        # --- Force send_message_to (owner "Send this to +92…") ---
+        # Live bug 2026-10-02: model rewrote the quoted capability list instead of
+        # calling send_message_to; keyword memory also false-fired on "permanent notes".
+        if _tool_allowed_for_chat(chat_id, "send_message_to"):
+            _send_cmd = _parse_send_to_command(
+                latest_user_text or extra_user_note or _intent_src or ""
+            )
+            if _send_cmd:
+                target_jid = _phone_to_wa_jid(_send_cmd["phone"])
+                body = _send_cmd["body"]
+                print(
+                    f"[AGENT] force send_message_to to={target_jid!r} "
+                    f"chars={len(body)}"
+                )
+                logging.getLogger("mojo.agent").info(
+                    "FORCE_SEND_MESSAGE_TO to=%s chars=%d",
+                    target_jid,
+                    len(body),
+                )
+                try:
+                    obs = execute_tool(
+                        "send_message_to",
+                        {"chat_id": target_jid, "text": body},
+                        tool_ctx,
+                    )
+                except Exception as _se:
+                    obs = f"Tool error: {_se}"
+                obs_s = str(obs)
+                if "Permission denied" in obs_s:
+                    return _reply(
+                        "Proactive send sirf bot owner ke liye available hai."
+                    )
+                if obs_s.startswith("Message sent"):
+                    return _reply(f"Bhej diya → {_send_cmd['phone']}")
+                return _reply(obs_s[:500])
+
         # Only tools the admin enabled for this chat are offered to the model.
         # Default is empty → pure conversational reply (ai_chat), no tools.
         tools_for_next: Optional[List] = _schemas_for_chat(chat_id)
+
+        # Pure greeting / small-talk: strip tools so search_knowledge cannot fire
+        # on "Hey" (rule 6 + live log 2026-10-02).
+        _greet_blob = (latest_user_text or "").strip()
+        if tools_for_next and _greet_blob and _GREETING_ONLY_RE.match(_greet_blob):
+            print(f"[AGENT] greeting-only — tools disabled: {_greet_blob[:40]!r}")
+            tools_for_next = None
+
         if tools_for_next:
             print(
                 f"[AGENT] tools enabled for {chat_id}: "

@@ -1038,6 +1038,21 @@ def resolve_mentions(text, reverse_map_or_tuple):
     return text
 
 
+# Substring "permanent note" falsely fired on capability lists that say
+# "permanent notes" inside a quoted bot reply. Word-boundary match on the LIVE
+# command line only + send/forward guard fixes that race.
+_MEMORY_TRIGGER_RE = re.compile(
+    r"(?i)\b(?:"
+    + "|".join(re.escape(t) for t in MEMORY_TRIGGERS)
+    + r")\b"
+)
+_SEND_FORWARD_CMD_RE = re.compile(
+    r"(?i)^\s*(send|forward|bhej|bhejo|bhej\s*do|bhej\s*dena|forward\s*karo|"
+    r"send\s*karo|send\s*this|forward\s*this|msg\s+word\s+to\s+word)"
+    r".{0,120}?(?:to|ko)\s*[\+@]?\d"
+)
+
+
 def maybe_save_memory(chat_id, sender_id, text_content):
     """Keyword version: if the message contains a memory trigger, extract the
     durable body (prefer quoted content) and store it in group_memory.
@@ -1045,9 +1060,21 @@ def maybe_save_memory(chat_id, sender_id, text_content):
     Previously this dumped the entire command wrapper + @mention + quote blob,
     which produced useless notes like 'Always remember @bot\\n\\n[Quoted…]' and
     also raced the agent save_memory tool into saving a 1-line stub.
+
+    Guard: bare substring of "permanent note" matched capability text
+    "permanent notes" when the user said "Send this to +92…" quoting a bot
+    capability list. Triggers are now word-boundary matched on the LIVE
+    command line only (before [Quoted Message]); send/forward commands skip.
     """
-    lowered = (text_content or "").lower()
-    if not any(trigger in lowered for trigger in MEMORY_TRIGGERS):
+    raw = text_content or ""
+    live = raw
+    q_idx = raw.lower().find("[quoted message]")
+    if q_idx >= 0:
+        live = raw[:q_idx]
+    if _SEND_FORWARD_CMD_RE.search(live):
+        log.info("MEMORY_SKIP send/forward command — not a memory write")
+        return
+    if not _MEMORY_TRIGGER_RE.search(live):
         return
     note = _extract_memory_note_body(text_content)
     if not note or len(note) < 8:

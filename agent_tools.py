@@ -364,7 +364,10 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "send_message_to",
             "description": (
-                "Send a proactive WhatsApp message to another chat_id. "
+                "Send a proactive WhatsApp message to another person or group. "
+                "Use when the owner says 'send this to +92…', 'bhej do is number pe', "
+                "or 'forward this message to …'. Pass the EXACT quoted/body text "
+                "word-for-word unless the owner asks to rewrite. "
                 "ONLY the bot owner may use this tool."
             ),
             "parameters": {
@@ -372,9 +375,15 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "properties": {
                     "chat_id": {
                         "type": "string",
-                        "description": "Target chat_id e.g. 92300...@s.whatsapp.net or group@g.us",
+                        "description": (
+                            "Target phone (+92312… / 92312…) or full chat_id "
+                            "(92300…@s.whatsapp.net / group@g.us). Phone is auto-normalized."
+                        ),
                     },
-                    "text": {"type": "string", "description": "Message body"},
+                    "text": {
+                        "type": "string",
+                        "description": "Exact message body to send (quoted text when user says send this)",
+                    },
                 },
                 "required": ["chat_id", "text"],
             },
@@ -2483,11 +2492,23 @@ def _tool_send_message_to(args: dict, ctx: dict) -> str:
         and str(ctx.get("sender_num") or "") != str(_OWNER_SENDER_ID)
     ):
         return "Permission denied: only the bot owner can send proactive messages."
-    chat_id = (args.get("chat_id") or "").strip()
-    text = (args.get("text") or "").strip()
+    chat_id = (args.get("chat_id") or args.get("to") or args.get("phone") or "").strip()
+    text = (args.get("text") or args.get("message") or args.get("body") or "").strip()
     if not chat_id or not text:
         return "chat_id and text required."
+    # Accept raw phone (+92312… / 03xx / 92312…) and normalize to WA JID
+    if "@" not in chat_id:
+        digits = "".join(c for c in chat_id if c.isdigit())
+        if digits.startswith("00"):
+            digits = digits[2:]
+        if digits.startswith("0") and len(digits) == 11:
+            digits = "92" + digits[1:]
+        if len(digits) < 10:
+            return f"Invalid phone/chat_id: {chat_id!r}"
+        chat_id = f"{digits}@s.whatsapp.net"
     try:
+        if not _send_proactive_message:
+            return "Send path not configured."
         _send_proactive_message(chat_id, text)
         return f"Message sent to {chat_id}."
     except Exception as e:
