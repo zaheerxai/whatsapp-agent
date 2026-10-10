@@ -1028,7 +1028,7 @@ def _build_system_prompt(
 8. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
 10. When summarizing a website from browse_url: 2–3 plain lines max. Light formatting (*bold* key phrase or a short list of ≤5 items) is fine; no numbered essay sections.
-11. VOICE: If the turn includes "[Voice note transcript]" or "[Cached recent voice-note transcript]", answer from that text. For "kya bola" / "voice note me kya" / "what did I say" use the transcript — never browse a website and never claim no voice exists when a transcript is present.
+11. VOICE: Voice notes are already transcribed and arrive as ordinary user text (history lines may start with 🎤). Treat them EXACTLY like typed messages — same tools, same rules. A voice note being replied to appears under [Quoted Message]; "[Cached recent voice-note transcript]" is the last voice note in this chat. For "kya bola" / "voice note me kya" / "what did I say" answer from that text — never browse a website and never claim no voice exists when a transcript is present.
 11b. NOTE DOWN vs IMAGE DESCRIBE:
    - note down / note karlo / onedrive me note / save this → note_down with FULL content WORD-FOR-WORD (quoted text, transcript, or image OCR). No "…" truncation. Summarize ONLY if user asked summary/khulasa/key points.
    - ye photo kya hai / what is in this image / describe → describe only (image_describe / vision). Do NOT write OneDrive.
@@ -1782,8 +1782,24 @@ def _chat_completion(
                 print(f"[AGENT] Groq 429/rate — retry in {sleep_s:.1f}s")
                 _time.sleep(sleep_s)
                 continue
-            print(f"[AGENT] Primary model failed: {primary_err}. Trying Gemini...")
+            print(f"[AGENT] Primary model failed: {primary_err}. Trying fallback...")
             break
+
+    # Groq limits are PER MODEL. When the big model is 429'd, a sibling model on its
+    # own bucket answers in ~1s; the Gemini detour cost 14-20s per turn in prod logs.
+    import os as _os
+    _gfb = (_os.getenv("GROQ_FALLBACK_MODEL") or "openai/gpt-oss-20b").strip()
+    _le = str(last_err).lower() if last_err else ""
+    if _gfb and _gfb != _MODEL_NAME and ("429" in _le or "rate" in _le or "too many" in _le):
+        try:
+            fk = dict(kwargs)
+            fk["model"] = _gfb
+            fk["messages"] = working
+            resp = _client_ai.chat.completions.create(**fk)
+            print(f"[AGENT] served by Groq fallback {_gfb}")
+            return resp.choices[0].message
+        except Exception as fe:
+            print(f"[AGENT] Groq fallback {_gfb} failed: {fe}. Trying Gemini...")
 
     # Gemini fallback — sanitize tool messages so we don't get 400s.
     # Single attempt only (no nested retry storms on 503/429).

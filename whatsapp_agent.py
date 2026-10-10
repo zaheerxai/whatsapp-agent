@@ -39,6 +39,7 @@ from supabase import create_client, Client
 # Import this AFTER load_dotenv() so it can see the variables
 import admin_commands
 import file_ops
+import voice_pipeline  # voice note -> typed-equivalent text (single front door)
 
 # Local file logging as early as possible (captures boot noise). Ephemeral on Render Free.
 import mojo_logging
@@ -907,51 +908,10 @@ def get_world_clocks():
     return "\n".join(clocks)
 
 
-# Arabic-script block (covers Urdu's Nastaliq letters, which are a superset of
-# standard Arabic + a few extra codepoints in the Arabic Presentation Forms range).
-# Now covers both Arabic/Urdu and Devanagari (Hindi) scripts
-_NON_LATIN_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\u0900-\u097F]")
-
-def transliterate_to_roman_if_needed(text: str) -> str:
-    """Normalize Urdu-script text to Roman Urdu (Latin letters).
-
-    Used specifically for voice transcripts: Whisper writes Urdu speech in its
-    native Nastaliq/Arabic script, but our default policy — mirrored from how
-    typed messages are handled — is Roman Urdu unless the person explicitly
-    writes in Urdu script. Voice has no script the speaker "chose", so this
-    normalizes to the default right after transcription, before the text is
-    ever stored in chat_history or used as a reminder's `message` field.
-    Skipped entirely (near-zero cost) for English/Roman-Urdu transcripts, which
-    contain no Arabic-script characters at all.
-    """
-    if not text or not _NON_LATIN_SCRIPT_RE.search(text):
-        return text
-    try:
-        resp = client_ai.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Transliterate the following Urdu-script text into Roman Urdu "
-                        "(Latin letters), the way a Pakistani WhatsApp user would "
-                        "naturally type it. Keep English loanwords (GitHub, WhatsApp, "
-                        "link, reminder, alarm, etc.) spelled normally in Latin, not "
-                        "phonetically mangled. Preserve meaning exactly — this is "
-                        "transliteration, not translation. Reply with ONLY the "
-                        "transliterated text, nothing else."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=min(1200, max(200, len(text) // 2 + 100)),
-        )
-        result = (resp.choices[0].message.content or "").strip()
-        return result or text
-    except Exception as e:
-        log.warning(f"Transliteration failed, keeping original script: {e}")
-        return text
+# NOTE: voice transcripts are normalized by voice_pipeline.understand_voice()
+# (Whisper -> one LLM JSON call). The old transliterate_to_roman_if_needed() was
+# removed: it ran on the saturated main model and silently returned the original
+# Devanagari on 429s (seen in prod logs).
 
 
 def upsert_contact(sender_id, push_name, sender_num=None):
@@ -1807,60 +1767,11 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
             )
 
 
-        # A. Voice Notes (Whisper)
+        # A. Voice notes are transcribed UPSTREAM (_process_message_inner ->
+        #    voice_pipeline) and then flow through the exact same path as typed
+        #    text. Nothing should reach here; guard so it can never double-handle.
         if media_kind in ("audio", "ptt"):
-            with open(tmp_path, "rb") as f:
-                transcript = client_ai.audio.transcriptions.create(
-                    model=WHISPER_MODEL,
-                    file=f,
-                    # No forced `language="ur"` — auto-detect per utterance so
-                    # code-switched English words (GitHub, reminder, alarm, link)
-                    # aren't forced through Urdu decoding, which was mangling them.
-                ).text
-            log.info("VOICE_TRANSCRIBED raw=%r", transcript)
-
-            transcript = transliterate_to_roman_if_needed(transcript)
-            log.info("VOICE_TRANSCRIBED normalized=%r", transcript)
-
-            # Cache so later "ye voice note me kya bola" can answer without re-download
-            try:
-                LAST_VOICE_BY_CHAT[chat_id] = {
-                    "transcript": transcript,
-                    "ts": time.time(),
-                }
-            except Exception:
-                pass
-
-            # text_content may already hold [Quoted Message]: ... when the user
-            # replied-to a previous msg with this voice note (e.g. "note down ye
-            # cheez"). Put quote first so the agent can act on the referent
-            # without asking "kis cheez ko?".
-            context_str = f"[Voice note transcript]: {transcript}"
-            if text_content and text_content.strip():
-                context_str = f"{text_content.strip()}\n\n[Voice note transcript]: {transcript}"
-
-            transcript_limit = detect_summary_history_limit(transcript)
-            if transcript_limit is not None:
-                history_limit = transcript_limit
-
-            insert_chat_message(chat_id, "voice_transcript", "user", context_str)
-
-            # Route voice through the SAME agent loop as text so tools
-            # (set_reminder, cancel, knowledge, …) actually run.
-            if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
-                from agent_loop import run_agent
-                is_group = "g.us" in (chat_id or "")
-                return run_agent(
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    sender_num=sender_num,
-                    history_limit=history_limit,
-                    is_group=is_group,
-                    msg_time=msg_time,
-                    extra_user_note=context_str,
-                    force_urls=None,  # never inherit a stale website URL for voice turns
-                    latest_user_text=context_str,
-                )
+            log.warning("VOICE reached handle_media_message — handled upstream; ignoring")
             return None
 
         # B. Visual media (Gemini vision)
@@ -2884,6 +2795,100 @@ def _split_whatsapp_chunks(text: str, limit: int = 3500) -> list:
     return [p for p in parts if p]
 
 
+# ---------------------------------------------------------------------------
+# VOICE → TEXT front door
+# ---------------------------------------------------------------------------
+# In groups a voice note cannot carry an @mention. By default it wakes the bot only
+# when it QUOTES a bot message (same rule as sticker reactions). Opt-in: transcribe
+# every group voice note and let the LLM decide if it was addressed to Mojo
+# ("Mojo, ...") — costs Whisper audio-seconds, hence off by default.
+VOICE_GROUP_WAKEWORD = (os.getenv("VOICE_GROUP_WAKEWORD") or "0").strip().lower() in ("1", "true", "yes", "on")
+VOICE_MAX_SECONDS = int(os.getenv("VOICE_MAX_SECONDS") or "600")
+
+
+def _audio_seconds(msg_obj) -> int:
+    for n in ("audioMessage", "AudioMessage"):
+        a = getattr(msg_obj, n, None)
+        if a is not None:
+            try:
+                return int(getattr(a, "seconds", 0) or 0)
+            except Exception:
+                return 0
+    return 0
+
+
+def _voice_known_names(chat_id, limit: int = 40) -> list:
+    """Recent speakers first (ASR mangles names most), then the rest of the address book."""
+    names, seen = [], set()
+    try:
+        cmap, _ = get_contacts_maps()
+        cmap = cmap or {}
+        for m in reversed(fetch_chat_history(chat_id, 30) or []):
+            n = cmap.get(m.get("sender_id"))
+            if n and n not in seen and not str(n).strip().isdigit():
+                seen.add(n); names.append(n)
+        for n in cmap.values():
+            if n and n not in seen and not str(n).strip().isdigit():
+                seen.add(n); names.append(n)
+            if len(names) >= limit:
+                break
+    except Exception as e:
+        log.warning("VOICE known-names failed: %s", e)
+    return names[:limit]
+
+
+def _voice_recent_chat(chat_id, n: int = 4) -> str:
+    try:
+        cmap, _ = get_contacts_maps()
+        cmap = cmap or {}
+        lines = []
+        for m in (fetch_chat_history(chat_id, n) or [])[-n:]:
+            who = "Mojo" if m.get("role") == "assistant" else cmap.get(m.get("sender_id"), "user")
+            lines.append(f"{who}: {(m.get('content') or '')[:160]}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _chat_has_recent_url(chat_id) -> bool:
+    return chat_id in LAST_URL_BY_CHAT or bool(urls_from_recent_history(chat_id, limit=10))
+
+
+def _transcribe_audio_msg(msg_obj, chat_id, need_flags: bool = False):
+    """Download + understand one audio message. Never raises."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+        client.download_any(msg_obj, path=tmp_path)
+        vr = voice_pipeline.understand_voice(
+            tmp_path,
+            groq_client=client_ai,
+            gemini_client=client_gemini,
+            gemini_model=GEMINI_MODEL,
+            known_names=_voice_known_names(chat_id),
+            recent_chat=_voice_recent_chat(chat_id),
+            need_flags=need_flags,
+        )
+        log.info(
+            "VOICE_UNDERSTOOD raw=%r text=%r lang=%s addressed=%s link_ref=%s unclear=%s "
+            "norm=%s whisper=%s dur=%.1fs err=%r",
+            vr.raw[:300], vr.text[:300], vr.language, vr.addressed_to_bot,
+            vr.references_previous_link, vr.unclear, vr.normalized_by or "-",
+            vr.whisper_model, vr.duration, vr.error,
+        )
+        return vr
+    except Exception as e:
+        log.exception("VOICE transcribe crashed: %s", e)
+        return voice_pipeline.VoiceResult(error=str(e)[:200])
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def process_message(client, message):
     try:
         if _should_skip_duplicate(message):
@@ -2954,6 +2959,8 @@ def _process_message_inner(client, message):
 
     media_kind = get_media_kind(message)
     target_media_msg = None
+    own_voice = media_kind in ("audio", "ptt")  # the message ITSELF is a voice note
+    quoted_voice_msg = None  # a voice note being replied to (typed OR voice reply)
 
     # --- CHECK FOR QUOTED MESSAGES AND TAGS ---
     quoted_text = ""
@@ -2985,7 +2992,7 @@ def _process_message_inner(client, message):
         q_text, q_urls = extract_quoted_text_and_urls(ctx)
         if q_text:
             quoted_text = q_text
-        if quoted is not None and not media_kind:
+        if quoted is not None and (not media_kind or own_voice):
             # media-kind detection on quoted payload — check mimetype OR url/directPath/mediaKey
             # (quoted stubs often lack mimetype but still have downloadable media)
             def _has_media(obj, *extra):
@@ -3002,19 +3009,19 @@ def _process_message_inner(client, message):
             q_vid = getattr(quoted, "videoMessage", None) or getattr(quoted, "VideoMessage", None)
             q_doc = getattr(quoted, "documentMessage", None) or getattr(quoted, "DocumentMessage", None)
             if _has_media(q_audio):
-                media_kind = "audio"
-                target_media_msg = quoted
+                # Transcribed later and injected as [Quoted Message] text (no media branch).
+                quoted_voice_msg = quoted
                 log.info("QUOTE_MEDIA quoted audio/ptt detected — will transcribe")
-            elif _has_media(q_img):
+            elif not media_kind and _has_media(q_img):
                 media_kind = "image"
                 target_media_msg = quoted
-            elif _has_media(q_sticker):
+            elif not media_kind and _has_media(q_sticker):
                 media_kind = "sticker"
                 target_media_msg = quoted
-            elif _has_media(q_vid):
+            elif not media_kind and _has_media(q_vid):
                 media_kind = "gif" if getattr(q_vid, "gifPlayback", False) else "video"
                 target_media_msg = quoted
-            elif _has_media(q_doc, "fileName", "title", "FileName", "Title"):
+            elif not media_kind and _has_media(q_doc, "fileName", "title", "FileName", "Title"):
                 media_kind = "document"
                 target_media_msg = quoted
 
@@ -3274,7 +3281,8 @@ def _process_message_inner(client, message):
     if not admin_commands.get_global_setting("agent_enabled", default=True):
         return
 
-    insert_chat_message(chat_id, db_sender_id, "user", text_content, sender_num=db_sender_num)
+    if not own_voice:  # voice: stored after transcription (with the transcript, under the real sender)
+        insert_chat_message(chat_id, db_sender_id, "user", text_content, sender_num=db_sender_num)
 
     upsert_contact(db_sender_id, push_name, db_sender_num)
 
@@ -3383,6 +3391,19 @@ def _process_message_inner(client, message):
         )
     )
 
+    # Voice notes: addressed when they QUOTE the bot (LID-less groups: match quoted
+    # text against our recent replies, same trick as sticker reactions).
+    if (
+        own_voice and is_group and not is_reply_to_bot and has_quote
+        and quoted_text and quoted_matches_recent_bot_reply(chat_id, quoted_text)
+    ):
+        is_reply_to_bot = True
+    is_voice_to_bot = own_voice and is_reply_to_bot
+    voice_wake_check = (
+        own_voice and is_group and not is_voice_to_bot
+        and not is_bot_mentioned and VOICE_GROUP_WAKEWORD
+    )
+
     # Persisted (not print-only) so this is diagnosable from the synced log file,
     # not just a live console tail. This is exactly the signal needed to tell
     # apart "ctx wasn't found" vs "ctx was found but participant didn't match
@@ -3398,9 +3419,11 @@ def _process_message_inner(client, message):
     )
 
     if is_group:
-        if not (is_bot_mentioned or is_media_reaction_to_bot):
+        if not (is_bot_mentioned or is_media_reaction_to_bot or is_voice_to_bot or voice_wake_check):
             return
-        if is_media_reaction_to_bot and not is_bot_mentioned:
+        if is_voice_to_bot:
+            log.info("GROUP_VOICE_REPLY_TO_BOT from=%s", sender_number)
+        elif is_media_reaction_to_bot and not is_bot_mentioned:
             log.info("GROUP_MEDIA_REACTION_TO_BOT kind=%s from=%s", media_kind, sender_number)
         else:
             log.info("GROUP_WAKE_WORD_DETECTED from=%s", sender_number)
@@ -3446,6 +3469,76 @@ def _process_message_inner(client, message):
     if time.time() - msg_time > 300:
         log.info(f"STALE_MESSAGE_SKIPPED from={sender_number} age={int(time.time() - msg_time)}s")
         return
+
+
+    # ==========================================
+    # VOICE → TEXT. From here on a voice note IS a typed message:
+    # note intent, email/send commands, URL follow-ups, memory, timezone,
+    # reminders, tool gating, language policy — all see plain text.
+    # ==========================================
+    if own_voice or quoted_voice_msg is not None:
+        _audio_on = admin_commands.is_feature_enabled(chat_id, "audio")
+
+        def _say(txt):
+            client.reply_message(txt, message, mentions_are_lids=is_lid_mode)
+
+        if own_voice and not _audio_on:
+            log.info("FEATURE_OFF audio disabled for %s", chat_id)
+            if admin_commands.has_any_feature_enabled(chat_id):
+                _say("🎤 Voice notes are currently turned off for this chat.")
+            return
+
+        if _audio_on:
+            # (a) the user's own voice note == the user's message
+            if own_voice:
+                _secs = _audio_seconds(message.Message)
+                if _secs and _secs > VOICE_MAX_SECONDS:
+                    _say(f"🎤 Voice note bohat lambi hai ({_secs // 60} min). Max {VOICE_MAX_SECONDS // 60} min — chhota karke bhejo.")
+                    return
+                _vr = _transcribe_audio_msg(
+                    message.Message, chat_id,
+                    need_flags=bool(voice_wake_check or _chat_has_recent_url(chat_id)),
+                )
+                if _vr.error and _vr.empty:
+                    _say("🎤 Voice note process nahi ho saki — dobara bhejo ya type kar do.")
+                    return
+                if _vr.empty:
+                    if not voice_wake_check:
+                        _say("🎤 Voice note mein kuch sunai nahi diya — dobara bhejo?")
+                    return
+                if voice_wake_check and not _vr.addressed_to_bot:
+                    # Not for us: keep it in history (summaries/context), stay silent.
+                    insert_chat_message(chat_id, db_sender_id, "user", "🎤 " + _vr.text, sender_num=db_sender_num)
+                    log.info("GROUP_VOICE_NOT_ADDRESSED — stored, no reply")
+                    return
+                original_text = _vr.text
+                media_kind = None  # → normal text path below
+                insert_chat_message(chat_id, db_sender_id, "user", "🎤 " + _vr.text, sender_num=db_sender_num)
+                LAST_VOICE_BY_CHAT[chat_id] = {"transcript": _vr.text, "ts": time.time()}
+                if _vr.references_previous_link and not message_urls:
+                    _hist = urls_from_recent_history(chat_id, limit=15) or (
+                        [LAST_URL_BY_CHAT[chat_id]] if chat_id in LAST_URL_BY_CHAT else []
+                    )
+                    if _hist:
+                        message_urls = [_hist[0]]
+                        log.info("VOICE_URL_HISTORY_FALLBACK %s", message_urls)
+            # (b) a voice note being replied to == quoted text
+            if quoted_voice_msg is not None and not quoted_text:
+                _qvr = _transcribe_audio_msg(quoted_voice_msg, chat_id)
+                if not _qvr.empty:
+                    quoted_text = _qvr.text
+                    LAST_VOICE_BY_CHAT[chat_id] = {"transcript": _qvr.text, "ts": time.time()}
+
+        # Rebuild the one string every downstream consumer reads.
+        text_content = original_text or ""
+        if quoted_text:
+            text_content = (text_content + "\n\n" if text_content else "") + f"[Quoted Message]: {quoted_text}"
+        if message_urls:
+            _missing = [u for u in message_urls if u not in text_content]
+            if _missing:
+                text_content += "\n\n[Linked URL]: " + " ".join(_missing)
+            for _u in message_urls[:1]:
+                LAST_URL_BY_CHAT[chat_id] = _u
 
     with _timed("1. feature flags + memory + timezone"):
         if admin_commands.is_feature_enabled(chat_id, "chat_memory"):
