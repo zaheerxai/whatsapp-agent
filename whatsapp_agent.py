@@ -3050,7 +3050,7 @@ def _process_message_inner(client, message):
         "kya bola", "kya kaha", "word to word", "word-to-word",
         "mene kya", "maine kya", "what did i say", "what i said",
     ))
-    _link_intent = (not _voice_intent) and any(w in _ref_clean for w in (
+    _link_intent = (not _voice_intent) and len(_ref_clean.split()) <= 14 and any(w in _ref_clean for w in (
         "detail", "details", "iska", "is ka", "is ki", "uska", "us ki",
         "about this", "about it", "about the", "this about", "what is this",
         "this link", "this site", "this url", "ye link", "ye site", "ye url",
@@ -3281,7 +3281,11 @@ def _process_message_inner(client, message):
     if not admin_commands.get_global_setting("agent_enabled", default=True):
         return
 
-    if not own_voice:  # voice: stored after transcription (with the transcript, under the real sender)
+    # Voice turns are stored AFTER transcription so the DB row — which is what the agent
+    # replays as the conversation — contains the transcript. (Storing first meant the model
+    # never saw the quoted voice note and grabbed an older message as the operand.)
+    _store_deferred = own_voice or quoted_voice_msg is not None
+    if not _store_deferred:
         insert_chat_message(chat_id, db_sender_id, "user", text_content, sender_num=db_sender_num)
 
     upsert_contact(db_sender_id, push_name, db_sender_num)
@@ -3420,6 +3424,8 @@ def _process_message_inner(client, message):
 
     if is_group:
         if not (is_bot_mentioned or is_media_reaction_to_bot or is_voice_to_bot or voice_wake_check):
+            if quoted_voice_msg is not None and not own_voice:
+                insert_chat_message(chat_id, db_sender_id, "user", text_content, sender_num=db_sender_num)
             return
         if is_voice_to_bot:
             log.info("GROUP_VOICE_REPLY_TO_BOT from=%s", sender_number)
@@ -3468,6 +3474,8 @@ def _process_message_inner(client, message):
     # If the message is older than 5 minutes (300 seconds), skip replying.
     if time.time() - msg_time > 300:
         log.info(f"STALE_MESSAGE_SKIPPED from={sender_number} age={int(time.time() - msg_time)}s")
+        if quoted_voice_msg is not None and not own_voice:
+            insert_chat_message(chat_id, db_sender_id, "user", text_content, sender_num=db_sender_num)
         return
 
 
@@ -3513,7 +3521,6 @@ def _process_message_inner(client, message):
                     return
                 original_text = _vr.text
                 media_kind = None  # → normal text path below
-                insert_chat_message(chat_id, db_sender_id, "user", "🎤 " + _vr.text, sender_num=db_sender_num)
                 LAST_VOICE_BY_CHAT[chat_id] = {"transcript": _vr.text, "ts": time.time()}
                 if _vr.references_previous_link and not message_urls:
                     _hist = urls_from_recent_history(chat_id, limit=15) or (
@@ -3528,6 +3535,10 @@ def _process_message_inner(client, message):
                 if not _qvr.empty:
                     quoted_text = _qvr.text
                     LAST_VOICE_BY_CHAT[chat_id] = {"transcript": _qvr.text, "ts": time.time()}
+                else:
+                    # Never leave the instruction without an operand — the model would
+                    # otherwise reach for an older message. Say plainly what is missing.
+                    quoted_text = "(voice note could not be transcribed — ask the user to resend it or type the text)"
 
         # Rebuild the one string every downstream consumer reads.
         text_content = original_text or ""
@@ -3539,6 +3550,13 @@ def _process_message_inner(client, message):
                 text_content += "\n\n[Linked URL]: " + " ".join(_missing)
             for _u in message_urls[:1]:
                 LAST_URL_BY_CHAT[chat_id] = _u
+
+        # Store the FINAL turn (transcript + quote) — this row is what the agent replays.
+        insert_chat_message(
+            chat_id, db_sender_id, "user",
+            ("🎤 " + text_content) if own_voice else text_content,
+            sender_num=db_sender_num,
+        )
 
     with _timed("1. feature flags + memory + timezone"):
         if admin_commands.is_feature_enabled(chat_id, "chat_memory"):

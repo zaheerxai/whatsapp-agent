@@ -41,6 +41,9 @@ MAX_TOOL_STEPS = 3  # was 5 — each step is a full Groq call + tool schemas
 # Keep payloads under Groq limits (413 Payload Too Large was hitting group chats)
 MAX_HISTORY_MSGS = 12
 MAX_MSG_CHARS = 600
+# The CURRENT user turn is never squeezed to 600 chars: a quoted 2-minute voice note is
+# ~2,500 chars and 'rewrite this' needs all of it (older turns stay capped for TPM).
+MAX_LATEST_MSG_CHARS = 8000
 MAX_OBS_CHARS = 3500
 # Full lecture transcript delivery (was 3500 → cut mid-sentence after speech_render)
 MAX_OBS_CHARS_TRANSCRIPT = 14000
@@ -439,6 +442,20 @@ def video_spoken_intent(text_low: str) -> Optional[str]:
     if len(tokens) >= 8:
         return "summary"
     return None
+
+
+def _video_route(text: str, url: str):
+    """LLM JSON plan for a message with a video link (video_intent.route); the keyword
+    ladder above is only the offline safety net inside it."""
+    import video_intent
+    return video_intent.route(
+        text, url,
+        groq_client=_client_ai,
+        gemini_client=_client_gemini,
+        gemini_model=_GEMINI_MODEL,
+        legacy_mode=video_spoken_intent,
+        legacy_blocked=_is_blocked_force_command,
+    )
 
 
 _VAGUE_ACK_RE = re.compile(
@@ -1029,6 +1046,7 @@ def _build_system_prompt(
 9. After tools finish, give a natural confirmation or answer in 1–3 lines. Prefer ZERO tools when the answer is pure conversation.
 10. When summarizing a website from browse_url: 2–3 plain lines max. Light formatting (*bold* key phrase or a short list of ≤5 items) is fine; no numbered essay sections.
 11. VOICE: Voice notes are already transcribed and arrive as ordinary user text (history lines may start with 🎤). Treat them EXACTLY like typed messages — same tools, same rules. A voice note being replied to appears under [Quoted Message]; "[Cached recent voice-note transcript]" is the last voice note in this chat. For "kya bola" / "voice note me kya" / "what did I say" answer from that text — never browse a website and never claim no voice exists when a transcript is present.
+11a. QUOTE = OPERAND: when the latest user message contains a [Quoted Message] block and the instruction points at it ("ye", "isko", "is ko", "this", "it", "likh do", "rewrite/translate/summarize/reply/send this"), that quoted text IS the thing to work on. Never substitute an earlier chat message or your own previous reply. If the instruction needs a quote and none is present, ask which message instead of guessing.
 11b. NOTE DOWN vs IMAGE DESCRIBE:
    - note down / note karlo / onedrive me note / save this → note_down with FULL content WORD-FOR-WORD (quoted text, transcript, or image OCR). No "…" truncation. Summarize ONLY if user asked summary/khulasa/key points.
    - ye photo kya hai / what is in this image / describe → describe only (image_describe / vision). Do NOT write OneDrive.
@@ -1790,7 +1808,12 @@ def _chat_completion(
     import os as _os
     _gfb = (_os.getenv("GROQ_FALLBACK_MODEL") or "openai/gpt-oss-20b").strip()
     _le = str(last_err).lower() if last_err else ""
-    if _gfb and _gfb != _MODEL_NAME and ("429" in _le or "rate" in _le or "too many" in _le):
+    try:
+        import llm_json as _lj
+        _gfb_ok = bool(_gfb) and _lj.is_usable(_client_ai, _gfb)
+    except Exception:
+        _gfb_ok = bool(_gfb)
+    if _gfb_ok and _gfb != _MODEL_NAME and ("429" in _le or "rate" in _le or "too many" in _le):
         try:
             fk = dict(kwargs)
             fk["model"] = _gfb
@@ -1817,6 +1840,32 @@ def _chat_completion(
         print(f"[AGENT] Gemini fallback failed: {e2}")
         # Do NOT burn more time on Gemini 503 loops. Caller uses tool OBS.
         raise last_err or e2
+
+
+def _replay_history_messages(raw_history: List[dict], contacts_map: dict) -> List[Dict[str, Any]]:
+    """Clean user/assistant turns for the model. Older turns are capped at MAX_MSG_CHARS
+    (TPM budget); the LATEST user turn keeps up to MAX_LATEST_MSG_CHARS so a quoted
+    voice note / forwarded text is never cut off mid-operand."""
+    out: List[Dict[str, Any]] = []
+    last_user_idx = max(
+        (i for i, m in enumerate(raw_history) if (m.get("role") or "user") == "user"),
+        default=-1,
+    )
+    for hi, msg in enumerate(raw_history):
+        role = msg.get("role") or "user"
+        if role not in ("user", "assistant"):
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        cap = MAX_LATEST_MSG_CHARS if hi == last_user_idx else MAX_MSG_CHARS
+        if len(content) > cap:
+            content = content[:cap] + "…"
+        if role == "user":
+            name = contacts_map.get(msg.get("sender_id"), msg.get("sender_id", "?"))
+            content = f"{name}: {content}"
+        out.append({"role": role, "content": content})
+    return out
 
 
 def run_agent(
@@ -1937,19 +1986,7 @@ def run_agent(
 
         # Only replay clean user/assistant turns (never stale tool messages from DB)
         # Truncate each message so one long past essay cannot blow the payload.
-        for msg in raw_history:
-            role = msg.get("role") or "user"
-            if role not in ("user", "assistant"):
-                continue
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            if len(content) > MAX_MSG_CHARS:
-                content = content[:MAX_MSG_CHARS] + "…"
-            if role == "user":
-                name = contacts_map.get(msg.get("sender_id"), msg.get("sender_id", "?"))
-                content = f"{name}: {content}"
-            messages.append({"role": role, "content": content})
+        messages.extend(_replay_history_messages(raw_history, contacts_map))
 
         if extra_user_note:
             messages.append({"role": "user", "content": extra_user_note})
@@ -2841,11 +2878,24 @@ def run_agent(
             is_video = is_video_url(primary_url)
             blocked_cmd = _is_blocked_force_command(_intent_low)
             spoken_mode = None
-            if is_video and not blocked_cmd:
-                spoken_mode = video_spoken_intent(_intent_low)
-            elif is_video and blocked_cmd:
+            vplan = None
+            if is_video:
+                # One LLM JSON call decides: summary | key_points | transcript | answer |
+                # caption | about | none  (+ wants_caption / wants_stats / verify).
+                vplan = _video_route(_intent_text, primary_url)
+                blocked_cmd = vplan.task == "none"
+                if vplan.task in ("summary", "key_points", "transcript", "answer"):
+                    spoken_mode = vplan.task
+                elif vplan.task in ("about", "caption"):
+                    spoken_mode = "summary"  # used only if the cheap metadata path is unavailable
+                if blocked_cmd:
+                    print(
+                        f"[AGENT] SKIP force video tools — link incidental "
+                        f"({_strip_intent_noise(_intent_low)[:80]!r})"
+                    )
+            elif blocked_cmd:
                 print(
-                    f"[AGENT] SKIP force video tools — blocked command intent "
+                    f"[AGENT] SKIP force URL tools — blocked command intent "
                     f"{_strip_intent_noise(_intent_low)[:80]!r}"
                 )
 
@@ -2853,12 +2903,16 @@ def run_agent(
             can_transcribe = _tool_allowed_for_chat(chat_id, "transcribe_video")
             can_preview = _tool_allowed_for_chat(chat_id, "link_preview")
             can_browse = _tool_allowed_for_chat(chat_id, "browse_url")
-            vague_about = use_video and _is_vague_about_ask(_intent_low)
-            # Prefer cheap caption preview for vague "ye kya hai" on IG/FB/TikTok
-            prefer_preview = vague_about and can_preview and any(
+            vague_about = use_video and (
+                vplan.task == "about" if vplan is not None else _is_vague_about_ask(_intent_low)
+            )
+            caption_only = bool(vplan and vplan.task == "caption" and is_video and can_preview)
+            # Cheap metadata first for vague "ye kya hai" on IG/FB/TikTok, and ALWAYS for
+            # caption/description/stats-only asks (no speech needed for those).
+            prefer_preview = caption_only or (vague_about and can_preview and any(
                 h in (primary_url or "").lower()
                 for h in ("instagram.com", "instagr.am", "facebook.com", "fb.watch", "tiktok.com")
-            )
+            ))
 
             def _force_tool(name: str, args: dict, call_id: str) -> str:
                 try:
@@ -2894,11 +2948,19 @@ def run_agent(
 
             if prefer_preview:
                 print(f"[AGENT] force link_preview (vague about) for: {primary_url}")
+                _pv_args: Dict[str, Any] = {"url": primary_url}
+                if caption_only:
+                    _f = ["title", "caption", "author"]
+                    if vplan.wants_caption:
+                        _f.append("tags")
+                    if vplan.wants_stats:
+                        _f += ["stats", "date", "duration"]
+                    _pv_args["fields"] = _f
                 _forced_obs_str = _force_tool(
-                    "link_preview", {"url": primary_url}, "call_forced_preview_0"
+                    "link_preview", _pv_args, "call_forced_preview_0"
                 )
                 # If caption-only is weak and speech tools allowed, try transcribe
-                if _obs_looks_failed_or_thin(_forced_obs_str) and can_transcribe:
+                if (not caption_only) and _obs_looks_failed_or_thin(_forced_obs_str) and can_transcribe:
                     print("[AGENT] link_preview thin/failed → fallback transcribe_video")
                     tw = _parse_target_words(_intent_low)
                     targs: Dict[str, Any] = {
@@ -2949,6 +3011,16 @@ def run_agent(
                     "timestamps": False,
                     "user_request": (_intent_text or "")[:500],
                 }
+                if vplan is not None:
+                    if vplan.question:
+                        tool_args["question"] = vplan.question
+                    # Caption/description/stats ride along ONLY if the user asked for them.
+                    if vplan.wants_caption:
+                        tool_args["include_caption"] = True
+                    if vplan.wants_stats:
+                        tool_args["include_stats"] = True
+                    if vplan.target_words and not tw:
+                        tw = vplan.target_words
                 if not tw and spoken_mode == "summary":
                     _il = (_intent_low or "")
                     if any(
@@ -2980,7 +3052,7 @@ def run_agent(
                     )
                 direct = _last_tool_obs_for_user(messages)
                 # Never serve YouTube description/promo as a transcript/summary
-                if direct:
+                if direct and spoken_mode != "answer":
                     try:
                         from agent_tools import _looks_like_youtube_description
                         if _looks_like_youtube_description(direct):
@@ -3111,7 +3183,11 @@ def run_agent(
                     except Exception as _ue:
                         print(f"[AGENT] untranslated-dump gate skip: {_ue}")
 
-                if direct and len(direct) >= 20:
+                _verify_followup = bool(
+                    vplan is not None and vplan.verify and direct
+                    and _tool_allowed_for_chat(chat_id, "web_search")
+                )
+                if direct and len(direct) >= 20 and not _verify_followup:
                     print(
                         "[AGENT] force transcribe/preview → direct OBS reply "
                         f"(chars={len(direct)}, starts={direct[:40]!r})"
@@ -3135,7 +3211,28 @@ def run_agent(
                         "Do NOT call transcribe_video or browse_url again this turn."
                     ),
                 })
-                tools_for_next = None  # synthesis only — no tool schema payload
+                if _verify_followup:
+                    # "Is this true?" — the video's claims are above; allow exactly one
+                    # web_search so the verdict is checked, not guessed.
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "EXCEPTION to the above: the user asked whether the video is TRUE. "
+                            "Call web_search ONCE with a precise query built from the video's central "
+                            "claim (use correct brand/product names, e.g. Anthropic / Claude Code — "
+                            "never ASR-garbled spellings). Then reply in the user's language: what the "
+                            "video claims, what the search shows (cite what you actually found), and a "
+                            "clear verdict. If the search finds nothing credible say so plainly — do not "
+                            "pad with unrelated results."
+                        ),
+                    })
+                    tools_for_next = [
+                        s_ for s_ in (_schemas_for_chat(chat_id) or [])
+                        if (s_.get("function") or {}).get("name") == "web_search"
+                    ] or None
+                    print("[AGENT] verify follow-up — web_search enabled for one step")
+                else:
+                    tools_for_next = None  # synthesis only — no tool schema payload
                 # Long summary / transcript needs a higher completion budget
                 if tw and tw >= 400:
                     # stashed for the model call below

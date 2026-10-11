@@ -43,13 +43,17 @@ class FakeAudio:
 
 class FakeChat:
     def __init__(self, behaviors):
-        self.behaviors = list(behaviors)
+        self.fn = behaviors if callable(behaviors) else None
+        self.behaviors = [] if self.fn else list(behaviors)
         self.calls = []
         self.completions = self
 
     def create(self, **kw):
         self.calls.append(kw)
-        b = self.behaviors.pop(0)
+        if self.fn:
+            b = self.fn(kw)
+        else:
+            b = self.behaviors.pop(0)
         if isinstance(b, Exception):
             raise b
         return NS(choices=[NS(message=NS(content=b))])
@@ -112,7 +116,7 @@ r = vp.understand_voice(tmp_audio(), groq_client=groq, known_names=["Zaheer"])
 check("devanagari -> roman via LLM", r.text.startswith("Aaj 4 baje ka reminder") and not vp.has_non_latin(r.text), r.text)
 check("normalized_by=llm", r.normalized_by == "llm")
 check("addressed flag parsed", r.addressed_to_bot is True)
-check("2nd model used after 429", [c["model"] for c in groq.chat.calls] == ["openai/gpt-oss-20b", "llama-3.1-8b-instant"])
+check("2nd model used after 429", [c["model"] for c in groq.chat.calls] == ["openai/gpt-oss-20b", "qwen/qwen3.6-27b"])
 check("gpt-oss got reasoning_effort=low", groq.chat.calls[0].get("extra_body") == {"reasoning_effort": "low"})
 check("json_object mode requested", groq.chat.calls[0].get("response_format") == {"type": "json_object"})
 check("whisper got priming prompt + verbose_json", "reminder" in groq.audio.transcriptions.calls[0]["prompt"]
@@ -262,6 +266,67 @@ if at is not None:
     at._client_ai = FakeClient(chat=FakeChat([]))
     out = at._tool_cancel_reminders({"query": "sab"}, ctx)
     check("'sab' cancels all with zero LLM calls", q.updated == ["r1", "r2"] and not at._client_ai.chat.calls, out)
+
+
+# ---------------------------------------------------------------- 130 s note: chunking / dead model / partial / relative sanity
+import re as _re
+
+def roman_fn(kw):
+    """Fake cleanup LLM: ASCII-ifies the chunk, keeps digits (so order is checkable)."""
+    payload = json.loads(kw["messages"][1]["content"])
+    raw = payload["transcript"]
+    if "FAILME" in raw:
+        raise Exception("429 rate limited")
+    txt = "".join("a" if ord(c) > 127 else c for c in raw)
+    return json.dumps({"text": txt, "language": "roman_urdu", "addressed_to_bot": "7." in raw,
+                       "references_previous_link": False, "unclear": False})
+
+sent_ur = [f"یہ جملہ نمبر {i}. " + "بات " * 12 + "ہے۔" for i in range(30)]
+raw_long = " ".join(sent_ur)
+llm_json._dead.clear()
+groq = FakeClient(audio=FakeAudio([whisper_res(raw_long, segs=[seg(x) for x in sent_ur], dur=130.8)]),
+                  chat=FakeChat(roman_fn))
+r = vp.understand_voice(tmp_audio(), groq_client=groq)
+nums = [int(x) for x in _re.findall(r"(\d+)\.", r.text)]
+check("long note split into several LLM calls", len(groq.chat.calls) >= 3, len(groq.chat.calls))
+check("chunks reassembled in original order", nums == sorted(nums) and len(nums) == 30, nums[:8])
+check("long note fully Latin after cleanup", not vp.has_non_latin(r.text) and r.normalized_by == "llm")
+check("flags OR-ed across chunks (addressed in chunk 7)", r.addressed_to_bot is True)
+
+sent_f = list(sent_ur); sent_f[12] = sent_f[12] + " FAILME"
+groq = FakeClient(audio=FakeAudio([whisper_res(" ".join(sent_f), segs=[seg(x) for x in sent_f])]), chat=FakeChat(roman_fn))
+r = vp.understand_voice(tmp_audio(), groq_client=groq)
+check("one failing chunk -> partial, rest still cleaned", r.normalized_by == "partial" and vp.has_non_latin(r.text) and "a" in r.text)
+
+# retired model (the real 404 from prod) is benched, not retried
+llm_json._dead.clear()
+def dead_then_ok(kw):
+    if kw["model"] == "openai/gpt-oss-20b":
+        raise Exception("Error code: 404 - The model `openai/gpt-oss-20b` does not exist or you do not have access to it.")
+    return GOOD
+c = FakeChat(dead_then_ok)
+groq = FakeClient(audio=FakeAudio([whisper_res(DEV, segs=[seg(DEV)]), whisper_res(DEV, segs=[seg(DEV)])]), chat=c)
+vp.understand_voice(tmp_audio(), groq_client=groq)
+first_models = [x["model"] for x in c.calls]
+vp.understand_voice(tmp_audio(), groq_client=groq)
+second_models = [x["model"] for x in c.calls[len(first_models):]]
+check("404 model benched: not retried on next note", "openai/gpt-oss-20b" in first_models and "openai/gpt-oss-20b" not in second_models, (first_models, second_models))
+
+# live /models list filters retired ids up-front
+llm_json._dead.clear(); llm_json._avail_cache.clear()
+c = FakeChat(GOOD)
+cl = FakeClient(audio=FakeAudio([whisper_res(DEV, segs=[seg(DEV)])]), chat=c)
+cl.models = NS(list=lambda: NS(data=[NS(id="qwen/qwen3.6-27b"), NS(id="whisper-large-v3")]))
+vp.understand_voice(tmp_audio(), groq_client=cl)
+check("model absent from /models never called", [x["model"] for x in c.calls] == ["qwen/qwen3.6-27b"])
+llm_json._avail_cache.clear()
+
+# relative script threshold: mostly-converted Urdu+English mix accepted, untouched Urdu rejected
+raw_mix = "یہ " * 40 + "research calling recording " * 4
+out_ok = "yeh " * 40 + "research calling recording " * 4 + " ہے ہے"
+check("mostly-converted output accepted", vp._sane_reason(raw_mix, out_ok) == "")
+check("untouched Urdu rejected with reason", vp._sane_reason(raw_mix, raw_mix).startswith("not_transliterated"))
+check("chunker never exceeds hard limit", all(len(c) <= 700 for c in vp._chunk_for_llm(["word " * 900])))
 
 print("\nall passed" if FAILS == 0 else f"\n{FAILS} failure(s)")
 sys.exit(1 if FAILS else 0)

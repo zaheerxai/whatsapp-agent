@@ -132,34 +132,80 @@ def _whisper(groq_client, path: str, prompt: str, models: Sequence[str]):
     raise last or RuntimeError("no whisper model configured")
 
 
-def extract_clean_text(res: Any) -> str:
-    """Join segments, dropping silence/looping hallucinations by Whisper's own stats."""
-    segs = _g(res, "segments") or []
+def _kept_segments(res: Any) -> List[str]:
+    """Segment texts that survive Whisper's own silence/looping statistics."""
     kept: List[str] = []
-    for s in segs:
-        t = (_g(s, "text", "") or "").strip()
+    for sg in (_g(res, "segments") or []):
+        t = (_g(sg, "text", "") or "").strip()
         if not t:
             continue
-        nsp = float(_g(s, "no_speech_prob", 0.0) or 0.0)
-        lp = float(_g(s, "avg_logprob", 0.0) or 0.0)
-        cr = float(_g(s, "compression_ratio", 0.0) or 0.0)
+        nsp = float(_g(sg, "no_speech_prob", 0.0) or 0.0)
+        lp = float(_g(sg, "avg_logprob", 0.0) or 0.0)
+        cr = float(_g(sg, "compression_ratio", 0.0) or 0.0)
         if (nsp > 0.6 and lp < -1.0) or cr > 2.4:
             continue
         kept.append(t)
-    if segs:
-        return re.sub(r"\s+", " ", " ".join(kept)).strip()
+    return kept
+
+
+def extract_clean_text(res: Any) -> str:
+    """Join segments, dropping silence/looping hallucinations by Whisper's own stats."""
+    if _g(res, "segments"):
+        return re.sub(r"\s+", " ", " ".join(_kept_segments(res))).strip()
     return re.sub(r"\s+", " ", (_g(res, "text", "") or "")).strip()
 
 
-def _sane(raw: str, out: str) -> bool:
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?\u061F\u06D4\u0964])\s+")
+
+
+def _chunk_for_llm(pieces: List[str], target: int = 450, hard: int = 700) -> List[str]:
+    """Group sentences/segments into ~target-char chunks. A 130 s Urdu note in ONE LLM
+    call failed validation in prod; short chunks are reliable and run in parallel."""
+    flat: List[str] = []
+    for p in pieces:
+        flat.extend(x for x in _SENT_SPLIT_RE.split(p) if x.strip())
+    chunks: List[str] = []
+    cur = ""
+    for piece in flat:
+        while len(piece) > hard:  # pathological unpunctuated run: split on whitespace
+            cut = piece.rfind(" ", 0, hard)
+            cut = cut if cut > 0 else hard
+            if cur:
+                chunks.append(cur.strip()); cur = ""
+            chunks.append(piece[:cut].strip())
+            piece = piece[cut:].strip()
+        if cur and len(cur) + 1 + len(piece) > target:
+            chunks.append(cur.strip()); cur = piece
+        else:
+            cur = f"{cur} {piece}".strip()
+    if cur.strip():
+        chunks.append(cur.strip())
+    return chunks or [" ".join(pieces).strip()]
+
+
+def _sane_reason(raw: str, out: str) -> str:
+    """'' = ok, else why the cleanup output was rejected (logged for diagnosis)."""
     if not out or not out.strip():
-        return False
+        return "empty"
     lr, lo = len(raw), len(out)
-    if lr >= 20 and (lo > lr * 3.5 + 80 or lo < lr * 0.15):
-        return False  # hallucinated summary / dropped content
-    if has_non_latin(raw) and _non_latin_ratio(out) > 0.3:
-        return False  # failed to transliterate
-    return True
+    if lr >= 20 and lo > lr * 3.5 + 80:
+        return f"too_long out={lo} raw={lr}"
+    if lr >= 20 and lo < lr * 0.15:
+        return f"too_short out={lo} raw={lr}"
+    if has_non_latin(raw):
+        r_in, r_out = _non_latin_ratio(raw), _non_latin_ratio(out)
+        # Must have converted most of it. Relative, so Urdu with many English words
+        # (already-Latin share) is judged fairly.
+        if r_out > max(0.15, 0.5 * r_in):
+            return f"not_transliterated in={r_in:.2f} out={r_out:.2f}"
+    return ""
+
+
+def _sane(raw: str, out: str) -> bool:
+    why = _sane_reason(raw, out)
+    if why:
+        log.warning("voice.normalize rejected output: %s", why)
+    return not why
 
 
 def _normalize(
@@ -186,7 +232,7 @@ def _normalize(
         groq_models=llm_models,
         gemini_client=gemini_client,
         gemini_model=gemini_model,
-        max_tokens=max(500, min(2500, int(len(raw) * 1.2) + 350)),
+        max_tokens=max(600, min(2500, int(len(raw) * 1.2) + 450)),
         validator=lambda o: _sane(raw, str(o.get("text") or "")),
         tag="voice.normalize",
     )
@@ -227,25 +273,47 @@ def understand_voice(
     if not (has_non_latin(raw) or need_flags or ALWAYS_NORMALIZE):
         return out  # already clean Latin text and no routing flags needed
 
-    obj = _normalize(
-        raw,
-        asr_language=out.language,
-        known_names=known_names,
-        recent_chat=recent_chat,
-        groq_client=groq_client,
-        gemini_client=gemini_client,
-        gemini_model=gemini_model,
-        llm_models=llm_models or LLM_MODELS,
-    )
-    if obj is None:
+    models = llm_models or LLM_MODELS
+    pieces = _kept_segments(res) or [raw]
+    # Non-Latin (or long) transcripts are cleaned in short chunks; clean Latin text
+    # only needs flags, so one call on the whole thing.
+    chunks = _chunk_for_llm(pieces) if has_non_latin(raw) else [raw[:6000]]
+
+    def _one(i: int):
+        return _normalize(
+            chunks[i],
+            asr_language=out.language,
+            known_names=known_names,
+            recent_chat=recent_chat if i == 0 else "",
+            groq_client=groq_client,
+            gemini_client=gemini_client,
+            gemini_model=gemini_model,
+            llm_models=models,
+        )
+
+    if len(chunks) == 1:
+        results = [_one(0)]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_one, range(len(chunks))))
+
+    ok = [r for r in results if r is not None]
+    if not ok:
         out.normalized_by = "raw"
-        log.warning("voice normalize failed on all models — keeping raw ASR text")
+        log.warning("voice normalize failed on all models (%d chunk(s)) — keeping raw ASR text", len(chunks))
         return out
 
-    out.text = str(obj.get("text") or raw).strip()
-    out.language = str(obj.get("language") or out.language)
-    out.addressed_to_bot = bool(obj.get("addressed_to_bot"))
-    out.references_previous_link = bool(obj.get("references_previous_link"))
-    out.unclear = bool(obj.get("unclear"))
-    out.normalized_by = "llm"
+    texts = [
+        str(r.get("text") or chunks[i]).strip() if r is not None else chunks[i]
+        for i, r in enumerate(results)
+    ]
+    out.text = re.sub(r"[ \t]+", " ", " ".join(t for t in texts if t)).strip()
+    out.language = str(ok[0].get("language") or out.language)
+    out.addressed_to_bot = any(bool(r.get("addressed_to_bot")) for r in ok)
+    out.references_previous_link = any(bool(r.get("references_previous_link")) for r in ok)
+    out.unclear = all(bool(r.get("unclear")) for r in ok)
+    out.normalized_by = "llm" if len(ok) == len(results) else "partial"
+    if out.normalized_by == "partial":
+        log.warning("voice normalize partial: %d/%d chunks cleaned", len(ok), len(results))
     return out

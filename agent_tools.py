@@ -484,10 +484,10 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "link_preview",
             "description": (
-                "Fetch public link metadata only: title, caption/description, author. "
-                "NO speech-to-text, NO audio download. Use for 'ye kya hai' / 'what is this' "
-                "on Instagram/Facebook/TikTok when full transcript is unnecessary, blocked, "
-                "or private. Prefer this over transcribe_video for quick about/caption asks. "
+                "Fetch public link metadata only (Supadata /metadata): title, caption/description, "
+                "author, and optionally stats/tags/date/duration. NO speech-to-text. Use for 'caption / "
+                "description / hashtags / likes / who posted' asks, quick 'ye kya hai' on IG/FB/TikTok, "
+                "or when audio is blocked/private. Request ONLY the fields the user asked for. "
                 "Do NOT invent captions."
             ),
             "parameters": {
@@ -496,6 +496,17 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "url": {
                         "type": "string",
                         "description": "Full https URL (Instagram reel, Facebook video, TikTok, etc.)",
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["title", "caption", "author", "stats", "tags", "date", "duration"],
+                        },
+                        "description": (
+                            "Which parts to return. Default [title, caption, author]. Add stats "
+                            "(likes/views/comments) / tags / date / duration ONLY if the user asked."
+                        ),
                     },
                 },
                 "required": ["url"],
@@ -511,7 +522,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "Use when user asks for transcript / summary / key points / 'is video me kya bola'. "
                 "ALWAYS call again if user changes mode or asks for a longer/shorter version — "
                 "do not invent from memory. "
-                "mode: transcript | summary | key_points. "
+                "mode: transcript | summary | key_points | answer. "
+                "Use mode=answer (with question=...) for ANY specific question about the video's content "
+                "('is this true?', 'give me the steps', 'what does he say about X'). "
+                "Set include_caption / include_stats true ONLY when the user explicitly asks for the "
+                "caption/description/hashtags or likes/views/date. "
                 "If user asks for N words (e.g. 400-word summary), set target_words=N. "
                 "Do NOT use for voice notes already transcribed in the chat. "
                 "If audio is blocked, prefer link_preview for caption/about."
@@ -525,8 +540,9 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["transcript", "summary", "key_points"],
+                        "enum": ["transcript", "summary", "key_points", "answer"],
                         "description": (
+                            "answer = answer `question` from the video's speech. "
                             "transcript = cleaned spoken text. "
                             "summary = overview (use with target_words if user asks for length). "
                             "key_points = bullet list only."
@@ -551,6 +567,20 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "timestamps": {
                         "type": "boolean",
                         "description": "If true, include [MM:SS] timestamps (transcript mode)",
+                        "default": False,
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "mode=answer: the user's question about the video, standalone.",
+                    },
+                    "include_caption": {
+                        "type": "boolean",
+                        "description": "Append the post caption/description/hashtags. ONLY if the user asked.",
+                        "default": False,
+                    },
+                    "include_stats": {
+                        "type": "boolean",
+                        "description": "Append creator + likes/views/comments/date. ONLY if the user asked.",
                         "default": False,
                     },
                 },
@@ -2746,6 +2776,168 @@ def _extract_youtube_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+# ---------------------------------------------------------------------------
+# Media identity, cached Supadata metadata, and caption/stats formatting.
+#   /v1/transcript -> what was SAID   (transcribe_video)
+#   /v1/metadata   -> title / caption(description) / author / stats / tags / date
+#                     (link_preview, and transcribe_video(include_caption=...))
+# Caption/stats are returned ONLY when the router/user asked for them.
+# ---------------------------------------------------------------------------
+_META_CACHE: Dict[str, tuple] = {}  # media_key -> (flat dict, exp)
+_META_TTL = 1800
+
+
+def _media_key(url: str) -> str:
+    """Stable id for caching speech/metadata across question follow-ups on the same
+    video. YouTube keeps its bare video id (agent_loop reads _RAW_SPEECH_CACHE by it)."""
+    import hashlib
+    from urllib.parse import urlparse, parse_qs
+    yid = _extract_youtube_id(url or "")
+    if yid:
+        return yid
+    u = (url or "").strip()
+    try:
+        if _is_instagram_url(u) or _is_facebook_url(u):
+            u = _normalize_ig_fb_url(u)
+    except Exception:
+        pass
+    pr = urlparse(u)
+    host = pr.netloc.lower()
+    for pre in ("www.", "m."):
+        if host.startswith(pre):
+            host = host[len(pre):]
+    q = ""
+    if "facebook.com" in host or "fb.watch" in host:
+        v = parse_qs(pr.query).get("v")
+        q = f"?v={v[0]}" if v else ""
+    return "m:" + hashlib.sha1(f"{host}{pr.path.rstrip('/')}{q}".encode()).hexdigest()[:16]
+
+
+def _flatten_supadata_meta(data: dict) -> dict:
+    data = data or {}
+    post = data.get("post") or {}
+    author = data.get("author") or data.get("authorName") or {}
+    if not isinstance(author, dict):
+        author = {"displayName": str(author)}
+    stats = data.get("stats") or {}
+    media = data.get("media") or {}
+    title = data.get("title") or post.get("title") or ""
+    if isinstance(title, dict):
+        title = title.get("text") or ""
+    return {
+        "platform": data.get("platform") or "",
+        "title": str(title or "").strip(),
+        "caption": str(
+            data.get("description") or data.get("caption")
+            or post.get("description") or post.get("caption") or ""
+        ).strip(),
+        "author_name": str(author.get("displayName") or author.get("name") or "").strip(),
+        "username": str(author.get("username") or author.get("handle") or "").strip(),
+        "verified": bool(author.get("verified")),
+        "likes": stats.get("likes"),
+        "views": stats.get("views"),
+        "comments": stats.get("comments"),
+        "shares": stats.get("shares"),
+        "duration": media.get("duration"),
+        "tags": [str(t) for t in (data.get("tags") or []) if t],
+        "created": str(data.get("createdAt") or "")[:10],
+    }
+
+
+def _supadata_metadata(url: str) -> Optional[dict]:
+    """Structured /v1/metadata (cached 30 min so follow-up questions cost nothing)."""
+    api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
+    if not api_key:
+        return None
+    mk = _media_key(url)
+    ent = _META_CACHE.get(mk)
+    if ent and ent[1] > time.time():
+        return ent[0]
+    try:
+        r = requests.get(
+            "https://api.supadata.ai/v1/metadata",
+            params={"url": url},
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"[metadata] Supadata HTTP {r.status_code}")
+            return None
+        flat = _flatten_supadata_meta(r.json() or {})
+        if not any((flat["title"], flat["caption"], flat["author_name"], flat["username"])):
+            return None
+        _META_CACHE[mk] = (flat, time.time() + _META_TTL)
+        return flat
+    except Exception as e:
+        print(f"[metadata] Supadata error: {e}")
+        return None
+
+
+def _fmt_count(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    return f"{n/1_000_000:.1f}M" if n >= 1_000_000 else (f"{n/1000:.1f}K" if n >= 10_000 else str(n))
+
+
+def _format_media_info(m: dict, fields) -> str:
+    """Render ONLY the requested fields: title|caption|author|stats|tags|date|duration."""
+    f = set(fields or ())
+    out: List[str] = []
+    if "author" in f and (m.get("author_name") or m.get("username")):
+        who = m.get("author_name") or ""
+        if m.get("username"):
+            who = f"{who} (@{m['username']})".strip()
+        out.append(f"*Creator:* {who}{' ✓' if m.get('verified') else ''}")
+    if "title" in f and m.get("title"):
+        out.append(f"*Title:* {m['title']}")
+    if "caption" in f and m.get("caption"):
+        out.append("*Caption / description:*\n" + m["caption"][:1800])
+    if "stats" in f:
+        parts = [
+            f"{icon} {_fmt_count(m.get(k))}"
+            for k, icon in (("views", "👁"), ("likes", "❤️"), ("comments", "💬"), ("shares", "↗️"))
+            if _fmt_count(m.get(k))
+        ]
+        if parts:
+            out.append("*Stats:* " + " · ".join(parts))
+    if "tags" in f and m.get("tags"):
+        out.append("*Tags:* " + " ".join("#" + t.lstrip("#") for t in m["tags"][:15]))
+    if "date" in f and m.get("created"):
+        out.append(f"*Posted:* {m['created']}")
+    if "duration" in f and m.get("duration"):
+        try:
+            d = int(float(m["duration"]))
+            out.append(f"*Duration:* {d // 60}:{d % 60:02d}")
+        except (TypeError, ValueError):
+            pass
+    return "\n".join(out)
+
+
+def _media_info_block(url: str, caption: bool = False, stats: bool = False) -> str:
+    """Extra block appended to a transcript/answer ONLY when the user asked for it."""
+    fields = []
+    if caption:
+        fields += ["title", "caption", "tags"]
+    if stats:
+        fields += ["author", "stats", "date", "duration"]
+    if not fields:
+        return ""
+    m = _supadata_metadata(url)
+    if m:
+        return _format_media_info(m, fields)
+    if caption:  # no key / API down: text-only fallbacks still have the caption
+        for fn in (_try_ytdlp_metadata_about, _try_oembed_about):
+            try:
+                body = fn(url)
+            except Exception:
+                body = None
+            if body and len(body.strip()) >= 8:
+                return "*Caption / description:*\n" + body.strip()[:1800]
+    return ""
+
+
 def _cache_key(url: str, language: str, timestamps: bool) -> str:
     # v3: bust entries that cached refine-hallucinated YouTube description
     return f"v3|{url.strip().lower()}|{language or 'auto'}|{int(bool(timestamps))}"
@@ -3702,6 +3894,9 @@ def _refine_transcript_compact(
     system_core = (
         "You turn a raw video transcript into a WhatsApp reply.\n"
         "CRITICAL: Use ONLY facts from the transcript. Do not invent.\n"
+        "The transcript is automatic speech recognition: repair obviously garbled brand/"
+        "product/person names from context and world knowledge (e.g. 'एंत्रोफिक' -> Anthropic, "
+        "'क्लोड कोड' -> Claude Code); if unsure, give your best guess followed by (?).\n"
         "Never end mid-sentence.\n"
         f"{script_rule}\n"
         f"{format_rule}"
@@ -4368,59 +4563,22 @@ def _try_ytdlp_metadata_about(url: str) -> Optional[str]:
 
 
 def _try_supadata_metadata(url: str) -> Optional[str]:
-    """Optional Supadata /metadata for IG/FB/TikTok when key is set."""
-    api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
-    if not api_key:
+    """Creator + title + caption as text (used by the 'about' fallback cascade)."""
+    m = _supadata_metadata(url)
+    if not m:
         return None
-    try:
-        r = requests.get(
-            "https://api.supadata.ai/v1/metadata",
-            params={"url": url},
-            headers={"x-api-key": api_key, "Accept": "application/json"},
-            timeout=30,
-        )
-        if r.status_code != 200:
-            print(f"[transcribe_video] Supadata metadata HTTP {r.status_code}")
-            return None
-        data = r.json() or {}
-        # Flexible field names across platform payloads
-        title = (
-            data.get("title")
-            or (data.get("post") or {}).get("title")
-            or ""
-        )
-        if isinstance(title, dict):
-            title = title.get("text") or ""
-        desc = (
-            data.get("description")
-            or data.get("caption")
-            or (data.get("post") or {}).get("description")
-            or (data.get("post") or {}).get("caption")
-            or ""
-        )
-        author_raw = data.get("author") or data.get("authorName") or ""
-        if isinstance(author_raw, dict):
-            author = (
-                author_raw.get("name")
-                or author_raw.get("username")
-                or author_raw.get("handle")
-                or ""
-            )
-        else:
-            author = author_raw or ""
-        parts = []
-        if author:
-            parts.append(f"Creator: {str(author).strip()}")
-        if title:
-            parts.append(f"Title: {str(title).strip()}")
-        if desc:
-            parts.append(str(desc).strip()[:2500])
-        text = "\n".join(p for p in parts if p).strip()
-        if text and len(text) >= 8:
-            print(f"[transcribe_video] Supadata metadata OK chars={len(text)}")
-            return text
-    except Exception as e:
-        print(f"[transcribe_video] Supadata metadata error: {e}")
+    parts = []
+    who = m.get("author_name") or m.get("username")
+    if who:
+        parts.append(f"Creator: {who}")
+    if m.get("title"):
+        parts.append(f"Title: {m['title']}")
+    if m.get("caption"):
+        parts.append(m["caption"][:2500])
+    text = "\n".join(parts).strip()
+    if len(text) >= 8:
+        print(f"[transcribe_video] Supadata metadata OK chars={len(text)}")
+        return text
     return None
 
 
@@ -4854,7 +5012,7 @@ def _transcribe_with_groq(audio_path: str, language: str) -> str:
     return (getattr(result, "text", None) or str(result) or "").strip()
 
 
-def _tool_transcribe_video(args: dict, ctx: dict) -> str:
+def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
     url = (args.get("url") or "").strip()
     language = (args.get("language") or "auto").strip().lower() or "auto"
     with_ts = bool(args.get("timestamps"))
@@ -4891,30 +5049,31 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             return cached
 
     yt_id = _extract_youtube_id(url)
+    # Raw speech is cached for EVERY platform (was YouTube-only): a reel question,
+    # then "is it true?", then "steps?" must not re-bill the transcript API each time.
+    mkey = yt_id or _media_key(url)
 
     def _raw_cache_get() -> Optional[str]:
-        if not yt_id:
-            return None
-        entry = _RAW_SPEECH_CACHE.get(yt_id)
+        entry = _RAW_SPEECH_CACHE.get(mkey)
         if not entry:
             return None
         text, exp = entry
         if time.time() > exp:
-            _RAW_SPEECH_CACHE.pop(yt_id, None)
+            _RAW_SPEECH_CACHE.pop(mkey, None)
             return None
         if _looks_like_youtube_description(text):
-            _RAW_SPEECH_CACHE.pop(yt_id, None)
+            _RAW_SPEECH_CACHE.pop(mkey, None)
             return None
         return text
 
     def _raw_cache_set(text: str, source: str) -> None:
-        if not yt_id or not text or _looks_like_youtube_description(text):
+        if not text or _looks_like_youtube_description(text):
             return
-        if len(text) < 120:
+        if len(text) < (120 if yt_id else 40):
             return
-        _RAW_SPEECH_CACHE[yt_id] = (text, time.time() + _RAW_SPEECH_TTL)
+        _RAW_SPEECH_CACHE[mkey] = (text, time.time() + _RAW_SPEECH_TTL)
         msg = (
-            f"[transcribe_video] RAW_CACHE store id={yt_id} "
+            f"[transcribe_video] RAW_CACHE store id={mkey} "
             f"source={source} chars={len(text)}"
         )
         print(msg)
@@ -4941,8 +5100,10 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             raise RuntimeError(
                 f"raw_is_description source={source} chars={len(raw_body)}"
             )
-        # Persist real speech for other modes (transcript ↔ summary)
+        # Persist real speech for other modes (transcript ↔ summary ↔ answer)
         _raw_cache_set(raw_body, source)
+        if args.get("_raw_only"):  # answer mode wants the speech itself, no render/refine
+            return f"Source: {source} | mode=raw\n\n{raw_body}"
 
         out_lang = "roman_urdu"
         if language in ("en", "english"):
@@ -5045,7 +5206,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
     cached_raw = _raw_cache_get()
     if cached_raw:
         msg = (
-            f"[transcribe_video] RAW_CACHE hit id={yt_id} "
+            f"[transcribe_video] RAW_CACHE hit id={mkey} "
             f"chars={len(cached_raw)} mode={mode}"
         )
         print(msg)
@@ -5053,7 +5214,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
             logging.getLogger("mojo").info(msg)
         except Exception:
             pass
-        packed = _take(f"raw_cache({yt_id})", cached_raw)
+        packed = _take(f"raw_cache({mkey})", cached_raw)
         if packed:
             return packed
 
@@ -5269,8 +5430,119 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
         )
 
 
+_ANSWER_SYSTEM = """You answer a WhatsApp user's question about a video using ONLY the material provided: SPEECH (automatic transcription, may contain recognition errors) and optionally CAPTION (the creator's post text).
+Rules:
+1. Answer the QUESTION directly and concretely. If they ask for steps, give numbered steps exactly as the video describes them. Never invent steps, prices or facts the video does not contain; if the video does not say, say so plainly.
+2. Repair obviously garbled brand/product/person names from context and world knowledge (e.g. 'एंत्रोफिक' / 'Entropic' -> Anthropic, 'क्लोड कोड' -> Claude Code); when unsure add (?).
+3. If the user asks whether it is true / real / a scam: first list in 1-3 bullets what the video CLAIMS; then give an honest assessment based ONLY on what the video itself shows (red flags such as urgency, 'comment to get the link', asking for DMs/payment, unrealistic value, no official source). State clearly what cannot be verified from the video alone. Never claim you checked outside sources.
+4. If SPEECH is empty/unavailable and only CAPTION exists, say the audio was not available and answer from the caption, marked caption-only.
+5. WhatsApp style: short, *bold* with single asterisks, '- ' bullets, no # headers, no tables.
+6. {script_rule}
+Return only the answer text."""
+
+
+def _answer_script_rule(language: str) -> str:
+    language = (language or "auto").lower()
+    if language in ("en", "english"):
+        return "OUTPUT LANGUAGE: English only (Latin letters)."
+    if language in ("urdu_script", "ur"):
+        return "OUTPUT SCRIPT: Urdu (Arabic script)."
+    if language in ("hindi_script", "hi"):
+        return "OUTPUT SCRIPT: Hindi Devanagari."
+    return "OUTPUT SCRIPT: Roman Urdu only (Latin letters), the way a Pakistani types on WhatsApp. Never native Urdu/Hindi script."
+
+
+def _video_answer(args: dict, ctx: dict) -> str:
+    """mode=answer: fetch speech (cached, any platform) and answer THE QUESTION from it."""
+    import llm_json
+    url = (args.get("url") or "").strip()
+    if not url:
+        return "URL required. Example: https://www.youtube.com/watch?v=..."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        if _is_instagram_url(url) or _is_facebook_url(url):
+            url = _normalize_ig_fb_url(url)
+    except Exception:
+        pass
+    language = (args.get("language") or "auto").strip().lower() or "auto"
+    question = (args.get("question") or args.get("user_request") or args.get("query") or "").strip()
+    if not question:
+        question = "Give a clear, concise overview of what this video says."
+
+    got = _tool_transcribe_video_core(
+        {"url": url, "mode": "transcript", "language": language, "timestamps": False, "_raw_only": True},
+        ctx,
+    )
+    head, _, body = (got or "").partition("\n\n")
+    speech, caption_only = "", False
+    if head.startswith("Source:"):
+        if "(about/caption)" in head:
+            caption_only = True
+        else:
+            speech = body.strip()
+    else:
+        return got  # tool's own user-facing failure message (private video, blocked, ...)
+
+    caption = ""
+    if caption_only:
+        caption = body.strip()
+    elif args.get("include_caption") or args.get("include_stats"):
+        caption = _media_info_block(url, bool(args.get("include_caption")), bool(args.get("include_stats")))
+
+    user = (
+        f"QUESTION: {question[:500]}\n\n"
+        f"SPEECH:\n{speech[:24000] if speech else '(not available)'}\n\n"
+        f"CAPTION:\n{caption[:2500] if caption else '(not provided)'}"
+    )
+    long_input = len(speech) > 9000  # Groq free tiers cap ~8K tokens/min -> Gemini takes long ones
+    answer = llm_json.text_chat(
+        _ANSWER_SYSTEM.format(script_rule=_answer_script_rule(language)),
+        user,
+        groq_client=_client_ai,
+        groq_models=[m for m in [_MODEL_NAME, *llm_json.SIDE_MODELS] if m],
+        gemini_client=_client_gemini,
+        gemini_model=_GEMINI_MODEL,
+        max_tokens=1400,
+        timeout=45.0,
+        prefer_gemini=long_input,
+        tag="video_answer",
+    )
+    if not answer:
+        if speech:
+            return ("Source: transcript | mode=answer\n\n"
+                    "Jawab generate nahi ho saka (AI busy). Video ka text ye raha:\n\n" + speech[:1500])
+        return "Video ka audio/caption nahi mila — public link try karo."
+    print(f"[video_answer] OK speech={len(speech)} caption={len(caption)} out={len(answer)}")
+    return f"Source: {'caption' if caption_only else 'transcript'} | mode=answer\n\n{answer}"
+
+
+def _tool_transcribe_video(args: dict, ctx: dict) -> str:
+    """Public entry. modes: transcript | summary | key_points | answer.
+    include_caption / include_stats append post metadata ONLY when requested."""
+    mode = (args.get("mode") or "transcript").strip().lower()
+    if mode == "answer":
+        return _video_answer(args, ctx)
+    out = _tool_transcribe_video_core(args, ctx)
+    want_cap, want_stats = bool(args.get("include_caption")), bool(args.get("include_stats"))
+    if (want_cap or want_stats) and out and not out.startswith("URL required"):
+        url = (args.get("url") or "").strip()
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        try:
+            if _is_instagram_url(url) or _is_facebook_url(url):
+                url = _normalize_ig_fb_url(url)
+        except Exception:
+            pass
+        extra = _media_info_block(url, want_cap, want_stats)
+        if extra:
+            out = out.rstrip() + "\n\n" + extra
+    return out
+
+
 def _tool_link_preview(args: dict, ctx: dict) -> str:
-    """Title + caption + author only — no ASR. Cheap path for IG/FB about asks."""
+    """Post metadata only — no ASR. `fields` picks what to return (default: title,
+    caption, author). Others: stats, tags, date, duration — only when the user asked."""
     url = (args.get("url") or "").strip()
     if not url:
         return "URL required for link_preview."
@@ -5279,11 +5551,20 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
     if _is_instagram_url(url) or _is_facebook_url(url):
         url = _normalize_ig_fb_url(url)
 
-    # Reuse the about cascade (Supadata metadata → yt-dlp info → oEmbed)
-    body = None
-    source = None
+    allowed = {"title", "caption", "author", "stats", "tags", "date", "duration"}
+    fields = [f for f in (args.get("fields") or []) if f in allowed] or ["title", "caption", "author"]
+
+    # 1) Supadata /v1/metadata — the only source with stats / tags / date
+    m = _supadata_metadata(url)
+    if m:
+        body = _format_media_info(m, fields)
+        if body.strip():
+            print(f"[link_preview] OK source=Supadata metadata fields={fields} chars={len(body)}")
+            return "Source: link_preview (Supadata metadata)\n\n" + body
+
+    # 2) text-only fallbacks (caption/title/author only)
+    body, source = None, None
     for fn, name in (
-        (_try_supadata_metadata, "Supadata metadata"),
         (_try_ytdlp_metadata_about, "yt-dlp metadata"),
         (_try_oembed_about, "oEmbed"),
     ):
@@ -5313,8 +5594,9 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
             "Public URL confirm karo."
         )
 
-    lines = [f"Source: link_preview ({source})", "", body.strip()]
-    out = "\n".join(lines)
+    out = f"Source: link_preview ({source})\n\n{body.strip()}"
+    if {"stats", "tags", "date", "duration"} & set(fields):
+        out += "\n\n(Likes/views/date is source se available nahi.)"
     print(f"[link_preview] OK source={source} chars={len(out)}")
     return out
 
