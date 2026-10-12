@@ -128,7 +128,7 @@ check("different reel -> different key", k1 != at._media_key("https://www.instag
 check("YouTube keeps bare video id (agent_loop reads cache by it)", at._media_key("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ")
 
 # link_preview honours `fields`
-at._supadata_metadata = lambda url: flat
+at._supadata_metadata = lambda url, privileged=False: flat
 out = at._tool_link_preview({"url": IG}, {})
 check("link_preview default: caption yes, stats no", "Claude Code free" in out and "Stats" not in out)
 out = at._tool_link_preview({"url": IG, "fields": ["stats", "date"]}, {})
@@ -139,7 +139,7 @@ calls = {"core": 0, "block": 0}
 def fake_core(args, ctx):
     calls["core"] += 1
     return "Source: Supadata | mode=summary\n\nSUMMARY TEXT"
-def fake_block(url, caption=False, stats=False):
+def fake_block(url, caption=False, stats=False, privileged=False):
     calls["block"] += 1
     return "*Caption / description:*\nCAP" if caption else ""
 at._tool_transcribe_video_core, at._media_info_block = fake_core, fake_block
@@ -165,7 +165,7 @@ check("answer mode: ASR brand repair instructed", "Anthropic" in seen["system"] 
 check("answer mode: Roman Urdu rule by default", "Roman Urdu" in seen["system"])
 check("answer mode returns the LLM answer", o.endswith("scam pattern.") and o.startswith("Source: transcript | mode=answer"))
 
-at._media_info_block = lambda url, c=False, s=False: "*Caption / description:*\nREAL CAPTION"
+at._media_info_block = lambda url, c=False, s=False, privileged=False: "*Caption / description:*\nREAL CAPTION"
 o = at._video_answer({"url": IG, "question": "caption me kya likha hai aur kya bola?", "include_caption": True}, {})
 check("answer mode: caption included when asked", "REAL CAPTION" in seen["user"])
 

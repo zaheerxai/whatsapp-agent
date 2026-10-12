@@ -7,6 +7,9 @@ Permission-sensitive tools (send_message_to, python_exec) check OWNER_SENDER_ID.
 
 from __future__ import annotations
 
+import usage_budget
+import github_ops
+import web_search_providers
 import json
 import logging
 import os
@@ -94,6 +97,7 @@ def init_tools(
 
     _supabase = supabase
     _client_ai = client_ai
+    usage_budget.init(supabase)
     _MODEL_NAME = model_name
     _BUSINESS_KNOWLEDGE = business_knowledge or ""
     _DEFAULT_TIMEZONE = default_timezone
@@ -165,6 +169,17 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "description": "How many results (1-8)",
                         "default": 5,
                     },
+                    "recency": {
+                        "type": "string",
+                        "enum": ["", "day", "week", "month", "year"],
+                        "description": "Restrict to results from this recent a period. Use for 'latest/today/this week' asks.",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "enum": ["general", "news"],
+                        "description": "'news' for current-events queries (better ranking/freshness).",
+                        "default": "general",
+                    },
                 },
                 "required": ["query"],
             },
@@ -177,7 +192,12 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "description": (
                 "Fetch live content of a public URL. "
                 "For github.com/username it returns the REAL public repo list via GitHub API "
-                "(sorted by last push). For github.com/user/repo it returns repo metadata. "
+                "(sorted by last push). For github.com/user/repo it returns name/stars/README "
+                "PLUS the actual file tree, auto-grouped into any skill/package catalog it "
+                "contains (use this for 'list all of them' / 'what skills does it have' on a "
+                "repo) — never guess repo contents from the README summary alone. "
+                "github.com/user/repo/tree/<branch>/<path> lists that folder; .../blob/<branch>/<path> "
+                "reads that file's text. "
                 "For other sites it returns page title + main text. "
                 "ALWAYS call this when the user pastes a URL or asks to fetch/open/latest repos "
                 "from a previously shared link. NEVER invent repo names or page content. "
@@ -1881,221 +1901,19 @@ def _format_search_lines(items: list, num: int) -> str:
 
 
 def _tool_web_search(args: dict, ctx: dict) -> str:
-    """Multi-backend web search. Order:
-    1) Serper (if SERPER_API_KEY) — Google-quality, paid free-tier
-    2) ddgs library — multi-engine (bing/brave/ddg/…), no API key
-    3) DuckDuckGo Instant Answer JSON — weak for company/LinkedIn queries
-    4) html.duckduckgo.com / lite.duckduckgo.com — last-resort HTML
-
-    Previous failure mode (logs 2026-08-31): no Serper key → Instant Answer
-    empty for "iSeeWaves LinkedIn" → lite.duckduckgo.com ConnectTimeout from
-    the host. Never fall through was also a bug when Serper raised.
+    """Multi-provider web search — see web_search_providers.py for the full chain
+    (Tavily -> Serper -> Gemini grounding -> ddgs) and the relevance gate that replaced
+    the old single-shared-token check (prod bug: a query about "the EU AI Act" matched
+    a Wikipedia "Europe" page on the shared token "the").
     """
     query = (args.get("query") or "").strip()
     num = min(max(int(args.get("num_results") or 5), 1), 8)
+    recency = (args.get("recency") or "").strip().lower()
+    topic = (args.get("topic") or "general").strip().lower()
     if not query:
         return "Empty query."
+    return web_search_providers.search(query, num=num, recency=recency, topic=topic)
 
-    errors: list = []
-
-    # 1) Serper — only if configured; on failure CONTINUE (do not return)
-    serper_key = (os.getenv("SERPER_API_KEY") or "").strip()
-    if serper_key:
-        try:
-            r = requests.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-                json={"q": query, "num": num},
-                timeout=12,
-            )
-            r.raise_for_status()
-            data = r.json()
-            lines = []
-            for item in (data.get("organic") or [])[:num]:
-                title = item.get("title", "")
-                snippet = item.get("snippet", "")
-                link = item.get("link", "")
-                lines.append(f"• {title}\n  {snippet}\n  {link}".rstrip())
-            if data.get("answerBox"):
-                ab = data["answerBox"]
-                lines.insert(
-                    0,
-                    f"Answer box: {ab.get('answer') or ab.get('snippet') or ''}",
-                )
-            if lines:
-                return "\n\n".join(lines)
-            errors.append("serper: empty organic")
-        except Exception as e:
-            errors.append(f"serper: {e}")
-            print(f"[web_search serper] {e}")
-
-    # 2) ddgs (pip install ddgs) — robust multi-backend, no key
-    #    Verified: returns real linkedin.com URLs for company queries.
-    try:
-        from ddgs import DDGS  # type: ignore
-
-        results = []
-        weak_candidate = None
-        # Prefer google — auto/bing often return unrelated hits for brand queries.
-        # Fall through backends on empty or exception (rate limits / blocks).
-        q_tokens = [t.lower() for t in query.split() if len(t) > 2]
-        for backend in ("google", "bing,brave", "duckduckgo", "auto"):
-            try:
-                results = list(
-                    DDGS().text(query, max_results=num, backend=backend)
-                ) or []
-            except TypeError:
-                try:
-                    with DDGS() as ddgs:
-                        results = list(
-                            ddgs.text(query, max_results=num, backend=backend)
-                        ) or []
-                except TypeError:
-                    results = list(DDGS().text(query, max_results=num)) or []
-            except Exception as be:
-                print(f"[web_search ddgs backend={backend}] {be}")
-                results = []
-            formatted = _format_search_lines(results, num)
-            if not formatted:
-                continue
-            low = formatted.lower()
-            if not q_tokens or any(t in low for t in q_tokens):
-                return formatted
-            # Unrelated SERP noise — keep as last resort, try next backend
-            weak_candidate = formatted
-            errors.append(f"ddgs:{backend}: weak match")
-        if weak_candidate:
-            return weak_candidate
-        errors.append("ddgs: empty results on all backends")
-    except ImportError:
-        errors.append("ddgs: not installed (pip install ddgs)")
-    except Exception as e:
-        errors.append(f"ddgs: {e}")
-        print(f"[web_search ddgs] {e}")
-
-    # 3) DuckDuckGo Instant Answer — often empty for company/LinkedIn queries
-    try:
-        r = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=10,
-            headers={"User-Agent": "MojoAgent/1.0"},
-        )
-        data = r.json()
-        parts = []
-        if data.get("AbstractText"):
-            parts.append(
-                f"Abstract: {data['AbstractText']}\nSource: {data.get('AbstractURL', '')}"
-            )
-        for topic in (data.get("RelatedTopics") or [])[:num]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                url = ""
-                if topic.get("FirstURL"):
-                    url = f"\n  {topic['FirstURL']}"
-                parts.append(f"• {topic['Text']}{url}")
-            elif isinstance(topic, dict) and "Topics" in topic:
-                for t in topic["Topics"][:2]:
-                    if t.get("Text"):
-                        parts.append(f"• {t['Text']}")
-        if parts:
-            return "\n".join(parts)
-        errors.append("ddg-ia: empty")
-    except Exception as e:
-        errors.append(f"ddg-ia: {e}")
-        print(f"[web_search DDG-IA] {e}")
-
-    # 4) HTML endpoints last (often blocked / slow from datacenter hosts)
-    from urllib.parse import parse_qs, urlparse, unquote
-
-    def _unwrap_ddg_href(href: str) -> str:
-        href = (href or "").strip()
-        if "uddg=" in href:
-            try:
-                qs = parse_qs(urlparse(href).query)
-                if qs.get("uddg"):
-                    return unquote(qs["uddg"][0])
-            except Exception:
-                pass
-        return href
-
-    for endpoint, method in (
-        ("https://html.duckduckgo.com/html/", "POST"),
-        ("https://lite.duckduckgo.com/lite/", "POST"),
-    ):
-        try:
-            if method == "POST":
-                r = requests.post(
-                    endpoint,
-                    data={"q": query},
-                    timeout=12,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"
-                        ),
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                )
-            else:
-                r = requests.get(
-                    endpoint,
-                    params={"q": query},
-                    timeout=12,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"
-                        ),
-                    },
-                )
-            r.raise_for_status()
-            pairs = re.findall(
-                r'<a[^>]+href="([^"]+)"[^>]*rel="nofollow"[^>]*>([^<]+)</a>',
-                r.text,
-                flags=re.I,
-            )
-            if not pairs:
-                pairs = re.findall(
-                    r'<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
-                    r.text,
-                    flags=re.I,
-                )
-            if not pairs:
-                pairs = re.findall(
-                    r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-                    r.text,
-                    flags=re.I | re.S,
-                )
-            snippets = re.findall(
-                r'class="result(?:__|-)?snippet"[^>]*>([^<]+)', r.text, flags=re.I
-            )
-            lines = []
-            for i, (href, title) in enumerate(pairs[:num]):
-                title = re.sub(r"<[^>]+>", "", title).strip()
-                sn = snippets[i] if i < len(snippets) else ""
-                href = _unwrap_ddg_href(href)
-                if not title and not href:
-                    continue
-                block = f"• {title}" if title else "•"
-                if sn.strip():
-                    block += f"\n  {sn.strip()}"
-                if href.startswith("http"):
-                    block += f"\n  {href}"
-                lines.append(block)
-            if lines:
-                return "\n\n".join(lines)
-            errors.append(f"{endpoint}: no parseable results")
-        except Exception as e:
-            errors.append(f"{endpoint}: {e}")
-            print(f"[web_search html] {endpoint} {e}")
-
-    err_summary = "; ".join(errors[:4]) if errors else "unknown"
-    return (
-        "Web search unavailable right now "
-        f"({err_summary}). Tip: set SERPER_API_KEY or ensure `ddgs` is installed."
-    )
 
 
 def _github_user_from_url(url: str) -> Optional[str]:
@@ -2204,10 +2022,16 @@ def _tool_browse_url(args: dict, ctx: dict) -> str:
 
     # --- GitHub special path (reliable JSON API, no JS-render needed) ---
     if "github.com" in url.lower():
+        g = github_ops.parse_github_url(url)
+        if g and g["kind"] != "repo":  # /tree/<ref>/<path> or /blob/<ref>/<path>
+            return github_ops.overview(g["owner"], g["repo"], g["kind"], g["ref"], g["path"], max_chars)
         repo_pair = _github_repo_from_url(url)
         if repo_pair and repo_pair[1].lower() not in ("", "repositories", "stars", "followers", "following"):
-            # full repo URL
-            return _fetch_github_repo(repo_pair[0], repo_pair[1])
+            # Full repo URL: name/description/stars PLUS the file tree (grouped into any
+            # SKILL.md / package catalog it contains, e.g. "list all of them" on a skills
+            # repo) and a README excerpt — not metadata alone (prod bug: metadata-only
+            # left the model with nothing to list and it invented an answer).
+            return github_ops.overview(repo_pair[0], repo_pair[1], max_chars=max(max_chars, 3000))
         user = _github_user_from_url(url)
         if user:
             return _fetch_github_user_repos(user, limit=12)
@@ -2844,15 +2668,25 @@ def _flatten_supadata_meta(data: dict) -> dict:
     }
 
 
-def _supadata_metadata(url: str) -> Optional[dict]:
-    """Structured /v1/metadata (cached 30 min so follow-up questions cost nothing)."""
+def _supadata_metadata(url: str, privileged: bool = False) -> Optional[dict]:
+    """Structured /v1/metadata. Cached 7 DAYS in Supabase kv_cache (survives Render
+    restarts — in-memory-only caching re-billed the same reel after every spin-down).
+    Costed against the monthly budget (1 credit) BEFORE the call, never after."""
     api_key = (os.getenv("SUPADATA_API_KEY") or "").strip()
     if not api_key:
         return None
     mk = _media_key(url)
-    ent = _META_CACHE.get(mk)
-    if ent and ent[1] > time.time():
-        return ent[0]
+    cache_key = f"meta:{mk}"
+    cached = usage_budget.kv_get(cache_key)
+    if cached is not None:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+    ok, why = usage_budget.supadata.can_spend(usage_budget.supadata.metadata_cost(), privileged)
+    if not ok:
+        print(f"[metadata] Supadata budget: {why}")
+        return None
     try:
         r = requests.get(
             "https://api.supadata.ai/v1/metadata",
@@ -2863,10 +2697,12 @@ def _supadata_metadata(url: str) -> Optional[dict]:
         if r.status_code != 200:
             print(f"[metadata] Supadata HTTP {r.status_code}")
             return None
+        usage_budget.supadata.record(usage_budget.supadata.metadata_cost(), f"metadata {mk}")
         flat = _flatten_supadata_meta(r.json() or {})
         if not any((flat["title"], flat["caption"], flat["author_name"], flat["username"])):
             return None
-        _META_CACHE[mk] = (flat, time.time() + _META_TTL)
+        usage_budget.kv_set(cache_key, json.dumps(flat, ensure_ascii=False), 7 * 86400)
+        _META_CACHE[mk] = (flat, time.time() + _META_TTL)  # hot in-memory layer too
         return flat
     except Exception as e:
         print(f"[metadata] Supadata error: {e}")
@@ -2915,7 +2751,7 @@ def _format_media_info(m: dict, fields) -> str:
     return "\n".join(out)
 
 
-def _media_info_block(url: str, caption: bool = False, stats: bool = False) -> str:
+def _media_info_block(url: str, caption: bool = False, stats: bool = False, privileged: bool = False) -> str:
     """Extra block appended to a transcript/answer ONLY when the user asked for it."""
     fields = []
     if caption:
@@ -2924,7 +2760,7 @@ def _media_info_block(url: str, caption: bool = False, stats: bool = False) -> s
         fields += ["author", "stats", "date", "duration"]
     if not fields:
         return ""
-    m = _supadata_metadata(url)
+    m = _supadata_metadata(url, privileged=privileged)
     if m:
         return _format_media_info(m, fields)
     if caption:  # no key / API down: text-only fallbacks still have the caption
@@ -4075,10 +3911,22 @@ def _try_piped_captions(
     return None
 
 
-def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[str]:
+def _is_owner(ctx: dict) -> bool:
+    if not _OWNER_SENDER_ID or not ctx:
+        return False
+    return (
+        str(ctx.get("sender_id") or "") == str(_OWNER_SENDER_ID)
+        or str(ctx.get("sender_num") or "") == str(_OWNER_SENDER_ID)
+    )
+
+
+def _try_supadata(url: str, language: str, with_timestamps: bool, privileged: bool = False) -> Optional[str]:
     """
     Managed API — YouTube, TikTok, Instagram, Facebook, X (cloud-friendly).
-    Requires SUPADATA_API_KEY (100 free credits/mo).
+    Requires SUPADATA_API_KEY. FREE PLAN = 100 credits/month, no rollover:
+    native transcript = 1 credit flat; AI-generated = 2 credits PER VIDEO MINUTE.
+    Every call here is gated by usage_budget.supadata and every success is recorded —
+    see usage_budget.py for the policy (owner reserve, generate-mode minute cap).
 
     Instagram/Facebook rarely expose native captions → try mode=auto then
     mode=generate. Handles async jobId via short-polling.
@@ -4093,6 +3941,8 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
     )
 
     lang = (language or "auto").strip().lower()
+    budget = usage_budget.supadata  # single capture point: visible to every nested closure below
+    call_state = {"made": False}    # True once a real HTTP call went out (budget blocks do NOT count)
 
     def _parse_content(data: dict) -> Optional[str]:
         if not isinstance(data, dict):
@@ -4163,6 +4013,11 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
                     # Add the rejection check here
                     parsed = _accept_transcript_candidate(parsed, "supadata-poll")
                     if parsed:
+                        jdur = (jdata.get("duration") or 0) / 60.0
+                        budget.record(
+                            budget.generate_cost(jdur if jdur > 0 else budget.max_gen_minutes()),
+                            f"transcript generate(job) {_media_key(url)}",
+                        )
                         print(f"[transcribe_video] Supadata job OK chars={len(parsed)}")
                         return parsed
                     else:
@@ -4179,6 +4034,30 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
         return None
 
     def _one_mode(mode: str) -> Optional[str]:
+        if mode == "native":
+            cost_estimate = budget.native_cost()
+        else:  # "generate": charged per MINUTE, duration unknown until after the call —
+            # use cached metadata duration if we have it (free), else the configured cap
+            # as a conservative worst-case estimate for the pre-flight affordability check.
+            mem = _META_CACHE.get(_media_key(url))
+            meta = mem[0] if mem else None
+            if meta is None:
+                try:
+                    raw_meta = usage_budget.kv_get(f"meta:{_media_key(url)}")
+                    meta = json.loads(raw_meta) if raw_meta else None
+                except Exception:
+                    meta = None
+            mins = (float(meta.get("duration") or 0) / 60.0) if meta else 0
+            mins = mins if mins > 0 else budget.max_gen_minutes()
+            if mins > budget.max_gen_minutes() and not privileged:
+                print(f"[transcribe_video] Supadata generate skipped: "
+                      f"~{mins:.1f} min > cap {budget.max_gen_minutes()} min")
+                return None
+            cost_estimate = budget.generate_cost(mins)
+        ok, why = budget.can_spend(cost_estimate, privileged)
+        if not ok:
+            print(f"[transcribe_video] Supadata mode={mode} budget: {why}")
+            return None
         params: Dict[str, Any] = {
             "url": url,
             "text": "false" if with_timestamps else "true",
@@ -4186,6 +4065,7 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
         }
         if lang and lang not in ("auto", ""):
             params["lang"] = lang
+        call_state["made"] = True
         try:
             r = requests.get(
                 "https://api.supadata.ai/v1/transcript",
@@ -4211,6 +4091,12 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
                 # Add the rejection check here
                 parsed = _accept_transcript_candidate(parsed, f"supadata-{mode}")
                 if parsed:
+                    actual_mins = (data.get("duration") or 0) / 60.0 if isinstance(data, dict) else 0
+                    final_cost = (
+                        budget.native_cost() if mode == "native"
+                        else budget.generate_cost(actual_mins if actual_mins > 0 else cost_estimate / 2)
+                    )
+                    budget.record(final_cost, f"transcript {mode} {_media_key(url)}")
                     print(
                     f"[transcribe_video] Supadata mode={mode} OK chars={len(parsed)}"
                     )
@@ -4226,18 +4112,32 @@ def _try_supadata(url: str, language: str, with_timestamps: bool) -> Optional[st
             print(f"[transcribe_video] Supadata mode={mode} error: {e}")
             return None
 
-    # IG/FB: native captions rare → try generate first for reliability
-    is_meta = _is_instagram_url(url) or _is_facebook_url(url)
-    modes = ("generate", "auto") if is_meta else ("auto", "generate")
-    for m in modes:
-        got = _one_mode(m)
-        if got and len(got.strip()) >= 20:
-            return got
-        if got:
-            print(
-                f"[transcribe_video] Supadata mode={m} too short "
-                f"({len(got.strip())} chars) — trying next"
-            )
+    # CREDIT POLICY (free plan = 100/month): native = 1 credit flat and costs nothing when
+    # unavailable; generate = 2 credits PER MINUTE. So ALWAYS native first, on every platform
+    # (the old order sent Instagram/Facebook straight to generate, then to "auto", which can
+    # generate again = the same reel billed twice). Rules:
+    #   * generate only if native found NOTHING (None) — a short but real native transcript
+    #     means the video just has little speech; paying 2/min to AI-transcribe it is waste;
+    #   * a failed generate is remembered 6 h so retry loops can't keep spending;
+    #   * _one_mode() enforces the monthly budget + minute cap before every paid call.
+    mkey = _media_key(url)
+    if usage_budget.kv_get(f"supadata_fail:{mkey}"):
+        print(f"[transcribe_video] Supadata skipped — failed recently for {mkey} (6h negative cache)")
+        return None
+    got = _one_mode("native")
+    if got and len(got.strip()) >= 20:
+        return got
+    if got:
+        print(
+            f"[transcribe_video] Supadata native too short ({len(got.strip())} chars) "
+            f"— NOT escalating to paid AI transcription"
+        )
+        return None
+    got = _one_mode("generate")
+    if got and len(got.strip()) >= 20:
+        return got
+    if call_state["made"]:  # only a REAL failed attempt is remembered, never a budget block
+        usage_budget.kv_set(f"supadata_fail:{mkey}", "1", 6 * 3600)
     return None
 
 
@@ -5056,6 +4956,12 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
     def _raw_cache_get() -> Optional[str]:
         entry = _RAW_SPEECH_CACHE.get(mkey)
         if not entry:
+            # Persistent layer (Supabase kv_cache, 30 days): survives Render spin-downs and
+            # serves the same reel to every chat — a paid transcript is never bought twice.
+            persisted = usage_budget.kv_get(f"speech:{mkey}")
+            if persisted and not _looks_like_youtube_description(persisted):
+                _RAW_SPEECH_CACHE[mkey] = (persisted, time.time() + _RAW_SPEECH_TTL)
+                return persisted
             return None
         text, exp = entry
         if time.time() > exp:
@@ -5072,6 +4978,7 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
         if len(text) < (120 if yt_id else 40):
             return
         _RAW_SPEECH_CACHE[mkey] = (text, time.time() + _RAW_SPEECH_TTL)
+        usage_budget.kv_set(f"speech:{mkey}", text, 30 * 86400)
         msg = (
             f"[transcribe_video] RAW_CACHE store id={mkey} "
             f"source={source} chars={len(text)}"
@@ -5242,7 +5149,7 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
             return packed
 
     # Managed API (SUPADATA) — strong for YT + best for IG/FB/TikTok
-    packed = _take("Supadata", _try_supadata(url, fetch_lang, with_ts))
+    packed = _take("Supadata", _try_supadata(url, fetch_lang, with_ts, privileged=_is_owner(ctx)))
     if packed:
         return packed
 
@@ -5488,7 +5395,7 @@ def _video_answer(args: dict, ctx: dict) -> str:
     if caption_only:
         caption = body.strip()
     elif args.get("include_caption") or args.get("include_stats"):
-        caption = _media_info_block(url, bool(args.get("include_caption")), bool(args.get("include_stats")))
+        caption = _media_info_block(url, bool(args.get("include_caption")), bool(args.get("include_stats")), privileged=_is_owner(ctx))
 
     user = (
         f"QUESTION: {question[:500]}\n\n"
@@ -5534,7 +5441,7 @@ def _tool_transcribe_video(args: dict, ctx: dict) -> str:
                 url = _normalize_ig_fb_url(url)
         except Exception:
             pass
-        extra = _media_info_block(url, want_cap, want_stats)
+        extra = _media_info_block(url, want_cap, want_stats, privileged=_is_owner(ctx))
         if extra:
             out = out.rstrip() + "\n\n" + extra
     return out
@@ -5555,7 +5462,7 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
     fields = [f for f in (args.get("fields") or []) if f in allowed] or ["title", "caption", "author"]
 
     # 1) Supadata /v1/metadata — the only source with stats / tags / date
-    m = _supadata_metadata(url)
+    m = _supadata_metadata(url, privileged=_is_owner(ctx))
     if m:
         body = _format_media_info(m, fields)
         if body.strip():

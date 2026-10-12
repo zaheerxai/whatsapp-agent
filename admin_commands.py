@@ -10,6 +10,8 @@ import os
 import re
 import unicodedata
 
+import usage_budget
+
 OWNER_SENDER_ID = os.getenv("OWNER_SENDER_ID")  # bare number/LID, no @server suffix
 
 KNOWN_FEATURES = [
@@ -737,6 +739,17 @@ def cmd_uploadlog(args):
     except Exception as e:
         return f"Upload failed: {e}"
 
+
+
+@command(
+    "credits",
+    "Usage: /credits — show the Supadata monthly credit budget (used/remaining/reserve).",
+)
+def cmd_credits(args):
+    try:
+        return usage_budget.supadata.status_text()
+    except Exception as e:
+        return f"credits check failed: {e}"
 
 
 @command(

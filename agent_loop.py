@@ -485,6 +485,10 @@ def _is_bad_post_tool_reply(text: str) -> bool:
         return True
     low = t.lower()
     bad_markers = (
+        "the tool result contains",
+        "tool result contains",
+        "the tool returned",
+        "tool output contains",
         "part 1",
         "part\u202f1",
         "here's part",
@@ -1047,6 +1051,8 @@ def _build_system_prompt(
 10. When summarizing a website from browse_url: 2–3 plain lines max. Light formatting (*bold* key phrase or a short list of ≤5 items) is fine; no numbered essay sections.
 11. VOICE: Voice notes are already transcribed and arrive as ordinary user text (history lines may start with 🎤). Treat them EXACTLY like typed messages — same tools, same rules. A voice note being replied to appears under [Quoted Message]; "[Cached recent voice-note transcript]" is the last voice note in this chat. For "kya bola" / "voice note me kya" / "what did I say" answer from that text — never browse a website and never claim no voice exists when a transcript is present.
 11a. QUOTE = OPERAND: when the latest user message contains a [Quoted Message] block and the instruction points at it ("ye", "isko", "is ko", "this", "it", "likh do", "rewrite/translate/summarize/reply/send this"), that quoted text IS the thing to work on. Never substitute an earlier chat message or your own previous reply. If the instruction needs a quote and none is present, ask which message instead of guessing.
+11b. NEVER narrate a tool ("the tool result contains…", "the tool returned…"). Use its content to answer the user's actual request: "list all of them" on a repo/page means output the full list from the tool result, not a description of the result. If the result lacks what was asked, say exactly what is missing.
+11c. WEB SEARCH HONESTY: if web_search returns "NO RELIABLE RESULTS" or results unrelated to the question, say plainly that the search found nothing usable. NEVER fill the gap from memory while presenting it as search results; background knowledge must be labelled "from my own knowledge, not from the search". Use correct brand/product spellings in queries (Anthropic, Claude Code — never ASR-garbled forms) and add recency="week"/"month" for "latest/new/today" asks.
 11b. NOTE DOWN vs IMAGE DESCRIBE:
    - note down / note karlo / onedrive me note / save this → note_down with FULL content WORD-FOR-WORD (quoted text, transcript, or image OCR). No "…" truncation. Summarize ONLY if user asked summary/khulasa/key points.
    - ye photo kya hai / what is in this image / describe → describe only (image_describe / vision). Do NOT write OneDrive.
