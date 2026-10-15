@@ -224,20 +224,24 @@ class SupadataBudget:
         return True, ""
 
     def record(self, cost: int, what: str) -> None:
-        """Count a paid call locally (fallback ledger) and log the real /me delta."""
-        before = None
+        """Log the real /me delta; keep the local ledger (the fallback when /me is down) in sync
+        with the TRUE balance instead of piling up pessimistic estimates (prod: est=8, real=3)."""
         with self._lock:
             before = (self._me or {}).get("used")
         k = f"supadata_used:{_month_key()}"
-        try:
-            kv_set(k, str(int(kv_get(k) or 0) + int(cost)), 40 * 86400)
-        except ValueError:
-            kv_set(k, str(int(cost)), 40 * 86400)
         after = self.snapshot(force=True)
-        log.info(
-            "SUPADATA_CHARGE what=%s est=%s used %s -> %s of %s (%s)",
-            what, cost, before, after.get("used"), after.get("max"), after.get("source"),
-        )
+        if after.get("source") == "me":
+            kv_set(k, str(after["used"]), 40 * 86400)
+            real = (after["used"] - before) if isinstance(before, int) else None
+            log.info("SUPADATA_CHARGE what=%s estimated=%s actual=%s used=%s/%s",
+                     what, cost, real if real is not None else "?", after["used"], after["max"])
+        else:
+            try:
+                kv_set(k, str(int(kv_get(k) or 0) + int(cost)), 40 * 86400)
+            except ValueError:
+                kv_set(k, str(int(cost)), 40 * 86400)
+            after = self.snapshot(force=True)
+            log.info("SUPADATA_CHARGE what=%s est=%s used~%s/%s (local ledger)", what, cost, after.get("used"), after.get("max"))
         pct = after["used"] / after["max"] if after.get("max") else 0
         for th in (0.8, 0.95):
             tag = (_month_key(), th)

@@ -772,232 +772,28 @@ def _needs_format_guide(
 
 
 def _format_whatsapp_reply(text: str) -> str:
-    """Post-synthesis sanitizer: GFM → clean WhatsApp-native text.
+    """Model markdown -> clean WhatsApp text (tables -> cards, headings, lists, links, unicode).
 
-    WhatsApp supports: *bold*  _italic_  ~strike~  ```mono```
-    Does NOT support: ** **, ## headers, pipe tables, nested emphasis.
+    Implemented in wa_format.py as a real block parser. It replaced a ~225-line regex stack
+    whose pipe-table handling turned every table CELL into its own bullet (prod 2026-10-12).
+    Pre-formatted cards (email drafts, /help) start with wa_format.RAW and pass through.
     """
-    if not text or not isinstance(text, str):
-        return text or ""
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Email draft cards: preserve structure; only light GFM cleanup.
-    # Full field-unglue path was collapsing already-correct multi-line cards.
-    if re.search(r"(?i)email draft", t) and re.search(
-        r"(?m)^\*To:\*", t
-    ):
-        for _ in range(2):
-            t2 = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"*\1*", t, flags=re.S)
-            if t2 == t:
-                break
-            t = t2
-        t = re.sub(r"\*{3,}", "*", t)
-        # Ensure space after *Label:*
-        t = re.sub(
-            r"(\*(?:To|Cc|Bcc|From|Subject|Body|Attach):\*)(\S)",
-            r"\1 \2",
-            t,
-            flags=re.I,
-        )
-        t = "\n".join(ln.rstrip() for ln in t.split("\n"))
-        t = re.sub(r"\n{3,}", "\n\n", t)
-        return t.strip()
-
-    # Horizontal rules / section dividers → blank line
-    t = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", t)
-    t = re.sub(r"\s*---+\s*", "\n\n", t)
-
-    # Strip fenced code language tags
-    t = re.sub(r"```[\w+-]*\n", "```\n", t)
-
-    # Convert **bold** / __bold__ → *bold* (repeat until stable for nested leftovers)
-    for _ in range(3):
-        t2_ = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"*\1*", t, flags=re.S)
-        t2_ = re.sub(r"__(?!\s)(.+?)(?<!\s)__", r"_\1_", t2_, flags=re.S)
-        if t2_ == t:
-            break
-        t = t2_
-    # Stray leftover multi-asterisks
-    t = re.sub(r"\*{3,}", "*", t)
-    t = re.sub(r"_{3,}", "_", t)
-    t = t.replace("****", "").replace("____", "")
-
-    # ATX headers → bold line on its own
-    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"*\1*", t)
-
-    # --- Glued field labels (classic email-draft collapse) ---
-    # Only rewrite when labels are GLUED on one line. Never touch an already
-    # well-formatted draft card (multi-line *To:* / *Subject:* / *Body:*).
-    _FIELD_RE = (
-        r"To|Cc|Bcc|From|Subject|Body|Attach(?:\s+resume)?|Purpose"
-    )
-    _already_structured = bool(
-        re.search(
-            # Matches our draft card lines: *To:* value
-            rf"(?m)^\*(?:{_FIELD_RE}):\*\s+\S",
-            t,
-            flags=re.I,
-        )
-    ) and ("\n" in t)
-    _glued = bool(
-        re.search(
-            rf"(?:\*)?(?:{_FIELD_RE})\s*:\s*\S[^\n]{{0,80}}\*(?:{_FIELD_RE})\s*:",
-            t,
-            flags=re.I,
-        )
-    ) or bool(
-        re.search(
-            rf"(?:\*)?(?:{_FIELD_RE})\s*:\s*[^\n]{{0,60}}(?:\*)?(?:{_FIELD_RE})\s*:",
-            t,
-            flags=re.I,
-        )
-    )
-    if _glued and not _already_structured:
-        parts = re.split(
-            rf"(?:\*)?\b({_FIELD_RE})\s*:\s*\*?",
-            t,
-            flags=re.I,
-        )
-        rebuilt: List[str] = []
-        preamble = (parts[0] or "").strip(" \t*")
-        if preamble:
-            rebuilt.append(preamble)
-        i = 1
-        while i < len(parts):
-            label = parts[i].strip()
-            raw_val = parts[i + 1] if i + 1 < len(parts) else ""
-            val = (raw_val or "").strip()
-            val = re.sub(r"^\*+\s*", "", val)
-            val = re.sub(r"\s*\*+\s*$", "", val)
-            val = val.strip(" \t*")
-            if label.lower() == "body":
-                val = val.strip()
-                rebuilt.append(f"*{label}:*")
-                if val:
-                    rebuilt.append(val)
-            else:
-                first = val.split("\n", 1)[0].strip().strip("*").strip()
-                rebuilt.append(f"*{label}:* {first}".rstrip())
-            i += 2
-        t = "\n".join(rebuilt)
-    # Ensure a space after *Label:* when missing (*To:*email → *To:* email)
-    t = re.sub(
-        rf"(\*(?:{_FIELD_RE}):\*)(\S)",
-        r"\1 \2",
-        t,
-        flags=re.I,
-    )
-
-    # Glue fix: *Section**3.1 Title* → *Section*\n\n*3.1 Title*
-    t = re.sub(r"\*([^*\n]{2,80})\*\*+(\d+\.\d+[^*\n]*)\*", r"*\1*\n\n*\2*", t)
-    t = re.sub(r"\*([^*\n]{2,80})\*\*+([A-Z][^*\n]{2,60})\*", r"*\1*\n\n*\2*", t)
-    # *text**next without space
-    t = re.sub(r"\*([^*\n]+)\*\*([A-Za-z0-9])", r"*\1*\n\n*\2", t)
-
-    # Ensure blank line before numbered section headings like *3.1 Foo*
-    t = re.sub(r"(?<!\n)\n?(\*\d+\.\d+[^*\n]*\*)", r"\n\n\1", t)
-    t = re.sub(r"(?<!\n)\n?(\*\d+\.\s+[^*\n]+\*)", r"\n\n\1", t)
-    # "sentence.*Section title*" glued → break
-    t = re.sub(
-        r"([.!?])\*([A-Z0-9][^*\n]{2,60})\*",
-        r"\1\n\n*\2*",
-        t,
-    )
-
-    # word.*N. Section* (missing space after period)
-    t = re.sub(
-        r"(\w)\.(\*\d+[^*\n]*\*)",
-        r"\1.\n\n\2",
-        t,
-    )
-
-    # Inline "1. foo 1. bar 1. baz" → real multiline list
-    def _split_inline_numbered(line: str) -> List[str]:
-        if not re.search(r"\d{1,2}\.\s+\S.+\d{1,2}\.\s+\S", line):
-            return [line]
-        # Don't touch lines that are already a single clean list item
-        if re.match(r"^\s*\d{1,2}\.\s+\S.*$", line) and line.count(". ") <= 1:
-            return [line]
-        parts = re.split(r"(?=\b\d{1,2}\.\s+)", line)
-        out: List[str] = []
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-            if re.match(r"^\d{1,2}\.\s+", p):
-                out.append(p)
-            else:
-                out.append(p)
-        return out if len(out) >= 2 else [line]
-
-    # Pipe tables → plain lines
-    lines_out: List[str] = []
-    for line in t.split("\n"):
-        s = line.strip()
-        if re.match(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$", s):
-            continue
-        if s.count("|") >= 2 and (s.startswith("|") or s.endswith("|")):
-            cells = [c.strip() for c in s.strip("|").split("|")]
-            lines_out.append(" · ".join(c for c in cells if c))
-            continue
-        lines_out.extend(_split_inline_numbered(line))
-    t = "\n".join(lines_out)
-
-    # Bare HTML
-    t = re.sub(
-        r"</?(?:b|strong|i|em|u|s|strike|code|pre|p|br|div|span)[^>]*>",
-        "",
-        t,
-        flags=re.I,
-    )
-    t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", t)
-
-    # Tighten * bold * → *bold* (same-line only)
-    def _tight(m: re.Match) -> str:
-        return f"{m.group(1)}{m.group(2).strip()}{m.group(1)}"
-
-    t = re.sub(r"([*_~])\s+([^*\n_~]+?)\s+\1", _tight, t)
-
-    # Bullet lines starting with · mid-paragraph → own line with dash
-    t = re.sub(r"(?<!\n)·\s+", "\n- ", t)
-
-    # Numbered list: renumber consecutive items so 1./1./1. becomes 1./2./3.
-    # Prefer bullets when the model stamped every row as "1."
-    capped: List[str] = []
-    num_count = 0
-    for line in t.split("\n"):
-        m = re.match(r"^(\s*)(\d{1,2})([.)])\s+(.*)$", line)
-        if m:
-            num_count += 1
-            body = m.group(4)
-            indent = m.group(1)
-            if num_count > 12:
-                capped.append(f"{indent}- {body}")
-            else:
-                capped.append(f"{indent}{num_count}. {body}")
-        else:
-            if not line.strip():
-                num_count = 0
-            elif not re.match(r"^\s*([-*]|\d{1,2}[.)])\s+", line):
-                num_count = 0
-            capped.append(line)
-    t = "\n".join(capped)
-
-    # Collapse 3+ blank lines → 2; trim trailing spaces per line
-    t = "\n".join(ln.rstrip() for ln in t.split("\n"))
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    # Leading newline from field-split cleanup
-    t = t.lstrip("\n")
-    # Drop trailing ellipsis-only cut markers that look unfinished mid-word
-    t = re.sub(r"(\w)\.\.\.\s*$", r"\1.", t)
-    return t.strip()
-
-
+    import bot_voice
+    import wa_format
+    if text and not text.startswith(wa_format.RAW):
+        text = bot_voice.scrub_errors(text, bot_voice.lang_of(text))   # never show "403 Client Error … for url: …"
+    return wa_format.to_whatsapp(text)
 
 
 def _reply(text: str) -> str:
-    """User-facing exit: always run the WhatsApp sanitizer."""
-    return _format_whatsapp_reply(text) if text else text
+    """User-facing exit: always run the WhatsApp sanitizer. Pre-formatted cards (e-mail drafts)
+    start with wa_format.RAW and pass through untouched — the final send stage strips the marker."""
+    if not text:
+        return text
+    import wa_format
+    if text.startswith(wa_format.RAW):
+        return text
+    return _format_whatsapp_reply(text)
 
 
 def _build_system_prompt(
@@ -1051,8 +847,9 @@ def _build_system_prompt(
 10. When summarizing a website from browse_url: 2–3 plain lines max. Light formatting (*bold* key phrase or a short list of ≤5 items) is fine; no numbered essay sections.
 11. VOICE: Voice notes are already transcribed and arrive as ordinary user text (history lines may start with 🎤). Treat them EXACTLY like typed messages — same tools, same rules. A voice note being replied to appears under [Quoted Message]; "[Cached recent voice-note transcript]" is the last voice note in this chat. For "kya bola" / "voice note me kya" / "what did I say" answer from that text — never browse a website and never claim no voice exists when a transcript is present.
 11a. QUOTE = OPERAND: when the latest user message contains a [Quoted Message] block and the instruction points at it ("ye", "isko", "is ko", "this", "it", "likh do", "rewrite/translate/summarize/reply/send this"), that quoted text IS the thing to work on. Never substitute an earlier chat message or your own previous reply. If the instruction needs a quote and none is present, ask which message instead of guessing.
-11b. NEVER narrate a tool ("the tool result contains…", "the tool returned…"). Use its content to answer the user's actual request: "list all of them" on a repo/page means output the full list from the tool result, not a description of the result. If the result lacks what was asked, say exactly what is missing.
-11c. WEB SEARCH HONESTY: if web_search returns "NO RELIABLE RESULTS" or results unrelated to the question, say plainly that the search found nothing usable. NEVER fill the gap from memory while presenting it as search results; background knowledge must be labelled "from my own knowledge, not from the search". Use correct brand/product spellings in queries (Anthropic, Claude Code — never ASR-garbled forms) and add recency="week"/"month" for "latest/new/today" asks.
+11g. NEVER narrate a tool ("the tool result contains…", "the tool returned…"). Use its content to answer the user's actual request: "list all of them" on a repo/page means output the full list from the tool result, not a description of the result. If the result lacks what was asked, say exactly what is missing.
+11e. RESEARCH: for "research / thorough report / compare / what should I buy / latest state of X" asks call deep_research ONCE with the full question and every constraint (budget, hardware, region). Its report is final — do not add your own summary. Use web_search only for a single quick fact.
+11h. WEB SEARCH HONESTY: if web_search returns "NO RELIABLE RESULTS" or results unrelated to the question, say plainly that the search found nothing usable. NEVER fill the gap from memory while presenting it as search results; background knowledge must be labelled "from my own knowledge, not from the search". Use correct brand/product spellings in queries (Anthropic, Claude Code — never ASR-garbled forms) and add recency="week"/"month" for "latest/new/today" asks.
 11b. NOTE DOWN vs IMAGE DESCRIBE:
    - note down / note karlo / onedrive me note / save this → note_down with FULL content WORD-FOR-WORD (quoted text, transcript, or image OCR). No "…" truncation. Summarize ONLY if user asked summary/khulasa/key points.
    - ye photo kya hai / what is in this image / describe → describe only (image_describe / vision). Do NOT write OneDrive.
@@ -1062,13 +859,8 @@ def _build_system_prompt(
    - When the user says always remember / remember this / yaad rakh / permanent note AND a quoted body or long profile/resume is present → call save_memory with the FULL quoted/profile content (not a 1-line stub like "Remember @bot").
    - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
    - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
-11d. OUTBOUND EMAIL / JOB APPLY (owner only — draft_email + send_email):
-   - Triggers: apply / cover letter / email this to X / outreach / intro / pitch (any language).
-   - EXACT BODY DEFAULT: user-supplied text after "email to X:" is stored WORD-FOR-WORD unless they ask to rewrite.
-   - When YOU compose (apply, rewrite, personalize, outreach): reason in JSON shape subject+body+attach_resume, then call draft_email. Facts come from the attached resume PDF text + permanent notes — never invent experience.
-   - JOB APPLY: Extract HR email from JD; subject from title/position; attach_resume=true.
-   - Flow: draft_email → show card → edit (update) → send_email only after send it / bhej do.
-   - Never claim sent unless send_email returned success.
+11i. GITHUB BY NAME: when the user names a repo ("the marketing agent", "my whatsapp-agent repo") and the conversation already shows the owner (a profile link or earlier repo URLs), do NOT ask for a link: browse_url the owner's profile once to list repos, pick the matching one, then browse_url the repo (and .../blob/HEAD/README.md with offset for a full README). Present exactly what the tool returned; never say a repo has no README unless the tool's "README: NO" line says so.
+11f. E-MAIL (owner only): drafting, forwarding ("email this to X"), editing, sending and cancelling are handled BEFORE you by a dedicated e-mail router — you will not normally see those turns. Use draft_email / send_email only when YOU decide an e-mail is the right output (e.g. "email me this report" right after a research answer): draft_email with the exact text, then wait for the owner to say send — never call send_email without an explicit confirmation, and never claim an e-mail was drafted or sent unless the tool returned a card/"Sent". Facts in an e-mail come ONLY from what the user gave you or the document being forwarded; never invent experience, names or dates, and never turn a normal message into a job application.
 
 {style_hint}
 {format_block}
@@ -1222,545 +1014,6 @@ def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
     return out
 
 
-def _parse_email_llm_json(raw: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse structured email JSON from an LLM response.
-
-    Expected shape (all email use-cases: apply, cover, intro, outreach, general):
-      {
-        "subject": "...",
-        "body": "...",
-        "attach_resume": true | false | "ask"   // optional
-      }
-
-    Tolerates fenced ```json blocks and leading/trailing prose.
-    """
-    if not raw or not isinstance(raw, str):
-        return None
-    s = raw.strip()
-    # Strip markdown fences
-    if "```" in s:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.I)
-        if m:
-            s = m.group(1).strip()
-    # Extract outermost { ... }
-    if not s.startswith("{"):
-        i, j = s.find("{"), s.rfind("}")
-        if i >= 0 and j > i:
-            s = s[i : j + 1]
-    try:
-        data = json.loads(s)
-    except Exception:
-        # Trailing commas / soft failures
-        try:
-            s2 = re.sub(r",\s*}", "}", s)
-            s2 = re.sub(r",\s*]", "]", s2)
-            data = json.loads(s2)
-        except Exception:
-            return None
-    if not isinstance(data, dict):
-        return None
-    body = data.get("body")
-    if body is None:
-        body = data.get("email_body") or data.get("message") or data.get("text")
-    if not isinstance(body, str) or len(body.strip()) < 20:
-        return None
-    out: Dict[str, Any] = {"body": body.strip()}
-    subj = data.get("subject") or data.get("email_subject")
-    if isinstance(subj, str) and subj.strip():
-        out["subject"] = subj.strip()
-    att = data.get("attach_resume")
-    if att is True or att is False:
-        out["attach_resume"] = "true" if att else "false"
-    elif isinstance(att, str) and att.strip().lower() in ("true", "false", "ask"):
-        out["attach_resume"] = att.strip().lower()
-    return out
-
-
-_EMAIL_JSON_SCHEMA_HINT = (
-    "Respond with ONLY a single JSON object (no markdown fences, no prose):\n"
-    "{\n"
-    '  "subject": "string — email subject line",\n'
-    '  "body": "string — full plain-text email body with real newline characters '
-    'between paragraphs",\n'
-    '  "attach_resume": true\n'
-    "}\n"
-    "Rules: body must be complete through the signature; never truncate mid-sentence; "
-    "plain text only inside body (no markdown); use \\n\\n between paragraphs inside "
-    "the JSON string; JSON only as the entire response."
-)
-
-
-def _looks_like_person_first_name(name: str) -> bool:
-    """Heuristic: real given names, not mailbox tags like bgreen / careers."""
-    n = (name or "").strip()
-    if not n or not n.isalpha():
-        return False
-    if len(n) < 3 or len(n) > 18:
-        return False
-    low = n.lower()
-    if low in {
-        "hr",
-        "jobs",
-        "careers",
-        "recruit",
-        "recruiting",
-        "talent",
-        "apply",
-        "info",
-        "contact",
-        "hello",
-        "team",
-        "admin",
-        "support",
-        "sales",
-        "office",
-        "noreply",
-        "no-reply",
-    }:
-        return False
-    # Must contain a vowel (filters bgreen, xkcd-style tags)
-    if not re.search(r"[aeiou]", low):
-        return False
-    # Reject initial+surname glue without separator (bgreen, jsmith) when
-    # first char + rest looks like surname-only mailbox: 1 letter + consonant-heavy
-    if len(n) >= 5 and low[0] not in "aeiou" and not re.search(
-        r"[aeiou].*[aeiou]", low
-    ):
-        # e.g. bgreen has only one vowel cluster 'ee' — still has vowels
-        pass
-    # Single leading initial pattern: Xname where X is 1 letter and rest is long
-    # Prefer "Hiring Team" for ambiguous local-parts like bgreen, jdoe
-    if re.match(r"^[a-z]\.?[a-z]{4,}$", low) and low[0] not in "aeiou":
-        # bgreen, jsmith, mwilliams — mailbox style, not a first name
-        return False
-    return True
-
-
-def _email_recipient_first_name(to_email: str, jd_text: str = "") -> str:
-    """Greeting name from local-part or JD; else Hiring Team."""
-    local = ""
-    if to_email and "@" in to_email:
-        local = to_email.split("@", 1)[0].strip()
-    local = re.sub(r"[0-9._+\-]+$", "", local)
-    local = re.sub(r"[._+\-]+", " ", local).strip()
-    if local:
-        first = local.split()[0]
-        if _looks_like_person_first_name(first):
-            return first[:1].upper() + first[1:].lower()
-    m = re.search(
-        r"(?i)(?:dear|hi|hello)\s+([A-Z][a-z]{1,20})\b",
-        jd_text or "",
-    )
-    if m and _looks_like_person_first_name(m.group(1)):
-        return m.group(1)
-    return "Hiring Team"
-
-
-def _candidate_display_name(facts: str) -> str:
-    """Pull real candidate name from resume/notes text."""
-    if not facts:
-        return "Muhammad Zaheeruddin"
-    # Prefer explicit full name near top of resume
-    for pat in (
-        r"(?im)^\s*(Muhammad\s+Zaheeruddin)\b",
-        r"(?im)^\s*(Muhammad\s+Zaheer[\w]*)\b",
-        r"(?i)\b(Muhammad\s+Zaheeruddin)\b",
-        r"(?i)\b(name)\s*[:\-]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})",
-    ):
-        m = re.search(pat, facts)
-        if m:
-            if m.lastindex and m.lastindex >= 2:
-                return m.group(2).strip()
-            return m.group(1).strip()
-    return "Muhammad Zaheeruddin"
-
-
-def _scrub_fake_identity(body: str, real_name: str) -> str:
-    """Strip placeholder identities and WhatsApp LIDs from LLM output."""
-    if not body:
-        return body
-    t = body
-    # Common LLM placeholders
-    t = re.sub(
-        r"(?i)\bJohn\s+Doe\b|\bJane\s+Doe\b|\bFoo\s+Bar\b",
-        real_name,
-        t,
-    )
-    t = re.sub(
-        r"(?i)[a-z0-9._%+\-]*@example\.com",
-        "",
-        t,
-    )
-    # WhatsApp LID (13–15 pure digits, often starting 7) is not a phone number —
-    # replace with owner phone when available, else drop the clause fragment.
-    owner_phone = ""
-    try:
-        import os as _os
-
-        owner_phone = (
-            _os.getenv("OWNER_PHONE")
-            or _os.getenv("GMAIL_CONTACT_PHONE")
-            or ""
-        ).strip()
-        if not owner_phone:
-            oid = (_os.getenv("OWNER_SENDER_ID") or "").strip()
-            # OWNER_SENDER_ID may itself be a phone (92…) not a LID (73…)
-            if oid.isdigit() and oid.startswith("92") and len(oid) >= 11:
-                owner_phone = "+" + oid if not oid.startswith("+") else oid
-    except Exception:
-        owner_phone = ""
-
-    def _lid_sub(m: re.Match) -> str:
-        raw = m.group(0)
-        digits = re.sub(r"\D", "", raw)
-        # Real PK mobile: 92 + 10 digits, or 03xx… — keep those
-        if digits.startswith("92") and 11 <= len(digits) <= 13:
-            return raw
-        if digits.startswith("03") and len(digits) == 11:
-            return raw
-        if owner_phone:
-            return owner_phone
-        return ""
-
-    t = re.sub(r"(?<!\d)(?:\+?73\d{10,14})(?!\d)", _lid_sub, t)
-    t = re.sub(r"(?i)Phone:\s*\+?[\d\s\-()]{6,}\s*", "", t)
-    # Drop junk signature lines the model invents under a fake name
-    t = re.sub(
-        r"(?im)^\s*Computer Science Graduate\s*\|\s*AI Engineer\s*$",
-        "",
-        t,
-    )
-    t = re.sub(r"\s{2,}", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t).strip()
-    # Ensure real name appears in sign-off
-    if real_name and not re.search(re.escape(real_name), t, flags=re.I):
-        if re.search(r"(?i)best regards,?\s*$", t):
-            t = re.sub(
-                r"(?i)(best regards,?)\s*$",
-                rf"\1\n{real_name}",
-                t,
-            )
-        else:
-            t = t.rstrip() + f"\n\nBest regards,\n{real_name}"
-    return t
-
-
-def _is_weak_email_subject(subject: str) -> bool:
-    s = (subject or "").strip()
-    if not s or s.lower() in {"job application", "application"}:
-        return True
-    if re.search(r"(?i)john\s+doe|jane\s+doe|example\.com", s):
-        return True
-    # Country/city alone after Application -
-    core = re.sub(r"(?i)^\s*application\s*[–\-:]\s*", "", s).strip()
-    if re.fullmatch(
-        r"(?i)pakistan|india|remote|lahore|islamabad|karachi|onsite|hybrid",
-        core or "",
-    ):
-        return True
-    return False
-
-
-def _email_cover_mode(user_text: str) -> str:
-    """brief | standard | detailed — driven by user wording."""
-    low = (user_text or "").lower()
-    if any(
-        p in low
-        for p in (
-            "detailed",
-            "in depth",
-            "in-depth",
-            "thorough",
-            "long cover",
-            "2 paragraph",
-            "two paragraph",
-            "atleast 2",
-            "at least 2",
-            "personalized",
-            "personalised",
-            "personalize",
-            "relevantly",
-            "high impact",
-            "high-impact",
-        )
-    ):
-        return "detailed"
-    if any(p in low for p in ("short", "brief", "concise", "chota", "mukhtasir")):
-        return "brief"
-    return "standard"
-
-
-def _normalize_email_body(body: str, greeting_name: str = "") -> str:
-    """Ensure readable paragraph breaks and a complete sign-off skeleton."""
-    if not body:
-        return body
-    t = body.replace("\r\n", "\n").replace("\r", "\n").strip()
-    # If the model emitted literal \n sequences, turn them into real newlines
-    if "\\n" in t and t.count("\n") < 2:
-        t = t.replace("\\n", "\n")
-    # Collapse 3+ newlines → 2
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    # If almost no newlines (single block), split on sentence boundaries lightly
-    if t.count("\n") < 2 and len(t) > 220:
-        # Insert break after greeting comma-line
-        t = re.sub(
-            r"(?i)^(hello[^,\n]*,)\s+",
-            r"\1\n\n",
-            t,
-            count=1,
-        )
-        t = re.sub(
-            r"(?i)(please find my (?:resume|cv) attached[^.]*\.)\s*",
-            r"\1\n\n",
-            t,
-            count=1,
-        )
-        t = re.sub(
-            r"(?i)\s*(best regards,?)\s*",
-            r"\n\n\1\n",
-            t,
-            count=1,
-        )
-    # Greeting override if still generic and we know a name
-    if greeting_name and greeting_name.lower() != "hiring team":
-        t = re.sub(
-            r"(?i)^hello\s+hiring\s+team\s*,",
-            f"Hello {greeting_name},",
-            t,
-            count=1,
-        )
-    # Ensure attach line present is caller's job; ensure sign-off has newline before name
-    t = re.sub(r"(?i)(best regards,)\s*(\S)", r"\1\n\2", t, count=1)
-    return t.strip()
-
-
-def _email_compose_system(mode: str, greeting_name: str) -> str:
-    greet = f"Hello {greeting_name}," if greeting_name else "Hello Hiring Team,"
-    if mode == "detailed":
-        structure = (
-            "BODY STRUCTURE (required, use blank lines between blocks):\n"
-            f"1) Greeting — {greet}\n"
-            "2) Paragraph 1 (4–6 sentences) — role + who you are + 2–3 REAL profile "
-            "facts framed toward the role's needs (transferable skills only)\n"
-            "3) Paragraph 2 (3–5 sentences) — more proof from profile; honest alignment "
-            "with JD themes without inventing duties you never did\n"
-            "4) Attach line — Please find my resume attached for full detail.\n"
-            "5) Soft CTA — brief call / next step\n"
-            "6) Sign-off — Best regards,\\n<name from profile>\n"
-            "Target ~180–280 words. Proper \\n\\n paragraph breaks."
-        )
-    elif mode == "brief":
-        structure = (
-            "BODY STRUCTURE:\n"
-            f"1) {greet}\n"
-            "2) 2–3 sentences: role + who you are + one real proof point\n"
-            "3) Attach line\n"
-            "4) Soft CTA + Best regards\\n<name>\n"
-            "Target ~70–110 words."
-        )
-    else:
-        structure = (
-            "BODY STRUCTURE (blank line between blocks):\n"
-            f"1) {greet}\n"
-            "2) Hook (2 sentences) — role + who you are from PROFILE\n"
-            "3) Proof (2–3 sentences) — only real profile facts, framed to the role\n"
-            "4) Attach line — Please find my resume attached for full detail.\n"
-            "5) Soft CTA\n"
-            "6) Best regards,\\n<name from profile>\n"
-            "Target ~120–180 words. Use \\n\\n between paragraphs."
-        )
-    return (
-        "You write high-response emails for job applications, cover letters, intros, "
-        "and outreach.\n\n"
-        f"{structure}\n\n"
-        "HARD ANTI-HALLUCINATION RULES:\n"
-        "- ONLY facts present in CANDIDATE FACTS (resume PDF + notes). Zero invention.\n"
-        "- The RESUME PDF section is the primary source of truth; notes are secondary.\n"
-        "- NEVER invent metrics (%, revenue, headcount) unless in the resume/notes.\n"
-        "- NEVER claim sales/recruiter/logistics years you do not have.\n"
-        "- JD is context for wording only — never claim JD duties as your experience.\n"
-        "- You MAY map real automation/AI/outreach work as transferable value.\n"
-        "- subject MUST be: Application - <exact job title from the JD>. "
-        "Never a country/city alone (not 'Application - Pakistan'). "
-        "Never invent placeholder names (no John Doe / Jane Doe).\n"
-        "- Sign-off name MUST be the real candidate name from CANDIDATE FACTS "
-        "(never John Doe, never example.com emails).\n"
-        "- attach_resume: true when resume will be attached.\n"
-        "- Complete through signature in ONE response."
-    )
-
-
-def _is_email_draft_card(text: str) -> bool:
-    if not text:
-        return False
-    return bool(
-        re.search(r"(?i)email draft", text)
-        and re.search(r"(?m)^\*To:\*", text)
-    )
-
-
-def _load_candidate_facts(
-    memory_block: str = "",
-    mem_obs: str = "",
-    *,
-    notes_cap: int = 2000,
-    resume_cap: int = 12000,
-) -> str:
-    """
-    Build the fact block for cover/outreach compose.
-
-    Priority: full resume PDF (same file attached on send) + permanent notes.
-    Resume text is the primary source of truth; notes fill gaps.
-    """
-    notes = mem_obs or ""
-    if "[Chat note]" in notes or len(notes) > notes_cap + 400:
-        notes = re.sub(r"\[Chat note\][^\n]*\n?", " ", notes)
-        notes = re.sub(r"\[Quoted Message\]:\s*", "", notes)
-        notes = re.sub(r"\s{2,}", " ", notes).strip()
-    notes = (notes or memory_block or "").strip()[:notes_cap]
-
-    resume_text = ""
-    resume_src = ""
-    try:
-        import email_ops as eo
-
-        resume_text, resume_src = eo.extract_resume_text(max_chars=resume_cap)
-    except Exception as e:
-        resume_src = f"resume load error: {e}"
-        resume_text = ""
-
-    if resume_text:
-        logging.getLogger("mojo.agent").info(
-            "RESUME_TEXT_LOADED src=%s chars=%s",
-            resume_src,
-            len(resume_text),
-        )
-        parts = [
-            "=== RESUME PDF (same file that will be attached — PRIMARY FACTS) ===",
-            resume_text,
-        ]
-        if notes:
-            parts.extend(
-                [
-                    "",
-                    "=== PERMANENT NOTES (supplementary) ===",
-                    notes,
-                ]
-            )
-        return "\n".join(parts)
-
-    logging.getLogger("mojo.agent").info(
-        "RESUME_TEXT_MISSING reason=%s — falling back to notes only",
-        resume_src,
-    )
-    if notes:
-        return (
-            "=== PERMANENT NOTES (resume PDF text unavailable) ===\n" + notes
-        )
-    return "(no resume PDF text and no permanent notes — stay minimal and honest)"
-
-
-def _compose_email_json(
-    *,
-    system: str,
-    user: str,
-    temperature: float = 0.2,
-    max_tokens: int = 1200,
-    real_name: str = "",
-) -> Optional[Dict[str, Any]]:
-    """
-    LLM-first email compose. Always prefers model output over any template.
-
-    Strategy:
-      1) Single completion with strict JSON schema hint
-      2) Tolerant parse (fences, trailing commas)
-      3) On parse miss: recovery with identity lock + original user context
-      4) Never invent a static cover-letter template in Python
-    """
-    identity_lock = ""
-    if real_name:
-        identity_lock = (
-            f"\nIDENTITY LOCK: Candidate name is exactly \"{real_name}\". "
-            "Never use John Doe, Jane Doe, or @example.com. "
-            f"Sign every email as {real_name}."
-        )
-    messages = [
-        {
-            "role": "system",
-            "content": system.rstrip()
-            + identity_lock
-            + "\n\n"
-            + _EMAIL_JSON_SCHEMA_HINT,
-        },
-        {"role": "user", "content": user},
-    ]
-    raw = ""
-    try:
-        msg = _chat_completion(
-            messages,
-            tools=None,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        raw = (getattr(msg, "content", None) or "").strip()
-        parsed = _parse_email_llm_json(raw)
-        if parsed and len((parsed.get("body") or "")) >= 60:
-            return parsed
-        logging.getLogger("mojo.agent").info(
-            "EMAIL_JSON_PARSE_MISS raw_len=%s preview=%r",
-            len(raw),
-            (raw or "")[:180],
-        )
-    except Exception as e:
-        print(f"[AGENT] _compose_email_json primary failed: {e}")
-        logging.getLogger("mojo.agent").info(
-            "EMAIL_JSON_PRIMARY_FAIL err=%s", e
-        )
-
-    # Recovery: re-parse / finish using ORIGINAL user brief (facts intact)
-    try:
-        recover_blob = (
-            "Fix into valid email JSON only.\n"
-            f"Real candidate name: {real_name or '(from CANDIDATE FACTS)'}\n"
-            "Rules: no John Doe, no example.com, subject = Application - "
-            "<exact JD job title>, body complete through Best regards + real name.\n\n"
-            "--- PREVIOUS MODEL OUTPUT ---\n"
-            f"{(raw or '')[:3000]}\n\n"
-            "--- ORIGINAL BRIEF (authoritative facts) ---\n"
-            f"{user[:5000]}"
-        )
-        msg2 = _chat_completion(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You repair broken email JSON. Preserve real candidate identity "
-                        "from CANDIDATE FACTS. Never invent placeholder people. "
-                        + identity_lock
-                        + "\n\n"
-                        + _EMAIL_JSON_SCHEMA_HINT
-                    ),
-                },
-                {"role": "user", "content": recover_blob},
-            ],
-            tools=None,
-            temperature=0.1,
-            max_tokens=max_tokens,
-        )
-        raw2 = (getattr(msg2, "content", None) or "").strip()
-        parsed2 = _parse_email_llm_json(raw2)
-        if parsed2 and len((parsed2.get("body") or "")) >= 60:
-            logging.getLogger("mojo.agent").info("EMAIL_JSON_RECOVERED")
-            return parsed2
-        logging.getLogger("mojo.agent").info(
-            "EMAIL_JSON_RECOVER_MISS preview=%r", (raw2 or "")[:180]
-        )
-    except Exception as e2:
-        print(f"[AGENT] _compose_email_json recover failed: {e2}")
-    return None
-
-
 def _chat_completion(
     messages: List[dict],
     tools: Optional[List] = None,
@@ -1806,7 +1059,7 @@ def _chat_completion(
                 print(f"[AGENT] Groq 429/rate — retry in {sleep_s:.1f}s")
                 _time.sleep(sleep_s)
                 continue
-            print(f"[AGENT] Primary model failed: {primary_err}. Trying fallback...")
+            print(f"[AGENT] Primary model failed: {_err_detail(primary_err)}. Trying fallback...")
             break
 
     # Groq limits are PER MODEL. When the big model is 429'd, a sibling model on its
@@ -1819,16 +1072,28 @@ def _chat_completion(
         _gfb_ok = bool(_gfb) and _lj.is_usable(_client_ai, _gfb)
     except Exception:
         _gfb_ok = bool(_gfb)
-    if _gfb_ok and _gfb != _MODEL_NAME and ("429" in _le or "rate" in _le or "too many" in _le):
-        try:
-            fk = dict(kwargs)
-            fk["model"] = _gfb
-            fk["messages"] = working
-            resp = _client_ai.chat.completions.create(**fk)
-            print(f"[AGENT] served by Groq fallback {_gfb}")
-            return resp.choices[0].message
-        except Exception as fe:
-            print(f"[AGENT] Groq fallback {_gfb} failed: {fe}. Trying Gemini...")
+    _auth_err = any(x in _le for x in ("401", "invalid api key", "403"))
+    if _gfb_ok and _gfb != _MODEL_NAME and not _auth_err:
+        # Attempt 1: same request on the sibling model (own TPM bucket). Attempt 2 (only after an
+        # HTTP 400): small gpt-oss models sometimes answer a synthesis turn with a malformed
+        # tool call, which Groq rejects as 400 tool_use_failed — retry WITHOUT tools and with
+        # flattened messages (prod: 3x '429, 429, 400' then a slow Gemini detour).
+        for _mode in ("normal", "no_tools"):
+            try:
+                fk = dict(kwargs)
+                fk["model"] = _gfb
+                fk["messages"] = working
+                if _mode == "no_tools":
+                    fk.pop("tools", None)
+                    fk.pop("tool_choice", None)
+                    fk["messages"] = _sanitize_messages_for_gemini(working)
+                resp = _client_ai.chat.completions.create(**fk)
+                print(f"[AGENT] served by Groq fallback {_gfb} ({_mode})")
+                return resp.choices[0].message
+            except Exception as fe:
+                print(f"[AGENT] Groq fallback {_gfb} ({_mode}) failed: {_err_detail(fe)}")
+                if "400" not in str(fe):
+                    break
 
     # Gemini fallback — sanitize tool messages so we don't get 400s.
     # Single attempt only (no nested retry storms on 503/429).
@@ -1846,6 +1111,16 @@ def _chat_completion(
         print(f"[AGENT] Gemini fallback failed: {e2}")
         # Do NOT burn more time on Gemini 503 loops. Caller uses tool OBS.
         raise last_err or e2
+
+
+def _err_detail(e: Exception) -> str:
+    """Error text INCLUDING the provider's response body (Groq puts the real reason — e.g.
+    tool_use_failed / failed_generation — there; str(e) alone is just '400 Bad Request')."""
+    body = getattr(e, "body", None)
+    if not body:
+        resp = getattr(e, "response", None)
+        body = getattr(resp, "text", "") if resp is not None else ""
+    return f"{str(e)[:200]} | body={str(body)[:400]}"
 
 
 def _replay_history_messages(raw_history: List[dict], contacts_map: dict) -> List[Dict[str, Any]]:
@@ -2003,6 +1278,8 @@ def run_agent(
             "sender_num": sender_num,
             "msg_time": msg_time,
             "is_group": is_group,
+            # chat language ("en" | "ur") so tools can answer in the user's language
+            "lang": __import__("bot_voice").lang_of(latest_user_text or ""),
         }
 
         # --- Force note_down (verbatim) when user asks to note + content is present ---
@@ -2099,649 +1376,25 @@ def run_agent(
                     ),
                 })
 
-        # --- Force email draft / send (owner) — never invent a draft without the tool ---
-        # Live bug: model replied "I've created a draft" with zero draft_email call,
-        # so send_email later returned "No draft to send".
+        # --- E-mail (owner): ONE LLM-routed brain (email_agent.py). It returns a finished reply
+        # for e-mail turns (draft cards, edits, send results) and None for everything else, so an
+        # unrelated message can never be hijacked by a keyword matcher ("Koi draft save nahi hai").
         try:
-            from agent_tools import (
-                parse_direct_email_command as _parse_email_cmd,
-                parse_job_apply_command as _parse_job_apply,
-                is_email_send_confirm as _is_email_confirm,
-                is_email_draft_edit_intent as _is_email_edit,
-                is_email_draft_cancel_intent as _is_email_cancel,
-                _get_draft as _email_get_draft,
-            )
-        except Exception:
-            _parse_email_cmd = None  # type: ignore
-            _parse_job_apply = None  # type: ignore
-            _is_email_confirm = None  # type: ignore
-            _is_email_edit = None  # type: ignore
-            _is_email_cancel = None  # type: ignore
-            _email_get_draft = None  # type: ignore
-
-        _email_src = latest_user_text or extra_user_note or _intent_src or ""
-
-        # Cancel draft (hard force — no LLM round-trip)
-        if (
-            _is_email_cancel
-            and _email_get_draft
-            and _is_email_cancel(_email_src)
-            and _tool_allowed_for_chat(chat_id, "draft_email")
-        ):
-            try:
-                obs = execute_tool(
-                    "draft_email", {"action": "cancel"}, tool_ctx
+            import email_agent
+            from agent_tools import _is_owner as _email_is_owner
+            _last_bot = ""
+            for _m in reversed(raw_history or []):
+                if (_m.get("role") or "") == "assistant":
+                    _last_bot = _m.get("content") or ""
+                    break
+            if _tool_allowed_for_chat(chat_id, "draft_email") and _email_is_owner(tool_ctx):
+                _em_reply = email_agent.handle(
+                    chat_id, latest_user_text or extra_user_note or "", last_bot=_last_bot, is_owner=True,
                 )
-            except Exception as _ce:
-                obs = f"Tool error: {_ce}"
-            return _reply(str(obs))
-
-        # Edit / personalize existing draft — MUST call draft_email update
-        # (live bug: model showed a rewritten body in chat but never saved it,
-        # so "send it" dispatched the old generic draft).
-        if (
-            _is_email_edit
-            and _email_get_draft
-            and _is_email_edit(_email_src)
-            and _tool_allowed_for_chat(chat_id, "draft_email")
-        ):
-            existing = None
-            try:
-                existing = _email_get_draft(tool_ctx)
-            except Exception:
-                existing = None
-            if not existing:
-                return _reply(
-                    "Koi draft save nahi hai. Pehle apply / email draft banao, "
-                    "phir personalize karo."
-                )
-            # 1) Deterministic field edits (subject / "a"→"b").
-            #    If user also asked to personalize/format, apply tweaks then continue
-            #    to JSON rewrite — never swallow following paragraphs as replace text.
-            field_edits = None
-            try:
-                from agent_tools import parse_draft_field_edits as _parse_fields
-
-                field_edits = _parse_fields(_email_src)
-            except Exception:
-                field_edits = None
-
-            update_args: Dict[str, Any] = {
-                "action": "update",
-                "attach_resume": existing.get("attach_resume") or "true",
-            }
-            did_deterministic = False
-            wants_rewrite = bool(
-                field_edits and field_edits.get("wants_rewrite") == "true"
-            )
-            working_body = existing.get("body") or ""
-            working_subj = existing.get("subject") or ""
-
-            if field_edits:
-                if field_edits.get("subject"):
-                    working_subj = field_edits["subject"]
-                    update_args["subject"] = working_subj
-                    did_deterministic = True
-                # position is only X → also align body role phrase
-                if field_edits.get("position_only"):
-                    only = field_edits["position_only"]
-                    if "subject" not in update_args:
-                        working_subj = f"Application - {only}"
-                        update_args["subject"] = working_subj
-                        did_deterministic = True
-                    body2, n = re.subn(
-                        r"(?i)((?:interest in|applying for|apply for|application for)"
-                        r"\s+the\s+)(.+?)(\s+(?:position|role)\b)",
-                        rf"\1{only}\3",
-                        working_body,
-                        count=1,
-                    )
-                    if n:
-                        working_body = body2
-                        update_args["body"] = working_body
-                        did_deterministic = True
-                # Surgical remove_phrase(s) — preserve rest of letter byte-stable
-                remove_list = []
-                if field_edits.get("remove_phrases"):
-                    remove_list = [
-                        p.strip()
-                        for p in str(field_edits["remove_phrases"]).split("|||")
-                        if p.strip()
-                    ]
-                elif field_edits.get("remove_phrase"):
-                    remove_list = [str(field_edits["remove_phrase"]).strip()]
-                if remove_list:
-                    subj2 = working_subj
-                    body2 = working_body
-                    changed = False
-                    for phrase in remove_list:
-                        if not phrase:
-                            continue
-                        if phrase.lower() in subj2.lower():
-                            subj2 = re.sub(
-                                re.escape(phrase), "", subj2, flags=re.I
-                            )
-                            changed = True
-                        if phrase.lower() in body2.lower():
-                            body2 = re.sub(
-                                re.escape(phrase), "", body2, flags=re.I
-                            )
-                            changed = True
-                    if changed:
-                        subj2 = re.sub(r"\s*[—–\-|/]\s*", " ", subj2)
-                        subj2 = re.sub(r"\s{2,}", " ", subj2).strip(" -—–|/")
-                        body2 = re.sub(
-                            r"\s*[—–]\s*(?=\s*(?:position|role)\b)",
-                            " ",
-                            body2,
-                            flags=re.I,
-                        )
-                        body2 = re.sub(r"[ \t]{2,}", " ", body2)
-                        body2 = re.sub(r" \n", "\n", body2)
-                        body2 = re.sub(r"\n{3,}", "\n\n", body2).strip()
-                        working_subj = subj2
-                        working_body = body2
-                        update_args["subject"] = working_subj
-                        update_args["body"] = working_body
-                        did_deterministic = True
-# Change role in body → swap "interest in the <old> position"
-                if field_edits.get("body_role"):
-                    new_role = field_edits["body_role"]
-                    body2, n = re.subn(
-                        r"(?i)((?:interest in|applying for|apply for|application for)"
-                        r"\s+the\s+)(.+?)(\s+(?:position|role)\b)",
-                        rf"\1{new_role}\3",
-                        working_body,
-                        count=1,
-                    )
-                    if not n:
-                        body2, n = re.subn(
-                            r"(?i)(the\s+)([A-Z][^.]{10,90}?)(\s+position\b)",
-                            rf"\1{new_role}\3",
-                            working_body,
-                            count=1,
-                        )
-                    if n:
-                        working_body = body2
-                        update_args["body"] = working_body
-                        did_deterministic = True
-                find_s = field_edits.get("body_find") or ""
-                repl_s = field_edits.get("body_replace")
-                if find_s and repl_s is not None:
-                    # Expand truncated finds: "73109..." → full digit run in body
-                    resolved = find_s
-                    if "…" in find_s or "..." in find_s or find_s.endswith("."):
-                        core = re.sub(r"[.…]+$", "", find_s).strip()
-                        digits = re.sub(r"\D", "", core)
-                        if digits and len(digits) >= 4:
-                            for m in re.finditer(
-                                r"\+?\d[\d\s\-()]{5,}", working_body
-                            ):
-                                cand = m.group(0)
-                                cand_d = re.sub(r"\D", "", cand)
-                                if cand_d.startswith(digits) or digits in cand_d:
-                                    resolved = cand
-                                    break
-                    body2, n = re.subn(
-                        re.escape(resolved),
-                        repl_s,
-                        working_body,
-                        count=0,
-                        flags=re.I,
-                    )
-                    if not n and resolved != find_s:
-                        body2, n = re.subn(
-                            re.escape(find_s),
-                            repl_s,
-                            working_body,
-                            count=0,
-                            flags=re.I,
-                        )
-                    if not n:
-                        body2, n = re.subn(
-                            re.escape(find_s.rstrip(",")),
-                            repl_s,
-                            working_body,
-                            count=1,
-                            flags=re.I,
-                        )
-                    # Digit-prefix fallback: any long number starting with find digits
-                    if not n:
-                        dig = re.sub(r"\D", "", find_s)
-                        if dig and len(dig) >= 4:
-                            body2, n = re.subn(
-                                rf"(?<!\d){re.escape(dig)}\d*",
-                                repl_s,
-                                working_body,
-                                count=0,
-                            )
-                    if n:
-                        working_body = body2
-                        update_args["body"] = working_body
-                        did_deterministic = True
-
-            if did_deterministic and not wants_rewrite:
-                try:
-                    obs = execute_tool("draft_email", update_args, tool_ctx)
-                except Exception as _ue:
-                    obs = f"Tool error: {_ue}"
-                obs_s = str(obs)
-                logging.getLogger("mojo.agent").info(
-                    "FORCE_DRAFT_EDIT deterministic obs=%s", obs_s[:240]
-                )
-                return _reply(
-                    obs_s + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
-                )
-
-            if did_deterministic:
-                existing = {
-                    **existing,
-                    "body": working_body,
-                    "subject": working_subj,
-                }
-
-            # 2) Full rewrite personalization via structured JSON LLM
-            try:
-                mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
-            except Exception:
-                mem_obs = ""
-            candidate_facts = _load_candidate_facts(
-                memory_block or "", mem_obs
-            )
-            real_name = _candidate_display_name(candidate_facts)
-            role_hint = (existing.get("subject") or "").strip()
-            role_hint = re.sub(
-                r"(?i)^\s*application\s*[–\-:]\s*", "", role_hint
-            ).strip() or role_hint
-            cover_mode = _email_cover_mode(_email_src)
-            greet_name = _email_recipient_first_name(
-                existing.get("to") or "", existing.get("body") or ""
-            )
-            tok_budget = {"brief": 700, "standard": 1100, "detailed": 1600}.get(
-                cover_mode, 1200
-            )
-            parsed = _compose_email_json(
-                system=_email_compose_system(cover_mode, greet_name)
-                + "\nYou are REWRITING an existing draft per the user request.",
-                user=(
-                    f"User edit request: {_email_src[:500]}\n"
-                    f"cover_mode: {cover_mode}\n"
-                    f"Candidate real name (sign-off MUST use this): {real_name}\n"
-                    f"Current subject: {existing.get('subject') or ''}\n"
-                    f"Role hint: {role_hint}\n"
-                    f"Recipient greeting name: {greet_name}\n"
-                    f"attach_resume: {existing.get('attach_resume') or 'true'}\n"
-                    f"Current body:\n{existing.get('body') or ''}\n\n"
-                    f"CANDIDATE FACTS (resume PDF + notes — ONLY source of facts):\n"
-                    f"{candidate_facts}"
-                ),
-                temperature=0.25,
-                max_tokens=tok_budget,
-                real_name=real_name,
-            )
-            new_body = (parsed or {}).get("body") or ""
-            new_subj = (parsed or {}).get("subject") or existing.get("subject") or ""
-            if new_subj and _is_weak_email_subject(new_subj):
-                new_subj = existing.get("subject") or new_subj
-            if not new_body or len(new_body) < 40:
-                return _reply(
-                    "Rewrite fail ho gaya. Subject/body clearly bolo, e.g.\n"
-                    "Change subject to Application - Full Stack Developer\n"
-                    'and "Job Application" to Full Stack Developer'
-                )
-            new_body = _scrub_fake_identity(new_body, real_name)
-            new_body = _normalize_email_body(new_body, greet_name)
-            if not re.search(r"(?i)resume|cv|attached", new_body) and (
-                (existing.get("attach_resume") or "") == "true"
-            ):
-                new_body = new_body.rstrip() + (
-                    "\n\nPlease find my resume attached for full detail."
-                )
-            try:
-                obs = execute_tool(
-                    "draft_email",
-                    {
-                        "action": "update",
-                        "body": new_body,
-                        "subject": new_subj,
-                        "attach_resume": existing.get("attach_resume") or "true",
-                    },
-                    tool_ctx,
-                )
-            except Exception as _ue:
-                obs = f"Tool error: {_ue}"
-            obs_s = str(obs)
-            logging.getLogger("mojo.agent").info(
-                "FORCE_DRAFT_EDIT json obs=%s", obs_s[:240]
-            )
-            if (
-                obs_s.startswith("Draft updated")
-                or "EMAIL DRAFT" in obs_s.upper()
-                or "Email draft" in obs_s
-            ):
-                return _reply(
-                    obs_s + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
-                )
-            return _reply(obs_s)
-
-        # Job apply: hard-force draft (no multi-tool loop — avoids search_knowledge
-        # distraction, 413 from huge memory dumps, and RETURNING_TOOL_OBS of notes).
-        if _parse_job_apply and _tool_allowed_for_chat(chat_id, "draft_email"):
-            apply = _parse_job_apply(_email_src)
-            if apply is not None:
-                if not apply.get("to"):
-                    print("[AGENT] apply intent but no email in JD")
-                    return _reply(
-                        "Is JD mein apply email nahi mili. HR/recruiter ka email "
-                        "bhej do, phir apply kar deta hoon."
-                    )
-                print(
-                    f"[AGENT] force job-apply HARD to={apply['to']!r} "
-                    f"subj={apply.get('subject', '')[:50]!r}"
-                )
-                logging.getLogger("mojo.agent").info(
-                    "FORCE_JOB_APPLY to=%s subject=%r",
-                    apply["to"],
-                    (apply.get("subject") or "")[:80],
-                )
-                # Resume PDF (attachment source) + permanent notes → LLM facts
-                try:
-                    mem_obs = str(execute_tool("get_memory", {}, tool_ctx) or "")
-                except Exception as _me:
-                    mem_obs = ""
-                candidate_facts = _load_candidate_facts(
-                    memory_block or "", mem_obs
-                )
-                real_name = _candidate_display_name(candidate_facts)
-                jd_clip = (apply.get("jd_excerpt") or "")[:2200]
-                subject = apply.get("subject") or "Job Application"
-                role_name = (apply.get("role") or "").strip() or re.sub(
-                    r"(?i)^\s*application\s*[–\-:]\s*", "", subject
-                ).strip() or subject
-                if _is_weak_email_subject(subject):
-                    # Let the LLM own the subject from the JD text
-                    subject = ""
-                    if _is_weak_email_subject(role_name):
-                        role_name = ""
-
-                cover_mode = _email_cover_mode(_email_src)
-                greet_name = _email_recipient_first_name(
-                    apply.get("to") or "", jd_clip
-                )
-                tok_budget = {"brief": 700, "standard": 1100, "detailed": 1600}.get(
-                    cover_mode, 1100
-                )
-                cover = ""
-                roles_hint = (apply.get("roles_list") or "").strip()
-                company_hint = (apply.get("company") or "").strip()
-                parsed_email = _compose_email_json(
-                    system=_email_compose_system(cover_mode, greet_name),
-                    user=(
-                        f"purpose: job_apply\n"
-                        f"cover_mode: {cover_mode}\n"
-                        f"user_request: {_email_src[:500]}\n"
-                        f"Candidate real name (sign-off MUST use this): {real_name}\n"
-                        f"Role hint (may be empty — extract exact title from JD): "
-                        f"{role_name or '(extract from JD)'}\n"
-                        f"Open roles on this posting (if multi-role): {roles_hint or 'n/a'}\n"
-                        f"Company: {company_hint or 'n/a'}\n"
-                        f"Suggested subject (may be empty — YOU must set "
-                        f"'Application - <exact JD title>'): {subject or '(set from JD)'}\n"
-                        f"Recipient greeting name: {greet_name}\n"
-                        f"attach_resume: true\n"
-                        "If multiple roles are listed, pick the ONE best fit for the "
-                        "candidate resume and write subject + body for that role only. "
-                        "Never say 'Job Application role'. Never use placeholder names.\n\n"
-                        f"JOB DESCRIPTION (context only — do not claim as experience):\n"
-                        f"{jd_clip}\n\n"
-                        f"CANDIDATE FACTS (resume PDF is primary — ONLY source of facts):\n"
-                        f"{candidate_facts}"
-                    ),
-                    temperature=0.25 if cover_mode == "detailed" else 0.2,
-                    max_tokens=tok_budget,
-                    real_name=real_name,
-                )
-                if parsed_email:
-                    cover = parsed_email.get("body") or ""
-                    if parsed_email.get("subject") and not _is_weak_email_subject(
-                        parsed_email["subject"]
-                    ):
-                        subject = parsed_email["subject"]
-                        rn = re.sub(
-                            r"(?i)^\s*application\s*[–\-:]\s*",
-                            "",
-                            subject,
-                        ).strip()
-                        if rn:
-                            role_name = rn
-                    elif parsed_email.get("subject"):
-                        logging.getLogger("mojo.agent").info(
-                            "EMAIL_SUBJECT_REJECTED weak=%r",
-                            parsed_email.get("subject"),
-                        )
-
-                if not cover or len(cover) < 60:
-                    logging.getLogger("mojo.agent").info(
-                        "FORCE_JOB_APPLY_LLM_EMPTY to=%s subject=%r",
-                        apply.get("to"),
-                        subject,
-                    )
-                    return _reply(
-                        "Cover letter LLM se generate nahi ho saki (parse/empty). "
-                        "Ek second baad dobara 'apply to this job' try karo — "
-                        "template use nahi karunga."
-                    )
-                cover = _scrub_fake_identity(cover, real_name)
-                cover = _normalize_email_body(cover, greet_name)
-                if not subject or _is_weak_email_subject(subject):
-                    # Last resort: derive from body first mention of position
-                    m = re.search(
-                        r"(?i)(?:interest in|applying for|apply for)\s+the\s+"
-                        r"(.+?)\s+(?:position|role)\b",
-                        cover,
-                    )
-                    if m:
-                        subject = f"Application - {m.group(1).strip()}"
-                    elif role_name and not _is_weak_email_subject(role_name):
-                        subject = f"Application - {role_name}"
-                    else:
-                        subject = "Job Application"
-                if not re.search(
-                    r"(?i)resume|cv|attached|attachment",
-                    cover,
-                ):
-                    cover = cover.rstrip() + (
-                        "\n\nPlease find my resume attached for full detail."
-                    )
-
-                try:
-                    obs = execute_tool(
-                        "draft_email",
-                        {
-                            "action": "create",
-                            "to": apply["to"],
-                            "subject": subject,
-                            "body": cover,
-                            "attach_resume": "true",
-                            "purpose": "job_apply",
-                            "reason": "job application — resume attached",
-                        },
-                        tool_ctx,
-                    )
-                except Exception as _de:
-                    obs = f"Tool error: {_de}"
-                obs_s = str(obs)
-                logging.getLogger("mojo.agent").info(
-                    "FORCE_JOB_APPLY_DRAFT obs=%s", obs_s[:240]
-                )
-                if "Permission denied" in obs_s:
-                    return _reply(
-                        "Job apply / email sirf bot owner ke liye available hai."
-                    )
-                if obs_s.startswith("Draft created") or obs_s.startswith(
-                    "Draft updated"
-                ):
-                    return _reply(
-                        obs_s
-                        + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
-                    )
-                return _reply(
-                    "Draft banane mein issue aaya. Dobara 'apply to this job' "
-                    "try karo ya HR email confirm karo."
-                )
-
-        if _parse_email_cmd and _tool_allowed_for_chat(chat_id, "draft_email"):
-            parsed = _parse_email_cmd(_email_src)
-            if parsed and parsed.get("to") and parsed.get("body"):
-                wants_rewrite = (parsed.get("exact") or "true").lower() == "false"
-                rewrite_instr = (parsed.get("rewrite") or "").strip()
-
-                if wants_rewrite:
-                    # User asked to rewrite (e.g. "make it professional") — do NOT
-                    # force the raw body. Steer the model to draft_email with a
-                    # rewritten body matching the instruction.
-                    print(
-                        f"[AGENT] email rewrite requested to={parsed['to']!r} "
-                        f"instr={rewrite_instr[:60]!r}"
-                    )
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "OUTBOUND EMAIL — REWRITE MODE (user asked for a rewrite).\n"
-                            f"Recipient: {parsed['to']}\n"
-                            f"Rewrite instruction: {rewrite_instr or 'professional tone'}\n"
-                            f"User's raw notes (use as source facts, NOT as final body):\n"
-                            f"{parsed['body']}\n\n"
-                            "You MUST call draft_email action=create with:\n"
-                            f"- to: {parsed['to']}\n"
-                            "- subject: short professional subject (invent if needed)\n"
-                            "- body: rewritten email following the instruction; "
-                            "do NOT paste the raw notes verbatim; do NOT include the "
-                            "rewrite instruction itself in the body\n"
-                            "- attach_resume: false\n"
-                            "After the tool returns, show the draft card as-is "
-                            "(keep newlines). Ask if they want to send."
-                        ),
-                    })
-                else:
-                    # DEFAULT: word-for-word exact body — no LLM rewrite
-                    print(
-                        f"[AGENT] force draft_email EXACT to={parsed['to']!r} "
-                        f"subj={parsed.get('subject', '')[:40]!r}"
-                    )
-                    try:
-                        obs = execute_tool(
-                            "draft_email",
-                            {
-                                "action": "create",
-                                "to": parsed["to"],
-                                "subject": parsed.get("subject") or "Quick note",
-                                "body": parsed["body"],
-                                "attach_resume": "false",
-                                "purpose": "direct_send",
-                                "reason": "exact user body (no rewrite asked)",
-                            },
-                            tool_ctx,
-                        )
-                    except Exception as _ee:
-                        obs = f"Tool error: {_ee}"
-                    obs_s = str(obs)
-                    logging.getLogger("mojo.agent").info(
-                        "FORCE_DRAFT_EMAIL exact=1 obs=%s", obs_s[:200]
-                    )
-                    if "Permission denied" in obs_s:
-                        return _reply(
-                            "Email draft/send sirf bot owner ke liye available hai."
-                        )
-                    if obs_s.startswith("Draft created") or obs_s.startswith(
-                        "Draft updated"
-                    ):
-                        return _reply(
-                            obs_s
-                            + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
-                        )
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": "call_forced_draft_email_0",
-                            "type": "function",
-                            "function": {
-                                "name": "draft_email",
-                                "arguments": json.dumps({
-                                    "action": "create",
-                                    "to": parsed["to"],
-                                    "subject": parsed.get("subject")
-                                    or "Quick note",
-                                    "body": parsed["body"],
-                                    "attach_resume": "false",
-                                }),
-                            },
-                        }],
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": "call_forced_draft_email_0",
-                        "content": obs_s,
-                    })
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "draft_email already ran with the user's EXACT body. "
-                            "Show the tool result as-is (preserve newlines). "
-                            "Do NOT rewrite the body. Do NOT glue To/Subject/Body "
-                            "onto one line."
-                        ),
-                    })
-
-        if (
-            _is_email_confirm
-            and _email_get_draft
-            and _is_email_confirm(_email_src)
-            and _tool_allowed_for_chat(chat_id, "send_email")
-        ):
-            existing_draft = None
-            try:
-                existing_draft = _email_get_draft(tool_ctx)
-            except Exception:
-                existing_draft = None
-            if existing_draft:
-                print(
-                    f"[AGENT] force send_email to={existing_draft.get('to')!r}"
-                )
-                send_args = {"confirm": True}
-                # If draft had attach=ask, default false on bare "send it" unless
-                # user said attach/resume/cv in the confirm message.
-                att = (existing_draft.get("attach_resume") or "ask").lower()
-                low_src = (_email_src or "").lower()
-                if att == "ask":
-                    if any(
-                        w in low_src
-                        for w in ("attach", "resume", "cv", "pdf", "with resume")
-                    ):
-                        send_args["attach_resume_override"] = "true"
-                    else:
-                        send_args["attach_resume_override"] = "false"
-                try:
-                    obs = execute_tool("send_email", send_args, tool_ctx)
-                except Exception as _se:
-                    obs = f"Tool error: {_se}"
-                obs_s = str(obs)
-                logging.getLogger("mojo.agent").info(
-                    "FORCE_SEND_EMAIL obs=%s", obs_s[:240]
-                )
-                return _reply(obs_s)
-            else:
-                # Confirm with no draft — tell user clearly (don't invent send)
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "User asked to SEND email but there is NO stored draft for this "
-                        "chat. Do NOT claim you sent anything. Ask them to re-state "
-                        "recipient + body (or quote the prior draft request) so "
-                        "draft_email can run first."
-                    ),
-                })
+                if _em_reply:
+                    return _reply(_em_reply)
+        except Exception as _ee:
+            print(f"[AGENT] email_agent failed (continuing normally): {_ee}")
 
         # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
         urls_in_last = list(force_urls or [])
@@ -3280,8 +1933,9 @@ def run_agent(
                 except Exception as _fe:
                     _forced_observation = f"Tool error: {_fe}"
                 _forced_obs_str = str(_forced_observation)
-                if len(_forced_obs_str) > MAX_OBS_CHARS:
-                    _forced_obs_str = _forced_obs_str[:MAX_OBS_CHARS] + "…"
+                _cap = 12000 if _forced_obs_str.startswith(("Repo:", "GitHub @", "FILE ")) else MAX_OBS_CHARS
+                if len(_forced_obs_str) > _cap:
+                    _forced_obs_str = _forced_obs_str[:_cap] + "…"
 
                 _forced_call_id = "call_forced_browse_0"
                 messages.append({
@@ -3492,6 +2146,9 @@ def run_agent(
                 # Draft cards must never be truncated — synthesis was gluing fields
                 if name in ("draft_email", "send_email"):
                     obs_cap = max(obs_cap, 12000)
+                # Finished research reports and GitHub catalogs (38 skills + descriptions) are long by nature
+                if name == "deep_research" or (name == "browse_url" and obs_str.startswith(("Repo:", "GitHub @"))):
+                    obs_cap = max(obs_cap, 12000)
                 if len(obs_str) > obs_cap:
                     obs_str = (
                         obs_str[:obs_cap]
@@ -3507,23 +2164,13 @@ def run_agent(
                         "content": obs_str,
                     }
                 )
-                # Hard-return email draft/send cards — never let a 429/synthesis
-                # pass re-format or truncate the structured card.
-                if name in ("draft_email", "send_email") and (
-                    _is_email_draft_card(obs_str)
-                    or obs_str.startswith("Draft created")
-                    or obs_str.startswith("Draft updated")
-                    or obs_str.startswith("Draft cancelled")
-                    or obs_str.startswith("Sent to ")
-                ):
-                    logging.getLogger("mojo.agent").info(
-                        "FORCE_EMAIL_CARD_RETURN tool=%s", name
-                    )
-                    if obs_str.startswith("Draft ") and "Bhejna" not in obs_str:
-                        return _reply(
-                            obs_str
-                            + "\n\nBhejna hai to 'send it' / 'bhej do' likho."
-                        )
+                # Finished research report: send as-is (writing + citations already done by research.py).
+                if name == "deep_research" and obs_str.startswith("REPORT\n"):
+                    return _reply(obs_str[len("REPORT\n"):])
+                # e-mail tools return a FINISHED card/sentence (email_agent): hard-return it so a 429 or a
+                # synthesis pass can never re-word, truncate or double up the hint line.
+                if name in ("draft_email", "send_email"):
+                    logging.getLogger("mojo.agent").info("EMAIL_TOOL_RETURN tool=%s", name)
                     return _reply(obs_str)
             # After tools ran this step → next step is synthesis only (no schema payload)
             tools_for_next = None

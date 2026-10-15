@@ -144,7 +144,7 @@ def json_chat(
             except Exception:
                 ok = False
             if not ok:
-                log.warning("%s: %s failed validation", tag, who)
+                log.warning("%s: %s failed validation — got %s", tag, who, json.dumps(obj, ensure_ascii=False)[:220])
                 return None
         return obj
 

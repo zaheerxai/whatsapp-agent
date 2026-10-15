@@ -30,6 +30,7 @@ KNOWN_FEATURES = [
 KNOWN_TOOLS = [
     "search_knowledge",
     "web_search",
+    "deep_research",     # multi-step research -> cited report (costs several search credits)
     "browse_url",
     "get_weather",
     "get_memory",
@@ -922,7 +923,11 @@ def cmd_kbstatus(args):
 
 @command("help", "Lists all available commands.")
 def cmd_help(args):
-    lines = ["Available admin commands:"]
+    """Pretty command list: bold-monospace title, ```/cmd``` ¬ per command, usage as WhatsApp quote(s)."""
+    blocks = []
     for name, info in COMMANDS.items():
-        lines.append(f"/{name} — {info['help']}")
-    return "\n".join(lines)
+        help_lines = [ln.strip() for ln in str(info.get("help") or "").split("\n") if ln.strip()]
+        quoted = [f"> {ln}" for ln in help_lines] or ["> (no description)"]
+        # one quote paragraph per help line (e.g. /ingest has two)
+        blocks.append(f"```/{name}``` ¬\n\n" + "\n\n".join(quoted))
+    return "*`AVAILABLE ADMIN COMMANDS:`*\n\n" + "\n\n\n".join(blocks)

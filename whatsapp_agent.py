@@ -39,6 +39,7 @@ from supabase import create_client, Client
 # Import this AFTER load_dotenv() so it can see the variables
 import admin_commands
 import file_ops
+import bot_voice
 import voice_pipeline  # voice note -> typed-equivalent text (single front door)
 
 # Local file logging as early as possible (captures boot noise). Ephemeral on Render Free.
@@ -974,6 +975,19 @@ def get_contacts_maps():
         return {}, {}
 
 
+def _strip_self_mentions(text: str) -> str:
+    """The model often echoes the '@<bot-id>' it saw in the user's message; resolve_mentions
+    then turns it into a real tag of the BOT ITSELF (prod 2026-10-12: replies opened with
+    '@73109738680505'). The reply already quotes the asker, so drop any self-mention."""
+    if not text:
+        return text
+    ids = [x for x in (BOT_PN, BOT_LID) if x]
+    for i in ids:
+        text = re.sub(rf"(?<!\w)@{re.escape(str(i))}\b[ \t]*[,:]?[ \t]*", "", text)
+    text = re.sub(r"(?i)(?<!\w)@(?:ai ?mojo|mojo)\b[ \t]*[,:]?[ \t]*", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).lstrip("\n")
+
+
 def resolve_mentions(text, reverse_map_or_tuple):
     """Swap @Name for @<number> so WhatsApp's mention parser picks it up.
     Robustly accepts either a reverse_map dict or the full (contacts_map, reverse_map) tuple."""
@@ -1621,7 +1635,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 
     if media_kind in ("audio", "ptt") and not admin_commands.is_feature_enabled(chat_id, "audio"):
         log.info(f"FEATURE_OFF audio disabled for {chat_id}")
-        return "🎤 Voice notes are currently turned off for this chat." if chat_has_any_feature else None
+        return bot_voice.say("voice_off", "ur") if chat_has_any_feature else None
 
 
     # --- MEDIA DOWNLOAD & PROCESSING ---
@@ -3085,6 +3099,7 @@ def _process_message_inner(client, message):
                         hist_urls = [LAST_URL_BY_CHAT[_raw]]
                 except Exception:
                     pass
+            hist_urls = [u for u in hist_urls if not re.match(r"^https?://(?:www\.)?github\.com/[^/?#]+/?$", u)]
             if hist_urls:
                 message_urls = [hist_urls[0]]
                 print(f"[URL HISTORY FALLBACK] chat={_early_chat} -> {message_urls}")
@@ -3257,6 +3272,7 @@ def _process_message_inner(client, message):
                     delete_local=True,
                 )
                 tmp_path = None  # already removed by helper
+                log.info("UPLOADIMG ok kind=%s -> %s/%s", media_kind, result.get("folder"), result.get("remote_name"))
                 admin_reply = (
                     f"✅ Uploaded → OneDrive/{result['folder']}/{result['remote_name']}\n"
                     f"{result.get('webUrl') or ''}"
@@ -3493,7 +3509,7 @@ def _process_message_inner(client, message):
         if own_voice and not _audio_on:
             log.info("FEATURE_OFF audio disabled for %s", chat_id)
             if admin_commands.has_any_feature_enabled(chat_id):
-                _say("🎤 Voice notes are currently turned off for this chat.")
+                _say(bot_voice.say("voice_off", "ur"))
             return
 
         if _audio_on:
@@ -3501,18 +3517,18 @@ def _process_message_inner(client, message):
             if own_voice:
                 _secs = _audio_seconds(message.Message)
                 if _secs and _secs > VOICE_MAX_SECONDS:
-                    _say(f"🎤 Voice note bohat lambi hai ({_secs // 60} min). Max {VOICE_MAX_SECONDS // 60} min — chhota karke bhejo.")
+                    _say(bot_voice.say("voice_too_long", "ur", mins=max(1, _secs // 60), max=VOICE_MAX_SECONDS // 60))
                     return
                 _vr = _transcribe_audio_msg(
                     message.Message, chat_id,
                     need_flags=bool(voice_wake_check or _chat_has_recent_url(chat_id)),
                 )
                 if _vr.error and _vr.empty:
-                    _say("🎤 Voice note process nahi ho saki — dobara bhejo ya type kar do.")
+                    _say(bot_voice.say("voice_failed", "ur"))
                     return
                 if _vr.empty:
                     if not voice_wake_check:
-                        _say("🎤 Voice note mein kuch sunai nahi diya — dobara bhejo?")
+                        _say(bot_voice.say("voice_empty", "ur"))
                     return
                 if voice_wake_check and not _vr.addressed_to_bot:
                     # Not for us: keep it in history (summaries/context), stay silent.
@@ -3652,6 +3668,7 @@ def _process_message_inner(client, message):
     )
     log.info("AI_REPLY chat=%s text=%r", chat_id, ai_answer)
 
+    ai_answer = _strip_self_mentions(ai_answer)
     _, reverse_map = get_contacts_maps()
     ai_answer = resolve_mentions(ai_answer, reverse_map)
 

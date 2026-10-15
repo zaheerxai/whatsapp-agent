@@ -53,14 +53,29 @@ _lock = threading.Lock()
 CACHE_TTL = 600
 
 
+# Providers that are real search engines / agent-search APIs: their ranking IS the relevance
+# signal. The prod regression (2026-10-12): Tavily AND Serper both returned good results for a
+# 13-word LLM-hardware query and my gate rejected them ("needs 6 of 11 literal words in the
+# snippets"), so the model answered from memory. The gate now only polices the keyless ddgs
+# path, where one encyclopedia page answering everything ("Europe") was the real failure.
+TRUSTED = frozenset({"tavily", "serper", "gemini"})
+
+_WORD_RE = re.compile(r"[a-z0-9\+\#\.]{2,}")
+
+
 def _tokens(q: str) -> List[str]:
-    return [t for t in re.findall(r"[a-z0-9\+\#\.]{2,}", (q or "").lower()) if t not in _STOP]
+    return [t for t in _WORD_RE.findall((q or "").lower()) if t not in _STOP]
+
+
+def _stem(t: str) -> str:
+    return t[:6] if len(t) >= 7 else t
 
 
 def relevant(results: List[dict], query: str) -> bool:
-    """Real gate (the old one passed on a single shared token). A result set is relevant if
-    some hit scores >= 0.5 from the provider, or >= 2 of the top 4 hits contain at least half
-    of the query's significant tokens in title+snippet."""
+    """Lenient topical check for UNTRUSTED results. A hit counts when it shares at least a
+    third of the query's significant words (min 1, max 3) as WHOLE WORDS (so "eu" can no
+    longer match "Europe", nor "ai" match "main"). Needs 2 such hits among the top 4
+    (1 if fewer than 3 results). A provider score >= 0.5 short-circuits to relevant."""
     if not results:
         return False
     if any((r.get("score") or 0) >= 0.5 for r in results):
@@ -68,13 +83,13 @@ def relevant(results: List[dict], query: str) -> bool:
     toks = _tokens(query)
     if not toks:
         return True
-    need = max(1, (len(toks) + 1) // 2)
+    need = min(3, max(1, -(-len(toks) // 3)))
     good = 0
     for r in results[:4]:
-        blob = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
-        if sum(1 for t in toks if t in blob) >= need:
+        words = {_stem(w) for w in _WORD_RE.findall(f"{r.get('title', '')} {r.get('snippet', '')}".lower())}
+        if sum(1 for t in toks if _stem(t) in words) >= need:
             good += 1
-    return good >= 2 or (len(results) < 3 and good >= 1)
+    return good >= (2 if len(results) >= 3 else 1)
 
 
 def _open(name: str) -> bool:
@@ -235,17 +250,33 @@ NO_RESULTS = (
 )
 
 
-def search(query: str, num: int = 5, recency: str = "", topic: str = "general") -> str:
-    """Formatted observation, or the NO_RESULTS notice. Never raises."""
-    query = (query or "").strip()
+def current_year() -> int:
+    return time.localtime().tm_year
+
+
+def clean_query(query: str, recency: str = "") -> str:
+    """Models write stale years into 'latest' queries ('...models 2024' in Oct 2026). A past
+    year on a recency-style query poisons the results, so drop it (recency does the work)."""
+    q = (query or "").strip()
+    wants_latest = bool(recency) or bool(
+        re.search(r"(?i)\b(latest|newest|current|recent|up[- ]to[- ]date|today|this (week|month|year)|now)\b", q)
+    )
+    if wants_latest:
+        yr = current_year()
+        q = re.sub(r"\b(?:19|20)\d{2}\b", lambda m: "" if int(m.group(0)) < yr else m.group(0), q)
+    return re.sub(r"\s{2,}", " ", q).strip()
+
+
+def search_data(query: str, num: int = 5, recency: str = "", topic: str = "general"):
+    """-> (provider_name, data, why_log) ; data is None when nothing usable. Never raises."""
+    query = clean_query(query, recency)
     if not query:
-        return "Empty query."
-    ck = f"{query.lower()}|{num}|{recency}|{topic}"
+        return None, None, ["empty query"]
+    ck = f"data|{query.lower()}|{num}|{recency}|{topic}"
     with _lock:
         hit = _cache.get(ck)
         if hit and hit[1] > time.time():
             return hit[0]
-
     why: List[str] = []
     for name, fn in PROVIDERS:
         if not _open(name):
@@ -265,15 +296,59 @@ def search(query: str, num: int = 5, recency: str = "", topic: str = "general") 
         if data is None:
             why.append(f"{name}:skipped")
             continue
-        if not (data.get("grounded") or relevant(data.get("results", []), query)):
+        results = data.get("results", [])
+        if not (data.get("answer") or results):
+            why.append(f"{name}:empty")
+            continue
+        if name not in TRUSTED and not relevant(results, query):
             why.append(f"{name}:off-topic")
             log.info("web_search %s returned off-topic results for %r", name, query)
             continue
-        out = format_results(name, query, data, num)
+        log.info("web_search OK via %s q=%r hits=%d", name, query, len(results))
+        out = (name, data, why)
+        with _lock:
+            _cache[ck] = ((out), time.time() + CACHE_TTL)
+        return out
+    return None, None, why
+
+
+def search(query: str, num: int = 5, recency: str = "", topic: str = "general") -> str:
+    """Formatted observation, or the NO_RESULTS notice. Never raises."""
+    query = (query or "").strip()
+    if not query:
+        return "Empty query."
+    name, data, why = search_data(query, num, recency, topic)
+    if data:
+        out = format_results(name, clean_query(query, recency), data, num)
         if out:
-            with _lock:
-                _cache[ck] = (out, time.time() + CACHE_TTL)
-            log.info("web_search OK via %s q=%r", name, query)
             return out
-        why.append(f"{name}:empty")
-    return NO_RESULTS.format(why="; ".join(why[:6]) or "no provider configured")
+    return NO_RESULTS.format(why="; ".join((why or [])[:6]) or "no provider configured")
+
+
+def extract_pages(urls: List[str], max_chars: int = 3500) -> Dict[str, str]:
+    """Clean page text for the given URLs via Tavily /extract (1 credit per 5 URLs, basic depth).
+    Returns {url: text}; empty when no key or on failure (callers fall back to browse_url)."""
+    key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    urls = [u for u in urls if u][:5]
+    if not key or not urls or not _open("tavily_extract"):
+        return {}
+    try:
+        r = requests.post(
+            "https://api.tavily.com/extract",
+            json={"urls": urls, "extract_depth": "basic"},
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            timeout=25,
+        )
+        if r.status_code in (401, 403, 432, 433):
+            _trip("tavily_extract", 3600, f"HTTP {r.status_code}")
+            return {}
+        r.raise_for_status()
+        out = {}
+        for x in (r.json() or {}).get("results", []):
+            txt = re.sub(r"\s+", " ", (x.get("raw_content") or "")).strip()
+            if txt:
+                out[x.get("url", "")] = txt[:max_chars]
+        return out
+    except Exception as e:
+        log.warning("tavily extract failed: %s", str(e)[:120])
+        return {}

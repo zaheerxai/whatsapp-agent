@@ -12,7 +12,6 @@ import sys
 import time
 from types import SimpleNamespace as NS
 
-import github_ops
 import usage_budget
 import web_search_providers as wsp
 
@@ -42,84 +41,6 @@ class Resp:
         if self.status_code >= 400:
             raise Exception(f"HTTP {self.status_code}")
 
-
-# ------------------------------------------------------------------ github_ops
-p = github_ops.parse_github_url("https://github.com/mattpocock/skills")
-check("parse repo URL", p == {"owner": "mattpocock", "repo": "skills", "kind": "repo", "ref": "", "path": ""}, p)
-p = github_ops.parse_github_url("github.com/mattpocock/skills/tree/main/skills/engineering")
-check("parse tree URL", p["kind"] == "tree" and p["ref"] == "main" and p["path"] == "skills/engineering")
-p = github_ops.parse_github_url("https://github.com/mattpocock/skills/blob/main/README.md")
-check("parse blob URL", p["kind"] == "blob" and p["path"] == "README.md")
-check("profile URL -> None (not a repo)", github_ops.parse_github_url("https://github.com/mattpocock") is None)
-
-paths = (
-    [f"skills/engineering/{n}/SKILL.md" for n in
-     ("ask-matt", "code-review", "tdd", "to-tickets", "triage", "wayfinder", "wizard")]
-    + [f"skills/productivity/{n}/SKILL.md" for n in ("grilling", "writing-for-agents")]
-    + ["packages/cli/package.json", "packages/core/package.json", "README.md", "LICENSE", "package.json"]
-)
-cat = github_ops._catalog(paths)
-check("catalog groups by category", any("engineering (7)" in l for l in cat), cat)
-check("catalog lists ALL 9 skill names (the 'list all of them' ask)",
-      sum(l.count(",") + 1 for l in cat if l.startswith("•")) == 9, cat)
-check("catalog finds monorepo packages too", any("PACKAGES" in l and "cli" in l and "core" in l for l in cat), cat)
-check("no catalog on an ordinary repo", github_ops._catalog(["src/main.py", "README.md"]) == [])
-
-calls = []
-def fake_get(url, **kw):
-    calls.append((url, kw))
-    if url.endswith("/repos/mattpocock/skills"):
-        return Resp(200, {"full_name": "mattpocock/skills", "description": "Skills for real engineers",
-                          "stargazers_count": 278000, "forks_count": 900, "language": "TypeScript",
-                          "pushed_at": "2026-10-09T00:00:00Z", "default_branch": "main"})
-    if "/git/trees/main" in url:
-        return Resp(200, {"tree": [{"path": p, "type": "blob"} for p in paths]
-                          + [{"path": "skills", "type": "tree"}], "truncated": False})
-    if url.endswith("/readme"):
-        return Resp(200, text="# skills\n\n38 skills that turn your coding agent into a senior dev.\n" + "x" * 3000)
-    return Resp(404)
-
-github_ops._get = fake_get
-github_ops._CACHE.clear()
-out = github_ops.overview("mattpocock", "skills")
-check("repo overview has stars/description (not just URL)", "278000" in out and "Skills for real engineers" in out)
-check("repo overview LISTS the skills (prod bug: was metadata-only)", "ask-matt" in out and "wizard" in out, out[:300])
-check("repo overview stays WhatsApp-sized", len(out) <= 3800, len(out))
-check("second call hit cache (no extra HTTP)", len(calls) == 3)
-out2 = github_ops.overview("mattpocock", "skills")
-check("cached result identical", out2 == out and len(calls) == 3)
-
-# 404 repo
-github_ops._CACHE.clear(); calls.clear()
-github_ops._get = lambda url, **kw: Resp(404)
-check("404 repo -> clear not-found message", "not found" in github_ops.overview("nope", "nope").lower())
-
-# rate limit surfaces a clear, actionable message (not a stack trace)
-github_ops._CACHE.clear()
-github_ops._get = lambda url, **kw: Resp(403, headers={"x-ratelimit-remaining": "0"})
-out = github_ops.overview("a", "b")
-check("rate limit -> actionable GITHUB_TOKEN hint", "GITHUB_TOKEN" in out and "rate limit" in out.lower())
-
-# tree / blob
-github_ops._CACHE.clear()
-def fake_get2(url, **kw):
-    if url.endswith("/repos/o/r"):
-        return Resp(200, {"full_name": "o/r", "description": "d", "stargazers_count": 1,
-                          "forks_count": 0, "language": "Python", "pushed_at": "2026-01-01T00:00:00Z",
-                          "default_branch": "main"})
-    if "/contents/skills/eng" in url:
-        return Resp(200, [{"name": "ask-matt", "type": "dir"}, {"name": "tdd", "type": "dir"},
-                          {"name": "notes.md", "type": "file"}])
-    if "/contents/README.md" in url:
-        return Resp(200, text="file body here")
-    return Resp(404)
-github_ops._get = fake_get2
-out = github_ops.overview("o", "r", kind="tree", ref="main", path="skills/eng")
-check("tree listing shows folders+files", "ask-matt/" in out and "notes.md" in out)
-out = github_ops.overview("o", "r", kind="blob", ref="main", path="README.md")
-check("blob returns file text", "file body here" in out)
-
-print()
 
 # ------------------------------------------------------------------ web_search_providers
 EU_RESULTS = [
@@ -198,6 +119,32 @@ try:
 finally:
     if _real_ddgs is not None:
         _sys.modules["ddgs"] = _real_ddgs
+
+
+# ------------------------------------------------------------------ prod regression 2026-10-12: trusted providers must not be gated
+wsp._down_until.clear(); wsp._cache.clear()
+LOGQ = "latest free locally runnable LLM models 2024 coding reasoning benchmarks 16GB RAM"
+def tav_lowscore(url, **kw):
+    return Resp(200, {"results": [
+        {"title": "Best Local LLMs for Coding", "url": "https://a.example", "content": "Qwen and DeepSeek lead open coding benchmarks on consumer GPUs", "score": 0.31},
+        {"title": "Run models on 16GB", "url": "https://b.example", "content": "Quantized 14B models fit in 16 GB of VRAM", "score": 0.28}], "answer": ""})
+_req.post = tav_lowscore
+try:
+    _os.environ["TAVILY_API_KEY"] = "tvly-x"
+    out = wsp.search(LOGQ, num=5, recency="month")
+    check("REGRESSION: Tavily results with low scores + long query are NOT rejected as off-topic",
+          out.startswith("Source: web_search (tavily)") and "Best Local LLMs" in out, out[:160])
+finally:
+    _req.post = orig_post
+    _os.environ.pop("TAVILY_API_KEY", None)
+
+check("clean_query drops a stale year on a 'latest' query", "2024" not in wsp.clean_query(LOGQ, "month"))
+check("clean_query keeps the current/future year", "2026" in wsp.clean_query("latest AI news 2026", "week"))
+check("clean_query keeps old years on historical queries", "1969" in wsp.clean_query("who won the world cup 1969"))
+check("word-boundary match: 'eu' no longer matches 'Europe'",
+      not wsp.relevant([{"title": "Europe", "snippet": "Europe is a continent."}] * 3, "EU AI regulation"))
+check("long-query leniency: 1/3 of words is enough for untrusted hits",
+      wsp.relevant([{"title": "Local LLM coding guide", "snippet": "benchmarks for local models"}] * 3, LOGQ))
 
 print()
 

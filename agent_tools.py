@@ -7,8 +7,10 @@ Permission-sensitive tools (send_message_to, python_exec) check OWNER_SENDER_ID.
 
 from __future__ import annotations
 
+import bot_voice
 import usage_budget
 import github_ops
+import research
 import web_search_providers
 import json
 import logging
@@ -188,6 +190,40 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "deep_research",
+            "description": (
+                "Multi-step web research that returns a FINISHED, cited report. Use it (once) whenever "
+                "the user asks to 'research', wants a 'thorough/detailed report', a comparison, "
+                "'what should I buy', or the latest state of a fast-moving topic that needs several "
+                "angles (options + requirements + prices ...). It plans 3-6 searches, reads the best "
+                "pages and writes the report itself — do NOT call web_search repeatedly for these and "
+                "do not rewrite the result. For one quick fact use web_search instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "The complete, self-contained research question with EVERY constraint the user "
+                            "gave (budget, hardware, region, free/open-source, use case). Include context "
+                            "from the conversation if the message alone is ambiguous."
+                        ),
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["standard", "deep"],
+                        "description": "standard = 4 searches/3 pages (default); deep = 6 searches/5 pages for 'very thorough'.",
+                        "default": "standard",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "browse_url",
             "description": (
                 "Fetch live content of a public URL. "
@@ -209,6 +245,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "url": {
                         "type": "string",
                         "description": "Full https URL (GitHub profile, repo, article, etc.)",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Start reading at this character offset (to continue a long page/file/README the previous call said was cut: use the offset it printed).",
+                        "default": 0,
                     },
                     "max_chars": {
                         "type": "integer",
@@ -706,1107 +747,18 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
 
 # ---------------------------------------------------------------------------
-# Email draft store
-# Owner-only; keyed primarily by chat_id so LID vs phone number never misses.
-# Also mirrored under chat|sender_id and chat|sender_num for safety.
-# Optional /tmp JSON so a quick process bounce still has the last draft.
+# E-mail tools — thin wrappers over email_agent (the single e-mail brain).
+# Used when the MODEL decides to draft (e.g. "email me this report" after research); direct
+# user e-mail turns are routed earlier in agent_loop by email_agent.handle().
 # ---------------------------------------------------------------------------
-
-_EMAIL_DRAFTS: Dict[str, Dict[str, Any]] = {}
-_EMAIL_DRAFT_FILE = os.environ.get(
-    "EMAIL_DRAFT_FILE", "/tmp/mojo_email_drafts.json"
-)
-
-
-def _draft_keys(ctx: dict) -> List[str]:
-    chat = str((ctx or {}).get("chat_id") or "").strip()
-    sid = str((ctx or {}).get("sender_id") or "").strip()
-    snum = str((ctx or {}).get("sender_num") or "").strip()
-    keys: List[str] = []
-    if chat:
-        keys.append(f"{chat}|owner")  # primary stable key for owner drafts
-        if sid:
-            keys.append(f"{chat}|{sid}")
-        if snum and snum != sid:
-            keys.append(f"{chat}|{snum}")
-    return keys
-
-
-def _draft_key(ctx: dict) -> str:
-    keys = _draft_keys(ctx)
-    return keys[0] if keys else "unknown"
-
-
-def _load_drafts_from_disk() -> None:
-    if _EMAIL_DRAFTS:
-        return
-    try:
-        if os.path.isfile(_EMAIL_DRAFT_FILE):
-            with open(_EMAIL_DRAFT_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                _EMAIL_DRAFTS.update(data)
-    except Exception as e:
-        print(f"[email_draft] load failed: {e}")
-
-
-def _save_drafts_to_disk() -> None:
-    try:
-        with open(_EMAIL_DRAFT_FILE, "w", encoding="utf-8") as f:
-            json.dump(_EMAIL_DRAFTS, f)
-    except Exception as e:
-        print(f"[email_draft] save failed: {e}")
-
-
-def _get_draft(ctx: dict) -> Optional[Dict[str, Any]]:
-    _load_drafts_from_disk()
-    for k in _draft_keys(ctx):
-        d = _EMAIL_DRAFTS.get(k)
-        if d:
-            return d
-    return None
-
-
-def _put_draft(ctx: dict, draft: Dict[str, Any]) -> None:
-    _load_drafts_from_disk()
-    for k in _draft_keys(ctx):
-        _EMAIL_DRAFTS[k] = draft
-    _save_drafts_to_disk()
-
-
-def _pop_draft(ctx: dict) -> Optional[Dict[str, Any]]:
-    _load_drafts_from_disk()
-    draft = _get_draft(ctx)
-    for k in list(_EMAIL_DRAFTS.keys()):
-        # drop every key that points at this same draft object / chat
-        chat = str((ctx or {}).get("chat_id") or "")
-        if chat and k.startswith(f"{chat}|"):
-            _EMAIL_DRAFTS.pop(k, None)
-    _save_drafts_to_disk()
-    return draft
-
-
-def _format_draft(d: Dict[str, Any]) -> str:
-    """WhatsApp-native draft card — one field per line, no glued *markers*."""
-    attach = d.get("attach_resume") or "ask"
-    attach_line = {
-        "true": "yes (resume PDF)",
-        "false": "no",
-        "ask": "undecided — reply yes/no",
-    }.get(attach, attach)
-    if d.get("reason") and attach == "ask":
-        attach_line += f" ({d['reason']})"
-
-    body = (d.get("body") or "").strip() or "(empty)"
-    lines = [
-        "*Email draft*",
-        "",
-        f"*To:* {d.get('to') or '(missing)'}",
-    ]
-    if d.get("cc"):
-        lines.append(f"*Cc:* {d['cc']}")
-    lines.extend(
-        [
-            f"*Subject:* {d.get('subject') or '(missing)'}",
-            f"*Attach:* {attach_line}",
-            "",
-            "*Body:*",
-            body,
-            "",
-            "_Edit karo, ya 'send it' / 'bhej do' likho._",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _owner_ok(ctx: dict) -> bool:
-    if not _OWNER_SENDER_ID:
-        return False
-    owner = str(_OWNER_SENDER_ID).strip()
-    sid = str((ctx or {}).get("sender_id") or "").strip()
-    snum = str((ctx or {}).get("sender_num") or "").strip()
-    # Also accept bare number match when LID/server suffix present
-    candidates = {sid, snum}
-    for c in list(candidates):
-        if c and "@" in c:
-            candidates.add(c.split("@")[0])
-        if c and c.isdigit():
-            candidates.add(c)
-    return owner in candidates or any(
-        c == owner or c.endswith(owner) or owner.endswith(c)
-        for c in candidates
-        if c
-    )
-
-
-# Meta instructions that mean "rewrite the body" — NOT part of the email itself.
-# Matched anywhere in the user message (before or after the ':').
-_EMAIL_REWRITE_PATTERNS = (
-    r"make\s+it\s+(?:more\s+)?(?:professional|formal|casual|friendly|polite|short|concise|warm|firm|assertive)",
-    r"rewrite(?:\s+it)?(?:\s+in\s+(?:a\s+)?[\w\s\-]+)?",
-    r"rephrase(?:\s+it)?",
-    r"polish(?:\s+it)?",
-    r"improve(?:\s+it)?",
-    r"formal\s+(?:bana|kar|tone)",
-    r"professional\s+(?:bana|kar|tone|likho|likh)",
-    r"(?:bana|kar)\s+(?:do\s+)?(?:professional|formal|casual|polite)",
-    r"in\s+a\s+[\w\-]+\s+tone",
-    r"tone\s*:\s*\w+",
-    r"more\s+professional",
-    r"more\s+formal",
-    r"keep\s+it\s+(?:short|brief|casual|formal|professional)",
-    r"word\s+it\s+(?:professionally|formally|politely|better)",
-)
-
-
-def extract_email_rewrite_instruction(text: str) -> str:
-    """Return the rewrite instruction phrase if present, else ''."""
-    if not text:
-        return ""
-    found: List[str] = []
-    for pat in _EMAIL_REWRITE_PATTERNS:
-        for m in re.finditer(pat, text, flags=re.I):
-            found.append(m.group(0).strip())
-    # de-dupe preserving order
-    seen = set()
-    out: List[str] = []
-    for f in found:
-        k = f.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(f)
-    return "; ".join(out)
-
-
-def strip_email_rewrite_instruction(text: str) -> str:
-    """Remove meta rewrite phrases so they never land in the email body."""
-    if not text:
-        return ""
-    t = text
-    for pat in _EMAIL_REWRITE_PATTERNS:
-        t = re.sub(pat, " ", t, flags=re.I)
-    # leftover glue: " , " / double spaces / trailing "and"
-    t = re.sub(r"\s*,\s*,+", ",", t)
-    t = re.sub(r"\s{2,}", " ", t)
-    t = re.sub(r"\s+,", ",", t)
-    t = re.sub(r",\s*$", "", t.strip())
-    t = re.sub(r"^(?:and|please|pls)\s+", "", t, flags=re.I)
-    t = re.sub(r"\s+(?:and|please|pls)$", "", t, flags=re.I)
-    return t.strip(" \t\n\r,;:-")
-
-
-def parse_direct_email_command(text: str) -> Optional[Dict[str, str]]:
-    """
-    Parse outbound email commands.
-
-    Default policy: body is WORD-FOR-WORD from the user (after stripping
-    recipient / subject / rewrite-meta phrases).
-
-    Returns dict with keys:
-      to, subject, body, rewrite (instruction or ''), exact ('true'|'false')
-    exact=true → force path should store body as-is.
-    exact=false → agent/LLM may rewrite using 'rewrite' instruction.
-    """
-    if not text:
-        return None
-    # Strip bot @mention + quoted blocks for parsing (body still from remaining)
-    t = re.sub(r"@\d[\d\s]*", " ", text)
-    t = re.sub(r"\[Quoted Message\]:.*", " ", t, flags=re.I | re.S)
-    t = t.strip()
-    if not t:
-        return None
-
-    rewrite = extract_email_rewrite_instruction(t)
-
-    # Broad recipient patterns (EN + Roman Urdu)
-    #   send email to X: / email this to X / email X ko: / mail X:
-    #   send Email lucie@x.com ko:
-    m = re.search(
-        r"(?:"
-        r"email\s+this\s+to|email\s+to|send\s+(?:this\s+)?email\s+to|"
-        r"send\s+email|email\s+kar(?:na|o|do)?|"
-        r"mail\s+this\s+to|mail\s+to|mail\s+kar(?:na|o|do)?|"
-        r"email|mail|send"
-        r")"
-        r"\s*"
-        r"(?:to\s+)?"
-        r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})"
-        r"(?:\s*ko)?"
-        r"\s*:?\s*",
-        t,
-        flags=re.I,
-    )
-    if not m:
-        # Fallback: any email after a send/email/mail keyword
-        if not re.search(r"\b(?:email|mail|send)\b", t, flags=re.I):
-            return None
-        em = re.search(
-            r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})",
-            t,
-        )
-        if not em:
-            return None
-        to = em.group(1).strip()
-        # body = everything except the email address and command words
-        rest = (t[: em.start()] + " " + t[em.end() :]).strip()
-        rest = re.sub(
-            r"(?i)\b(?:send\s+)?(?:this\s+)?(?:email|mail)(?:\s+this)?(?:\s+to)?\b",
-            " ",
-            rest,
-        )
-        rest = re.sub(r"(?i)\bko\b", " ", rest)
-        rest = re.sub(r"\s{2,}", " ", rest).strip(" \t\n\r:")
-    else:
-        to = m.group(1).strip()
-        rest = t[m.end() :].strip()
-        # Also strip a leading "ko:" leftover
-        rest = re.sub(r"(?i)^ko\s*:?\s*", "", rest).strip()
-
-    subject = ""
-    body = rest
-    sm = re.match(
-        r"(?is)^(?:subject|subj)\s*:\s*(.+?)(?:\n+|$)(.*)$",
-        rest,
-    )
-    if sm:
-        subject = sm.group(1).strip()
-        body = (sm.group(2) or "").strip()
-
-    # Strip rewrite meta from body (never ship "make it professional" to recipient)
-    body = strip_email_rewrite_instruction(body)
-    if subject:
-        subject = strip_email_rewrite_instruction(subject)
-
-    if not body:
-        # Maybe the only content was a rewrite instruction — still need something
-        body = rest.strip()
-        body = strip_email_rewrite_instruction(body)
-    if not body:
-        return None
-
-    if not subject:
-        subject = "Quick note"
-
-    exact = "false" if rewrite else "true"
-    return {
-        "to": to,
-        "subject": subject,
-        "body": body,
-        "rewrite": rewrite,
-        "exact": exact,
-    }
-
-
-def is_job_apply_intent(text: str) -> bool:
-    """True when user wants to apply to a quoted/pasted JD."""
-    if not text:
-        return False
-    head = re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
-    head = re.sub(r"@\d[\d\s]*", " ", head)
-    head = re.sub(r"https?://\S+", " ", head)
-    low = head.lower()
-    phrases = (
-        "apply to this",
-        "apply for this",
-        "apply to the job",
-        "apply for the job",
-        "apply karo",
-        "apply kar do",
-        "apply kar dena",
-        "is job pe apply",
-        "is pe apply",
-        "job pe apply",
-        "send my cv",
-        "send my resume",
-        "send cv",
-        "send resume",
-        "cover letter bhej",
-        "application bhej",
-        "apply now",
-    )
-    if any(p in low for p in phrases):
-        return True
-    if re.search(r"(?<!\w)apply(?!\w)", low) and re.search(
-        r"(?i)job|hiring|position|recruiter|vacancy|jd\b|role\b",
-        text,
-    ):
-        return True
-    return False
-
-
-def parse_job_apply_command(text: str) -> Optional[Dict[str, str]]:
-    """
-    Extract apply target from a message that quotes/pastes a JD.
-
-    Returns {to, subject, jd_excerpt, attach_resume} or None if not apply intent.
-    Email is taken from the JD (e.g. hr@samagroup.com). Never ask the user for
-    an address that is already present in the quoted text.
-    """
-    if not text or not is_job_apply_intent(text):
-        return None
-
-    quoted = ""
-    qm = re.search(r"\[Quoted Message\]:\s*(.+)$", text, flags=re.I | re.S)
-    if qm:
-        quoted = qm.group(1)
-    search_blob = quoted or text
-
-    # WhatsApp JDs often use Mathematical Bold/Italic Unicode (𝗛𝗶𝗿𝗶𝗻𝗴 / 𝐑𝐨𝐥𝐞).
-    # NFKC maps those to plain ASCII so Role:/Hiring: regexes work.
-    try:
-        import unicodedata as _ud
-
-        search_blob = _ud.normalize("NFKC", search_blob)
-        if quoted:
-            quoted = _ud.normalize("NFKC", quoted)
-    except Exception:
-        pass
-
-    try:
-        import email_ops as eo
-
-        emails = eo.extract_emails(search_blob) or eo.extract_emails(text)
-    except Exception:
-        emails = re.findall(
-            r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-            search_blob,
-        )
-
-    cleaned: List[str] = []
-    seen = set()
-    for e in emails or []:
-        el = e.lower().strip()
-        if el in seen or el.endswith("@lid") or "whatsapp" in el:
-            continue
-        seen.add(el)
-        cleaned.append(e.strip())
-
-    to = cleaned[0] if cleaned else ""
-
-    _TITLE_TOKEN = (
-        r"developer|engineer|recruiter|executive|manager|designer|analyst|"
-        r"intern|specialist|consultant|lead|sales|marketing|writer|officer|"
-        r"associate|architect|scientist|coordinator"
-    )
-
-    def _clean_title(raw: str) -> str:
-        s = (raw or "").strip()
-        s = re.sub(r"[*_`]", "", s)
-        if "|" in s:
-            # "Hiring | CAD Application Engineer" → keep side that looks like a title
-            parts = [p.strip() for p in s.split("|")]
-            scored = sorted(
-                parts,
-                key=lambda p: (
-                    0 if re.search(rf"(?i){_TITLE_TOKEN}", p) else 1,
-                    len(p),
-                ),
-            )
-            s = scored[0] if scored else s
-        s = re.sub(
-            r"(?i)^\s*(?:we'?re\s+hiring|hiring\s+now|hiring|position|role|title)\s*[:\-–]?\s*",
-            "",
-            s,
-        ).strip()
-        s = re.sub(r"\s{2,}", " ", s).strip(" -–|:")
-        return s
-
-    def _is_job_title(s: str) -> bool:
-        if not s or len(s) < 3 or len(s) > 70:
-            return False
-        low = s.lower()
-        # Reject skill/responsibility fragments
-        if re.search(
-            r"(?i)^(improve|develop|perform|provide|work|collaborate|generate|"
-            r"maintain|build|create|handle|manage|understand|good|strong|basic|"
-            r"experience|knowledge|understanding|ability|exposure)\b",
-            low,
-        ):
-            return False
-        if re.search(
-            r"(?i)understanding of|knowledge of|experience (?:in|with)|"
-            r"workflows through|drawings and|problem.?solving",
-            low,
-        ):
-            return False
-        return bool(re.search(rf"(?i){_TITLE_TOKEN}", s))
-
-    subject = ""
-    role = ""
-
-    sm = re.search(r"(?im)^(?:email\s+)?subject\s*:\s*(.+)$", search_blob)
-    if sm:
-        subject = _clean_title(sm.group(1))
-
-    # Explicit Role: / Position: / Title: (after NFKC this catches 𝗥𝗼𝗹𝗲:)
-    if not role:
-        pm = re.search(
-            r"(?i)(?:position|role|title)\s*:\s*\*?([^\n*]+)",
-            search_blob,
-        )
-        if pm:
-            cand = _clean_title(pm.group(1))
-            if _is_job_title(cand):
-                role = cand
-
-    # "We're Hiring: Remote B2B Sales Consultants"
-    # "We're Hiring | *CAD Application Engineer*"
-    if not role:
-        hm = re.search(
-            r"(?i)(?:we'?re\s+hiring|hiring\s+now|hiring|looking\s+for)\s*[:\-–|]\s*\*?([^*\n]+)",
-            search_blob,
-        )
-        if hm:
-            cand = _clean_title(hm.group(1))
-            if _is_job_title(cand):
-                role = cand
-
-    # Multi-role hiring lists only (short title-like bullets, not skill lists)
-    roles_list: List[str] = []
-    for m in re.finditer(
-        r"(?im)^\s*[-•*]\s*\*?([^*\n]{3,50}?)\*?\s*$",
-        search_blob,
-    ):
-        cand = _clean_title(m.group(1))
-        if _is_job_title(cand) and len(cand.split()) <= 5:
-            roles_list.append(cand)
-    # Deduplicate preserving order
-    seen_r = set()
-    roles_list = [
-        r
-        for r in roles_list
-        if not (r.lower() in seen_r or seen_r.add(r.lower()))
-    ]
-
-    if not role and roles_list:
-        ranked = sorted(
-            roles_list,
-            key=lambda r: (
-                0
-                if re.search(
-                    r"(?i)wordpress|web|full.?stack|software|developer|engineer",
-                    r,
-                )
-                else 1
-            ),
-        )
-        role = ranked[0]
-        if len(ranked) > 1:
-            role = " / ".join(ranked[:3])
-
-    # First line often is the title
-    if not role:
-        first = (search_blob.strip().split("\n", 1)[0] or "").strip()
-        first = _clean_title(first)
-        if _is_job_title(first):
-            role = first
-
-    company = ""
-    cm = re.search(
-        r"(?i)\b([A-Z][A-Za-z0-9&.\' ]{2,40}?)\s+(?:is\s+hiring|is\s+looking|"
-        r"are\s+hiring|we're\s+hiring|we\s+are\s+hiring)",
-        search_blob,
-    )
-    if cm:
-        company = cm.group(1).strip().strip("*")
-
-    if not subject:
-        if role and " / " not in role:
-            subject = f"Application - {role}"
-        elif role:
-            # Multi-role: subject uses best-fit (first segment)
-            subject = f"Application - {role.split(' / ')[0].strip()}"
-        elif company:
-            subject = f"Application - {company}"
-        else:
-            subject = "Job Application"
-
-    return {
-        "to": to,
-        "subject": subject,
-        "role": role
-        or re.sub(r"(?i)^\s*application\s*[–\-:]\s*", "", subject).strip(),
-        "company": company,
-        "roles_list": ",".join(roles_list),
-        "jd_excerpt": (quoted or search_blob).strip()[:3500],
-        "attach_resume": "true",
-        "emails_found": ",".join(cleaned),
-    }
-
-
-def _edit_instruction_text(text: str) -> str:
-    """
-    Prefer quoted instruction when the live message is only a mention/empty.
-
-    WhatsApp UX: user types the edit, then replies to it with @bot — the real
-    instruction lives in [Quoted Message], not the mention line.
-    """
-    if not text:
-        return ""
-    quoted = ""
-    qm = re.search(r"\[Quoted Message\]:\s*(.+)$", text, flags=re.I | re.S)
-    if qm:
-        quoted = qm.group(1).strip()
-    live = re.split(r"\[Quoted Message\]:", text, maxsplit=1, flags=re.I)[0]
-    live = re.sub(r"@\d[\d\s]*", " ", live)
-    live = re.sub(r"\s+", " ", live).strip()
-    if quoted and (not live or len(live) < 8):
-        return quoted
-    if live and quoted:
-        low = live.lower()
-        if not any(
-            k in low
-            for k in (
-                "remove",
-                "change",
-                "subject",
-                "rewrite",
-                "personalize",
-                "edit",
-                "update",
-                "keep",
-            )
-        ):
-            return f"{live}\n{quoted}"
-        return live
-    return live or quoted
-
-
-def parse_draft_field_edits(text: str) -> Optional[Dict[str, str]]:
-    """
-    Deterministic draft edits from instructions like:
-      Change subject to Application - Full Stack Developer
-      Remove (0-2 years) wherever it is
-      Remove LinkedIn from subject and body, keep everything else
-
-    Replacement values are SAME-LINE only so following paragraphs
-    (personalize / format instructions) are never swallowed into body_replace.
-    """
-    if not text:
-        return None
-    t = _edit_instruction_text(text)
-    t = re.sub(r"@\d[\d\s]*", " ", t)
-    t = t.strip()
-    if not t:
-        return None
-
-    out: Dict[str, str] = {}
-
-    # Prefer quoted subject: Change subject to "Application - CAD …"
-    sm = re.search(
-        r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*"
-        r'[""\']([^""\']+)[""\']',
-        t,
-    )
-    if not sm:
-        sm = re.search(
-            r"(?i)(?:change|set|update)\s+(?:the\s+)?subject\s+to\s+[:\-]?\s*"
-            r"([^\n]+)",
-            t,
-        )
-    if sm:
-        subj = sm.group(1).strip().strip("\"'").rstrip(".,;")
-        # Stop before "and role…" / "and the body…"
-        subj = re.split(
-            r"(?i)\s+and\s+(?:(?:the\s+)?role\b|(?:the\s+)?(?:second\s+line|body|line)\b)",
-            subj,
-            maxsplit=1,
-        )[0].strip()
-        subj = subj.strip("\"'").rstrip(".,;")
-        if subj and len(subj) < 120:
-            out["subject"] = subj
-
-    # Change role in email body to "CAD Application Engineer"
-    role_m = re.search(
-        r"(?i)(?:change\s+)?role\s+(?:in\s+(?:the\s+)?(?:email\s+)?body\s+)?"
-        r"to\s+[:\-]?\s*[""\']?([^""\'\n]{3,80})[""\']?",
-        t,
-    )
-    if role_m:
-        new_role = role_m.group(1).strip().strip("\"'").rstrip(".,;")
-        if new_role and " and " not in new_role.lower():
-            out["body_role"] = new_role
-
-    # "old" to "new" — quoted, never cross newlines
-    rm = re.search(
-        r"(?i)(?:change|replace|update)?\s*[\"']([^\"'\n]{2,80})[\"']\s+"
-        r"(?:to|with|->)\s+[\"']?([^\"'\n]{1,80})[\"']?",
-        t,
-    )
-    if rm:
-        find_s = rm.group(1).strip()
-        repl_s = rm.group(2).strip().rstrip(".,;")
-        if find_s and repl_s and "\n" not in repl_s and len(repl_s) <= 80:
-            if find_s.lower() not in (out.get("subject") or "").lower():
-                out["body_find"] = find_s
-                out["body_replace"] = repl_s
-
-    # Unquoted surgical replace (phone / LID fixes):
-    #   replace the 73109... number with +923161545875
-    #   replace 73109738680505 with +923161545875, everything else as is
-    if "body_find" not in out:
-        rm2 = re.search(
-            r"(?i)replace\s+(?:the\s+)?([+\d][\d.\s…]{3,30}?)\s*"
-            r"(?:number\s+)?(?:with|to|->|=)\s*([+\d][\d\s\-()]{6,24})",
-            t,
-        )
-        if not rm2:
-            rm2 = re.search(
-                r"(?i)replace\s+(?:the\s+)?(.{2,40}?)\s+"
-                r"(?:with|to|->)\s+(.{1,40}?)(?:\s*,?\s*(?:everything|keep|no change)|$)",
-                t,
-            )
-        if rm2:
-            find_s = rm2.group(1).strip().strip("\"'")
-            find_s = re.sub(r"(?i)\s*(?:number|instead)\s*$", "", find_s).strip()
-            repl_s = rm2.group(2).strip().strip("\"'").rstrip(".,;")
-            repl_s = re.sub(
-                r"(?i)\s*(?:instead|everything|as is|no change).*$",
-                "",
-                repl_s,
-            ).strip()
-            if find_s and repl_s and len(find_s) <= 40 and len(repl_s) <= 40:
-                out["body_find"] = find_s
-                out["body_replace"] = repl_s
-
-    # Collect ALL surgical remove phrases in one message
-    remove_phrases: List[str] = []
-
-    def _add_remove(p: str) -> None:
-        p = (p or "").strip().strip("\"'").rstrip(".,;")
-        p = re.sub(r"(?i)\s+from\s+(?:role|subject|body|title).*$", "", p).strip()
-        p = re.sub(r"(?i)\s+wherever\s+it\s+is.*$", "", p).strip()
-        if p and 1 < len(p) <= 80 and p.lower() not in {
-            x.lower() for x in remove_phrases
-        }:
-            remove_phrases.append(p)
-
-    # remove X from subject/body/role
-    for m in re.finditer(
-        r"(?i)remove\s+[\"']?([^\"'\n]{1,80}?)[\"']?\s+"
-        r"from\s+(?:the\s+)?(?:role\s+in\s+)?(?:subject|body|title|role)",
-        t,
-    ):
-        _add_remove(m.group(1))
-    # remove X wherever it is / remove the "Y"
-    for m in re.finditer(
-        r"(?i)remove\s+(?:the\s+)?[\"']([^\"'\n]{1,80})[\"']",
-        t,
-    ):
-        _add_remove(m.group(1))
-    for m in re.finditer(
-        r"(?i)remove\s+(\([^)\n]{1,40}\))\s*(?:wherever\s+it\s+is)?",
-        t,
-    ):
-        _add_remove(m.group(1))
-    for m in re.finditer(
-        r"(?i)remove\s+([A-Za-z0-9][^,\n]{0,60}?)\s+wherever\s+it\s+is",
-        t,
-    ):
-        _add_remove(m.group(1))
-    # also remove the "..."
-    for m in re.finditer(
-        r"(?i)(?:also\s+)?remove\s+(?:the\s+)?[\"']([^\"'\n]{1,80})[\"']",
-        t,
-    ):
-        _add_remove(m.group(1))
-
-    if remove_phrases:
-        # Primary single + joined list for multi-remove
-        out["remove_phrase"] = remove_phrases[0]
-        out["remove_phrases"] = "|||".join(remove_phrases)
-
-    # "The position is only Business Development Executive"
-    only_m = re.search(
-        r"(?i)(?:position|role|title)\s+is\s+only\s+[:\-]?\s*"
-        r"[\"']?([^\"'\n,]{3,80})[\"']?",
-        t,
-    )
-    if only_m:
-        only_role = only_m.group(1).strip().strip("\"'").rstrip(".,;")
-        only_role = re.split(
-            r"(?i)\s*,\s*remove\b|\s+remove\b|\s+and\s+remove\b",
-            only_role,
-            maxsplit=1,
-        )[0].strip()
-        if only_role:
-            out["position_only"] = only_role
-            if "subject" not in out:
-                out["subject"] = f"Application - {only_role}"
-
-    low = t.lower()
-    # Preserve-as-is cues: do NOT trigger full rewrite
-    preserve_cues = (
-        "keep everything else",
-        "keep the rest",
-        "rest as is",
-        "as is",
-        "same body",
-        "only change",
-        "just remove",
-        "sirf remove",
-        "bas remove",
-    )
-    rewrite_cues = (
-        "personalize",
-        "personalized",
-        "personalise",
-        "high impact",
-        "high-impact",
-        "rewrite",
-        "rephrase",
-        "polish",
-        "paragraph",
-        "line break",
-        "line breaks",
-        "better format",
-        "format the body",
-        "more relevant",
-        "relevantly",
-        "improve",
-    )
-    if any(c in low for c in rewrite_cues) and not any(
-        c in low for c in preserve_cues
-    ):
-        out["wants_rewrite"] = "true"
-    if any(c in low for c in preserve_cues):
-        out.pop("wants_rewrite", None)
-
-    if not any(
-        k in out
-        for k in (
-            "subject",
-            "body_find",
-            "body_role",
-            "remove_phrase",
-            "position_only",
-            "wants_rewrite",
-        )
-    ):
-        return None
-    return out
-
-
-def is_email_send_confirm(text: str) -> bool:
-    head = re.split(r"\[quoted message\]:", (text or "").lower(), maxsplit=1)[0]
-    head = re.sub(r"@\d[\d\s]*", " ", head)
-    head = re.sub(r"https?://\S+", " ", head)
-    head = re.sub(r"[^\w\s]", " ", head)
-    head = re.sub(r"\s+", " ", head).strip()
-    # Don't treat "send email to X" as confirm — that's a new draft
-    if re.search(r"\b(?:email|mail)\s+to\b", head) or re.search(
-        r"\bsend\s+email\b.+\b[a-z0-9._%+\-]+@[a-z0-9.\-]+", head
-    ):
-        return False
-    phrases = (
-        "send it",
-        "send now",
-        "bhej do",
-        "bhej dena",
-        "bhej de",
-        "confirm send",
-        "haan bhej",
-        "han bhej",
-        "yes send",
-        "send the email",
-        "send the draft",
-        "go ahead send",
-        "approve send",
-    )
-    if any(p in head for p in phrases):
-        return True
-    tokens = head.split()
-    return tokens in (["send"], ["bhej"], ["confirm"])
-
-
-def is_email_draft_edit_intent(text: str) -> bool:
-    """User wants the stored draft body/subject rewritten (not a new apply)."""
-    if not text:
-        return False
-    # Prefer quoted instruction when mention-only (user replies to their own edit note)
-    instr = _edit_instruction_text(text)
-    head = instr or re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
-    head = re.sub(r"@\d[\d\s]*", " ", head)
-    low = head.lower()
-    # New apply / new email commands are not edits
-    if is_job_apply_intent(text) or parse_direct_email_command(text):
-        return False
-    phrases = (
-        "personalize",
-        "personalized",
-        "personalise",
-        "high impact",
-        "high-impact",
-        "rewrite",
-        "rephrase",
-        "polish",
-        "improve",
-        "update draft",
-        "edit draft",
-        "edit the draft",
-        "update the draft",
-        "draft update",
-        "banao",
-        "bana do",
-        "better banao",
-        "zyada better",
-        "more relevant",
-        "relevantly",
-        "relevant banao",
-        "experience ke sath",
-        "experience k sath",
-        "experience ke saat",
-        "experience k saat",
-        "mera experience",
-        "mere experience",
-        "stronger",
-        "make it better",
-        "make it stronger",
-        "subject change",
-        "change subject",
-        "body change",
-        "change body",
-        # surgical preserve edits
-        "remove ",
-        "replace ",
-        "replace the",
-        "keep everything else",
-        "keep the rest",
-        "as is",
-        "no change",
-        "everything else",
-        "position is only",
-        "role is only",
-        "title is only",
-        "sirf ",
-        "bas remove",
-        "from subject",
-        "from body",
-        "from role",
-        "number with",
-    )
-    return any(p in low for p in phrases)
-
-
-def is_email_draft_cancel_intent(text: str) -> bool:
-    if not text:
-        return False
-    head = re.split(r"\[quoted message\]:", text, maxsplit=1, flags=re.I)[0]
-    head = re.sub(r"@\d[\d\s]*", " ", head)
-    low = head.lower()
-    return any(
-        p in low
-        for p in (
-            "cancel draft",
-            "draft cancel",
-            "cancel the draft",
-            "discard draft",
-            "delete draft",
-            "draft hatao",
-            "draft cancel karo",
-        )
-    )
-
-
 def _tool_draft_email(args: dict, ctx: dict) -> str:
-    if not _owner_ok(ctx):
-        return "Permission denied: only the bot owner can draft/send emails."
-
-    action = (args.get("action") or "create").strip().lower()
-    existing = _get_draft(ctx)
-
-    if action == "show":
-        if not existing:
-            return "No email draft for this chat yet. Create one with action=create."
-        return _format_draft(existing)
-
-    if action == "cancel":
-        if existing:
-            _pop_draft(ctx)
-            return "Draft cancelled."
-        return "No draft to cancel."
-
-    if action == "update":
-        if not existing:
-            return "No draft to update. Use action=create first."
-        if args.get("to"):
-            existing["to"] = str(args["to"]).strip()
-        if args.get("subject") is not None and str(args.get("subject")).strip() != "":
-            existing["subject"] = str(args["subject"]).strip()
-        if args.get("body") is not None and str(args.get("body")).strip() != "":
-            new_body = str(args["body"]).strip()
-            old_body = (existing.get("body") or "").strip()
-            # Reject truncated/rewritten-short bodies (LLM tool-arg cutoffs)
-            truncated = (
-                new_body.endswith("…")
-                or new_body.endswith("...")
-                or new_body.endswith("…")
-                or bool(re.search(r"(?i)\bclients?\s*…\s*$", new_body))
-            )
-            too_short = (
-                old_body
-                and len(new_body) < max(120, int(len(old_body) * 0.7))
-                and not args.get("force_short")
-            )
-            if truncated or too_short:
-                logging.getLogger("mojo.agent").info(
-                    "EMAIL_UPDATE_BODY_REJECTED truncated=%s old_len=%s new_len=%s",
-                    truncated,
-                    len(old_body),
-                    len(new_body),
-                )
-                return (
-                    "Update rejected: body looks truncated or incomplete. "
-                    "Do not shorten the letter. Re-send the FULL body, or use a "
-                    "surgical edit (e.g. remove a phrase / change subject only)."
-                )
-            existing["body"] = new_body
-        if args.get("cc") is not None:
-            existing["cc"] = str(args.get("cc") or "").strip() or None
-        if args.get("attach_resume") in ("true", "false", "ask"):
-            existing["attach_resume"] = args["attach_resume"]
-        if args.get("reason"):
-            existing["reason"] = str(args["reason"]).strip()
-        if args.get("purpose"):
-            existing["purpose"] = str(args["purpose"]).strip()
-        existing["updated_at"] = time.time()
-        _put_draft(ctx, existing)
-        return "Draft updated.\n\n" + _format_draft(existing)
-
-    # create
-    to = (args.get("to") or "").strip()
-    subject = (args.get("subject") or "").strip()
-    body = (args.get("body") or "").strip()
-    attach = (args.get("attach_resume") or "ask").strip().lower()
-    if attach not in ("true", "false", "ask"):
-        attach = "ask"
-    purpose = (args.get("purpose") or "").strip() or "general"
-    reason = (args.get("reason") or "").strip()
-    cc = (args.get("cc") or "").strip() or None
-
-    if not to:
-        return (
-            "Missing recipient (to). Extract email from the JD / quoted message "
-            "or ask the user for the address, then call draft_email again."
-        )
-    if "@" not in to:
-        return f"Invalid recipient email: {to!r}"
-    if not body:
-        return "Missing body. Write a concise high-impact email body, then create the draft."
-    if not subject:
-        subject = "Introduction / Application"
-
-    draft = {
-        "to": to,
-        "subject": subject,
-        "body": body,
-        "cc": cc,
-        "attach_resume": attach,
-        "purpose": purpose,
-        "reason": reason,
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
-    _put_draft(ctx, draft)
-    logging.getLogger("mojo.agent").info(
-        "EMAIL_DRAFT_SAVED to=%s subject=%r attach=%s", to, subject[:60], attach
-    )
-    extra = ""
-    if attach == "ask":
-        extra = (
-            "\n\nAttachment undecided. Confirm: attach resume PDF? "
-            "(yes / no). Reason: "
-            + (reason or "not specified")
-        )
-    elif attach == "true":
-        try:
-            import email_ops as eo
-
-            path, src = eo.resolve_resume_pdf()
-            if not path:
-                extra = f"\n\nattach_resume=true but resume file missing: {src}"
-            else:
-                extra = f"\n\nResume ready ({src})"
-        except Exception as e:
-            extra = f"\n\nResume check failed: {e}"
-
-    return "Draft created.\n\n" + _format_draft(draft) + extra
+    import email_agent
+    return email_agent.tool_draft(args or {}, str((ctx or {}).get("chat_id") or ""), _is_owner(ctx))
 
 
 def _tool_send_email(args: dict, ctx: dict) -> str:
-    if not _owner_ok(ctx):
-        return "Permission denied: only the bot owner can send emails."
-
-    if not args.get("confirm"):
-        return "Send aborted: confirm must be true. Show the draft and wait for user OK."
-
-    draft = _get_draft(ctx)
-    if not draft:
-        return "No draft to send. Create one with draft_email first."
-
-    attach_flag = draft.get("attach_resume") or "ask"
-    override = (args.get("attach_resume_override") or "").strip().lower()
-    if override in ("true", "false"):
-        attach_flag = override
-
-    if attach_flag == "ask":
-        return (
-            "Attachment still undecided (attach_resume=ask). "
-            "Ask the user: attach resume PDF yes or no? Then call send_email "
-            "with attach_resume_override=true|false and confirm=true."
-        )
-
-    to = (draft.get("to") or "").strip()
-    subject = (draft.get("subject") or "").strip()
-    body = (draft.get("body") or "").strip()
-    if not to or not body:
-        return "Draft incomplete (need to + body). Update with draft_email first."
-
-    try:
-        import email_ops as eo
-    except Exception as e:
-        return f"email_ops import failed: {e}"
-
-    if not eo.gmail_configured():
-        return (
-            "Gmail not configured on this host. Set GMAIL_CLIENT_ID, "
-            "GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER."
-        )
-
-    attach_path = None
-    attach_src = None
-    if attach_flag == "true":
-        attach_path, attach_src = eo.resolve_resume_pdf()
-        if not attach_path:
-            return (
-                f"Cannot send with attachment — resume not found: {attach_src}. "
-                "Set RESUME_PDF_PATH or RESUME_ONEDRIVE_PATH, or resend without attach "
-                "(attach_resume_override=false)."
-            )
-
-    try:
-        result = eo.send_email(
-            to=to,
-            subject=subject,
-            body=body,
-            attach_path=attach_path,
-            cc=draft.get("cc"),
-        )
-    except Exception as e:
-        return f"Send failed: {e}"
-
-    _pop_draft(ctx)
-    att = "yes" if result.get("attached") else "no"
-    logging.getLogger("mojo.agent").info(
-        "EMAIL_SENT to=%s id=%s attached=%s", result.get("to"), result.get("id"), att
-    )
-    return (
-        f"Sent to {result.get('to')}\n"
-        f"Subject: {result.get('subject')}\n"
-        f"Gmail id: {result.get('id')}\n"
-        f"Attached resume: {att}"
-        + (f" ({attach_src})" if attach_src and result.get("attached") else "")
-    )
+    import email_agent
+    return email_agent.tool_send(args or {}, str((ctx or {}).get("chat_id") or ""), _is_owner(ctx))
 
 
 def _tool_search_knowledge(args: dict, ctx: dict) -> str:
@@ -1900,6 +852,52 @@ def _format_search_lines(items: list, num: int) -> str:
     return "\n\n".join(lines)
 
 
+def _tool_deep_research(args: dict, ctx: dict) -> str:
+    """Multi-step research -> finished cited report (see research.py). Returns 'REPORT\\n...'
+    which agent_loop sends straight to the user (no re-summarising, no truncation)."""
+    import datetime as _dt
+    import llm_json
+    question = (args.get("question") or args.get("query") or "").strip()
+    if len(question) < 8:
+        return bot_voice.say("research_need_question", (ctx or {}).get("lang", "ur"))
+    depth = (args.get("depth") or "standard").strip().lower()
+    today = _dt.datetime.now().strftime("%d %B %Y")
+    try:
+        import language_policy
+        lang = language_policy.detect_output_lang(question, default="en")
+    except Exception:
+        lang = "en"
+    lang = lang if lang in ("en", "roman_urdu") else "en"
+
+    def json_fn(system: str, user: str):
+        return llm_json.json_chat(
+            system, user, groq_client=_client_ai, groq_models=llm_json.SIDE_MODELS,
+            gemini_client=_client_gemini, gemini_model=_GEMINI_MODEL,
+            max_tokens=600, timeout=20.0, tag="research_plan",
+        )
+
+    def write_fn(system: str, user: str, stage: int):
+        if stage == 1:   # long context first: Gemini takes the whole evidence pack
+            return llm_json.text_chat(
+                system, user, gemini_client=_client_gemini, gemini_model=_GEMINI_MODEL,
+                max_tokens=2400, timeout=70.0, temperature=0.3, tag="research_write",
+            )
+        return llm_json.text_chat(   # trimmed pack for Groq's ~8K-TPM buckets
+            system, user, groq_client=_client_ai,
+            groq_models=[m for m in [_MODEL_NAME, *llm_json.SIDE_MODELS] if m],
+            max_tokens=1800, timeout=45.0, temperature=0.3, tag="research_write_groq",
+        )
+
+    return research.run(
+        question, depth=depth, today=today, language=lang,
+        json_fn=json_fn,
+        search_fn=web_search_providers.search_data,
+        extract_fn=web_search_providers.extract_pages,
+        fetch_fn=lambda u: _tool_browse_url({"url": u, "max_chars": 3500}, ctx),
+        write_fn=write_fn,
+    )
+
+
 def _tool_web_search(args: dict, ctx: dict) -> str:
     """Multi-provider web search — see web_search_providers.py for the full chain
     (Tavily -> Serper -> Gemini grounding -> ddgs) and the relevance gate that replaced
@@ -1943,42 +941,9 @@ def _github_repo_from_url(url: str) -> Optional[tuple]:
     return m.group(1), m.group(2)
 
 
-def _fetch_github_user_repos(username: str, limit: int = 12) -> str:
-    """Public GitHub API — real repo list, sorted by recently pushed."""
-    api = f"https://api.github.com/users/{username}/repos"
-    try:
-        r = requests.get(
-            api,
-            params={"sort": "pushed", "direction": "desc", "per_page": min(limit, 30)},
-            timeout=15,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "MojoAgent/1.0",
-            },
-        )
-        if r.status_code == 404:
-            return f"GitHub user '{username}' not found."
-        r.raise_for_status()
-        repos = r.json()
-        if not isinstance(repos, list) or not repos:
-            return f"GitHub user '{username}' has no public repositories."
-        lines = [f"GitHub @{username} — {len(repos)} public repos shown (sorted by last push):"]
-        for repo in repos[:limit]:
-            name = repo.get("full_name") or repo.get("name")
-            desc = (repo.get("description") or "").strip() or "(no description)"
-            stars = repo.get("stargazers_count", 0)
-            lang = repo.get("language") or "?"
-            pushed = (repo.get("pushed_at") or "")[:10]
-            fork = " [fork]" if repo.get("fork") else ""
-            lines.append(
-                f"• {name}{fork}\n"
-                f"  {desc}\n"
-                f"  ★{stars} · {lang} · last push {pushed}\n"
-                f"  {repo.get('html_url', '')}"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"GitHub API error for {username}: {e}"
+def _fetch_github_user_repos(username: str, limit: int = 100) -> str:
+    """All public repos for a profile (API with token -> HTML fallback). See github_ops.user_repos."""
+    return github_ops.user_repos(username, limit=limit)
 
 
 def _fetch_github_repo(owner: str, repo: str) -> str:
@@ -2015,26 +980,26 @@ def _tool_browse_url(args: dict, ctx: dict) -> str:
     url = (args.get("url") or "").strip()
     # Keep page extracts tight — long HTML dumps caused 413 payloads and long agent essays
     max_chars = min(int(args.get("max_chars") or 2500), 4000)
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
     if not url:
         return "Empty URL."
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # --- GitHub special path (reliable JSON API, no JS-render needed) ---
+    # --- GitHub special path: archive/raw/API with token + graceful fallbacks (github_ops v2) ---
     if "github.com" in url.lower():
         g = github_ops.parse_github_url(url)
-        if g and g["kind"] != "repo":  # /tree/<ref>/<path> or /blob/<ref>/<path>
-            return github_ops.overview(g["owner"], g["repo"], g["kind"], g["ref"], g["path"], max_chars)
-        repo_pair = _github_repo_from_url(url)
-        if repo_pair and repo_pair[1].lower() not in ("", "repositories", "stars", "followers", "following"):
-            # Full repo URL: name/description/stars PLUS the file tree (grouped into any
-            # SKILL.md / package catalog it contains, e.g. "list all of them" on a skills
-            # repo) and a README excerpt — not metadata alone (prod bug: metadata-only
-            # left the model with nothing to list and it invented an answer).
-            return github_ops.overview(repo_pair[0], repo_pair[1], max_chars=max(max_chars, 3000))
+        if g:
+            # repo root -> full overview incl. EVERY skill/package + README; tree/blob -> folder / file text
+            budget = 7000 if g["kind"] == "repo" else min(max(int(args.get("max_chars") or 6000), 4000), 9000)
+            return github_ops.overview(g["owner"], g["repo"], g["kind"], g["ref"], g["path"],
+                                       max_chars=budget, offset=offset)
         user = _github_user_from_url(url)
         if user:
-            return _fetch_github_user_repos(user, limit=12)
+            return github_ops.user_repos(user)
         # fall through to HTML if path is unusual
 
     # --- Generic page fetch ---
@@ -2090,9 +1055,12 @@ def _tool_browse_url(args: dict, ctx: dict) -> str:
             parts.append(f"Title: {title}")
         if desc:
             parts.append(f"Description: {desc}")
-        parts.append(text[:max_chars])
+        total = len(text)
+        parts.append(text[offset: offset + max_chars])
+        if offset + max_chars < total:
+            parts.append(f"[chars {offset}-{offset + max_chars} of {total}; call browse_url again with offset={offset + max_chars} for more]")
         out = "\n".join(parts)
-        return out[: max_chars + 200] + ("…" if len(out) > max_chars + 200 else "")
+        return out[: max_chars + 400] + ("…" if len(out) > max_chars + 400 else "")
     except Exception as e:
         return f"Failed to fetch URL ({url}): {e}"
 
@@ -5419,7 +4387,7 @@ def _video_answer(args: dict, ctx: dict) -> str:
         if speech:
             return ("Source: transcript | mode=answer\n\n"
                     "Jawab generate nahi ho saka (AI busy). Video ka text ye raha:\n\n" + speech[:1500])
-        return "Video ka audio/caption nahi mila — public link try karo."
+        return bot_voice.say("video_no_content", (ctx or {}).get("lang", "ur"))
     print(f"[video_answer] OK speech={len(speech)} caption={len(caption)} out={len(answer)}")
     return f"Source: {'caption' if caption_only else 'transcript'} | mode=answer\n\n{answer}"
 
@@ -5485,21 +4453,12 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
             break
 
     if not body:
+        _lg = (ctx or {}).get("lang", "ur")
         if _is_instagram_url(url):
-            return (
-                "Is Instagram link ka public caption/title nahi mila "
-                "(private, restricted, ya login wall). "
-                "Public reel share karo ya video download karke voice note bhej do."
-            )
+            return bot_voice.say("ig_blocked", _lg)
         if _is_facebook_url(url):
-            return (
-                "Is Facebook link ka public title/caption nahi mila. "
-                "Public post try karo."
-            )
-        return (
-            "Link preview nahi nikal saka (title/caption unavailable). "
-            "Public URL confirm karo."
-        )
+            return bot_voice.say("fb_blocked", _lg)
+        return bot_voice.say("link_failed", _lg)
 
     out = f"Source: link_preview ({source})\n\n{body.strip()}"
     if {"stats", "tags", "date", "duration"} & set(fields):
@@ -5511,6 +4470,7 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
     "web_search": _tool_web_search,
+    "deep_research": _tool_deep_research,
     "browse_url": _tool_browse_url,
     "get_weather": _tool_get_weather,
     "get_memory": _tool_get_memory,
