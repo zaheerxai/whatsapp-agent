@@ -129,6 +129,42 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "save_to_knowledge",
+            "description": (
+                "Index a document or text into the searchable knowledge base so it can be recalled "
+                "later with search_knowledge. Use when the user says save/add/store/index this "
+                "document/file/PDF/note to knowledge / library / 'yaad rakho for later search'. "
+                "With no `text`, saves the most recent document sent in this chat (kept 2 hours). "
+                "scope 'chat' (default) = only this chat; 'global' = every chat (owner only)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Name for the entry (defaults to the file name)"},
+                    "text": {"type": "string", "description": "Optional explicit text to index instead of the last document"},
+                    "scope": {"type": "string", "enum": ["chat", "global"], "default": "chat"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_knowledge",
+            "description": (
+                "Remove a previously saved knowledge entry by (part of) its title. Only entries saved "
+                "in this chat can be removed; global entries need the owner."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"title": {"type": "string", "description": "Part of the entry title (min 3 chars)"}},
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_knowledge",
             "description": (
                 "Search Mojo AI Agency knowledge base (hybrid RAG over agency docs + "
@@ -822,6 +858,46 @@ def _tool_search_knowledge(args: dict, ctx: dict) -> str:
     return "\n---\n".join(chunks[: top_k + 3])
 
 
+def _tool_save_to_knowledge(args: dict, ctx: dict) -> str:
+    chat_id = (ctx or {}).get("chat_id")
+    if not chat_id:
+        return "No chat context."
+    try:
+        import knowledge_rag as kr
+    except Exception as e:
+        return f"Knowledge base unavailable: {e}"
+    res = kr.save_to_knowledge(
+        chat_id=chat_id,
+        sender_id=(ctx or {}).get("sender_id"),
+        title=(args.get("title") or "").strip() or None,
+        text=(args.get("text") or "").strip() or None,
+        scope=(args.get("scope") or "chat"),
+        is_owner=_is_owner(ctx or {}),
+    )
+    st = res.get("status")
+    if st == "ok":
+        return f"Saved to knowledge ({res.get('chunks')} chunks, v{res.get('source_version')}). It is now searchable."
+    if st == "unchanged":
+        return "Already in the knowledge base (same content) — nothing to do."
+    if st == "skipped":
+        return f"Not saved: {res.get('reason')}."
+    return f"Could not save: {res.get('error')}"
+
+
+def _tool_forget_knowledge(args: dict, ctx: dict) -> str:
+    try:
+        import knowledge_rag as kr
+    except Exception as e:
+        return f"Knowledge base unavailable: {e}"
+    res = kr.delete_documents(
+        args.get("title") or "", chat_id=(ctx or {}).get("chat_id"), is_owner=_is_owner(ctx or {})
+    )
+    if res.get("status") != "ok":
+        return f"Could not remove: {res.get('error')}"
+    gone = res.get("deleted") or []
+    return ("Removed: " + ", ".join(str(g) for g in gone)) if gone else "No matching entry saved in this chat."
+
+
 def _format_search_lines(items: list, num: int) -> str:
     """Normalize heterogeneous search hits into title / snippet / url lines."""
     lines = []
@@ -1180,6 +1256,11 @@ def _tool_save_memory(args: dict, ctx: dict) -> str:
                 "note": note[:12000],
             }
         ).execute()
+        try:
+            import knowledge_rag as _kr
+            _kr.sync_chat_notes_async(ctx["chat_id"])  # semantic index follows the note store
+        except Exception:
+            pass
         preview = note[:120] + ("…" if len(note) > 120 else "")
         return f"Saved permanent note ({len(note)} chars): {preview}"
     except Exception as e:
@@ -4493,6 +4574,8 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
 
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
+    "save_to_knowledge": _tool_save_to_knowledge,
+    "forget_knowledge": _tool_forget_knowledge,
     "web_search": _tool_web_search,
     "deep_research": _tool_deep_research,
     "browse_url": _tool_browse_url,

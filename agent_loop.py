@@ -858,6 +858,7 @@ def _build_system_prompt(
 4. GREETINGS / SMALL TALK ("hi", "hello", "hows it going", "kya haal", "salam") → reply naturally in ONE short line. Do NOT call any tool. Do NOT dump agency stats or founder bio.
 5. PURE @mention only (message is just "@mojo" / "@aimojo" / a number tag with no real question) → reply "Haan, boliye?" Do NOT call any tool. Do NOT continue a previous website topic from history.
 6. Call search_knowledge ONLY when the user actually asks about agency services, portfolio, founder background, pricing, or "what can you do". Never on a plain greeting ("hi"/"hey"/"salam") or pure mention. Never call it just because history mentioned capabilities.
+6a. KNOWLEDGE BASE: when the user asks to save / add / store a document, file or text "to knowledge" (or "yaad rakho, baad mein search karna"), call save_to_knowledge (it uses the document they just sent; scope "global" only if the owner asks for all chats). To remove an entry call forget_knowledge. When search_knowledge returns "No relevant knowledge found", say you could not find it in the saved knowledge — do not invent an answer from it.
 6b. SEND / FORWARD: When the owner says "send this to +92…", "bhej do is number pe", "forward this to …" (with or without a quoted message) you MUST call send_message_to with the EXACT quoted/body text word-for-word and the target phone/chat_id. Do NOT rewrite, summarize, or reply with the text in this chat instead of sending.
 7. For ANY reminder create / list / cancel intent — including Roman Urdu like "remind karna", "1 min me paani", "list reminder", "cancel karo", "paani wale cancel" — you MUST call set_reminder / list_reminders / cancel_reminders. Never pretend you set a reminder without the tool. Never suggest "set a phone timer instead".
 8. cancel_reminders understands keywords like "paani", "water", "debug", or "all"/"sab". Prefer calling it over asking clarifying questions when intent is clear.
@@ -1059,6 +1060,37 @@ def _chat_completion(
         flatten=_sanitize_messages_for_gemini,
         is_usable=_usable,
     )
+
+
+def rag_vision_extract(b64: str, mime: str, name: str) -> str:
+    """LLM text extraction for scanned PDFs / images before they are indexed (no OCR dependency)."""
+    return gemini_vision_complete(
+        [
+            {"role": "system", "content": "Transcribe the document faithfully as plain text/markdown. Keep headings, "
+                                          "tables (as markdown) and numbers exactly. No commentary, no summary."},
+            {"role": "user", "content": [
+                {"type": "text", "text": f"Document: {name}"},
+                {"type": "image_url", "image_url": {"url": f"data:{mime or 'application/pdf'};base64,{b64}"}},
+            ]},
+        ],
+        max_tokens=8192,
+        temperature=0.0,
+    )
+
+
+def rag_rerank(query: str, passages: List[str]) -> List[int]:
+    """Optional (RAG_RERANK=1) LLM rerank: returns passage indices, best first. JSON in, JSON out."""
+    import llm_json as _lj
+    numbered = "\n".join(f"[{i}] {p}" for i, p in enumerate(passages))
+    msg = _chat_completion(
+        [
+            {"role": "system", "content": 'Rank passages by how directly they answer the query. Reply with JSON only: {"order":[indices, best first]}'},
+            {"role": "user", "content": f"Query: {query}\n\nPassages:\n{numbered}"},
+        ],
+        tools=None, temperature=0.0, max_tokens=200,
+    )
+    data = _lj.parse_json_loose(getattr(msg, "content", "") or "") or {}
+    return [int(i) for i in (data.get("order") or []) if str(i).lstrip("-").isdigit()]
 
 
 def gemini_vision_complete(messages: List[dict], max_tokens: int = 8192, temperature: float = 0.3):

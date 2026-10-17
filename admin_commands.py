@@ -29,6 +29,8 @@ KNOWN_FEATURES = [
 # Owner-only tools still require OWNER_SENDER_ID even when the flag is ON.
 KNOWN_TOOLS = [
     "search_knowledge",
+    "save_to_knowledge",  # chat-scoped for everyone; scope=global enforced owner-only at executor
+    "forget_knowledge",
     "web_search",
     "deep_research",     # multi-step research -> cited report (costs several search credits)
     "browse_url",
@@ -794,8 +796,8 @@ def cmd_uploadimg(args):
 
 @command(
     "ingest",
-    "Usage: /ingest agency | onedrive [subfolder] | file <local-or-onedrive-path> | status\n"
-    "Seeds RAG from business_info.txt, walks Documents/aimojo, or ingests one path.",
+    "Usage: /ingest agency | onedrive [subfolder] | file <local-or-onedrive-path> | notes | sync | forget <title> | status\n"
+    "Seeds RAG from business_info.txt, walks Documents/aimojo, indexes chat notes, or ingests one path.",
 )
 def cmd_ingest(args):
     """Owner-only RAG ingestion control plane."""
@@ -847,6 +849,20 @@ def cmd_ingest(args):
             result = kr.ingest_onedrive_path(path)
         return _format_ingest_result(path, result)
 
+    if mode == "notes":
+        r = kr.sync_all_chat_notes()
+        return f"Chat notes indexed: chats={r.get('chats')} re-embedded={r.get('reindexed')} ({r.get('status')})"
+
+    if mode == "sync":
+        r = kr.run_full_sync()
+        return f"Full sync: {r}"
+
+    if mode in ("forget", "delete", "rm"):
+        r = kr.delete_documents(rest, chat_id=None, is_owner=True)
+        if r.get("status") != "ok":
+            return f"Failed: {r.get('error')}"
+        return "Removed (global only): " + (", ".join(map(str, r.get("deleted") or [])) or "nothing matched")
+
     if mode == "ensure":
         result = kr.ensure_onedrive_knowledge_tree()
         if result.get("ok"):
@@ -862,6 +878,8 @@ def cmd_ingest(args):
         "  /ingest onedrive [sub]  — walk Documents/aimojo[/sub]\n"
         "  /ingest file <path>     — one local or OneDrive path\n"
         "  /ingest ensure          — create Documents/aimojo/{agency,docs,chats}\n"
+        "  /ingest notes|sync      — index all chat notes | run the full sync now\n"
+        "  /ingest forget <title>  — delete a global entry by title\n"
         "  /ingest status          — same as /kbstatus"
     )
 
@@ -914,11 +932,43 @@ def cmd_kbstatus(args):
             lines.append(
                 "→ Run sql/rag_schema.sql in Supabase SQL editor, then /ingest agency"
             )
+        lines.append(f"Relevance floor: {st.get('min_sim')} | rerank: {st.get('rerank')}")
+        if st.get("stale_embedding_chunks"):
+            lines.append(f"⚠ {st.get('stale_embedding_chunks')} chunks use an old embedding model — /ingest sync re-embeds them")
+        if st.get("last_sync"):
+            lines.append(f"Last sync: {st.get('last_sync')}")
         if st.get("count_error"):
             lines.append(f"Count error: {st['count_error']}")
         return "\n".join(lines)
     except Exception as e:
         return f"kbstatus failed: {e}"
+
+
+@command(
+    "kbsearch",
+    "Usage: /kbsearch <query> — debug retrieval: shows every candidate with similarity, lexical hit and kept/dropped.",
+)
+def cmd_kbsearch(args):
+    q = (args or "").strip()
+    if not q:
+        return "Usage: /kbsearch <query>"
+    try:
+        import knowledge_rag as kr
+
+        rows = kr.hybrid_retrieve(q, top_k=8, chat_id=None, debug=True)
+        if not rows:
+            return "No candidates (schema missing, embeddings failing, or empty KB). Check /kbstatus."
+        out = []
+        for r in rows:
+            sim = r.get("similarity")
+            out.append(
+                f"{'✅' if r.get('_kept') else '✖'} sim={('%.3f' % sim) if sim is not None else '?'} "
+                f"lex={bool(r.get('lex_hit'))} [{r.get('source_type')}] {(r.get('title') or '')[:40]}\n"
+                f"   {(r.get('content') or '')[:120].strip()}"
+            )
+        return f"Floor={kr.MIN_SIM} (global scope)\n" + "\n".join(out)
+    except Exception as e:
+        return f"kbsearch failed: {e}"
 
 
 @command("help", "Lists all available commands.")

@@ -1027,6 +1027,28 @@ _SEND_FORWARD_CMD_RE = re.compile(
 )
 
 
+def _rag_notes_changed(chat_id):
+    """Keep the semantic index in step with group_memory (debounced, background, never raises)."""
+    try:
+        import knowledge_rag as _kr
+        _kr.sync_chat_notes_async(chat_id)
+    except Exception:
+        pass
+
+
+def _rag_remember_doc(chat_id, filename, *, text=None, path=None, mime=None):
+    """Cache the document so 'save this to knowledge' works later (extraction runs off-thread)."""
+    try:
+        import knowledge_rag as _kr
+        import threading as _th
+        _th.Thread(
+            target=_kr.remember_document, args=(chat_id, filename),
+            kwargs={"text": text, "local_path": path, "mime": mime}, daemon=True,
+        ).start()
+    except Exception:
+        pass
+
+
 def maybe_save_memory(chat_id, sender_id, text_content):
     """Keyword version: if the message contains a memory trigger, extract the
     durable body (prefer quoted content) and store it in group_memory.
@@ -1061,6 +1083,7 @@ def maybe_save_memory(chat_id, sender_id, text_content):
             "note": note,
         }).execute()
         log.info("MEMORY_SAVED chars=%d preview=%r", len(note), note[:160])
+        _rag_notes_changed(chat_id)
     except Exception as e:
         log.error(f"Error saving memory: {e}")
 
@@ -1092,6 +1115,7 @@ def maybe_save_memory_smart(chat_id, sender_id, text_content):
                 "note": classification
             }).execute()
             log.info("MEMORY_SAVED_SMART %r", classification)
+            _rag_notes_changed(chat_id)
     except Exception as e:
         log.error(f"Error in smart memory save: {e}")
 
@@ -1754,6 +1778,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 # The user's saved resume/profile lives in PERMANENT NOTES. The old one-shot call never
                 # saw it, so "using my experience, skills, resume u have" got generic answers (prod
                 # 2026-10-17 09:53). Let the LLM decide how to use it; no keyword routing.
+                _rag_remember_doc(chat_id, filename, path=tmp_path, mime="application/pdf")
                 try:
                     from agent_loop import build_memory_block
                     _pdf_mem = build_memory_block(chat_id, budget=6000, per_profile=4000)
@@ -1849,6 +1874,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 )
 
             if body:
+                _rag_remember_doc(chat_id, filename, text=body, mime=mime)
                 context_str = (
                     f"[Document: {filename}]\n{body}"
                     if not (text_content and text_content.strip())
@@ -2568,11 +2594,30 @@ agent_tools.init_tools(
 try:
     import knowledge_rag
 
+    def _all_group_notes():
+        out = {}
+        for row in (supabase.table("group_memory").select("chat_id, note").execute().data or []):
+            out.setdefault(row["chat_id"], []).append(row["note"])
+        return out
+
+    def _rag_vision_extract(b64, mime, name):
+        from agent_loop import rag_vision_extract
+        return rag_vision_extract(b64, mime, name)
+
+    def _rag_rerank(query, passages):
+        from agent_loop import rag_rerank
+        return rag_rerank(query, passages)
+
     knowledge_rag.init(
         supabase,
         file_ops_module=file_ops,
         extract_document_text_fn=extract_document_text,
+        get_notes_fn=lambda cid: get_group_memory(cid),
+        all_notes_fn=_all_group_notes,
+        vision_extract_fn=_rag_vision_extract,
+        rerank_fn=_rag_rerank,
     )
+    knowledge_rag.start_background_sync()  # boot + periodic: agency file, OneDrive (+prune), chat notes
     print(
         f"[RAG] knowledge_rag ready schema={knowledge_rag.schema_ready()} "
         f"root={knowledge_rag.knowledge_root()}"
