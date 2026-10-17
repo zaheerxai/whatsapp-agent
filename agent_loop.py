@@ -680,6 +680,18 @@ _PHONE_FIRST_RE = re.compile(
 )
 
 
+def _bot_self_ids() -> set:
+    """Avoid importing whatsapp_agent (connects WA client on import)."""
+    try:
+        import sys
+        wa = sys.modules.get("whatsapp_agent")
+        if wa is None:
+            return set()
+        return {str(x) for x in (getattr(wa, "BOT_PN", None), getattr(wa, "BOT_LID", None)) if x}
+    except Exception:
+        return set()
+
+
 def _parse_send_to_command(text: str):
     """Return {phone, body} when owner asks to send the quoted/live body to a number."""
     raw = text or ""
@@ -689,7 +701,10 @@ def _parse_send_to_command(text: str):
     if m_q:
         body = (m_q.group(1) or "").strip()
         live = raw[: m_q.start()]
-    live_s = live.strip()
+    # Strip @mentions (esp. bot LID wake-word) so they are never parsed as the destination
+    # (prod 2026-10-15: @73109738680505 → send_message_to bot itself → "no LID found").
+    live_s = re.sub(r"(?<!\w)@\d{6,}\b", " ", live.strip())
+    live_s = re.sub(r"[ \t]{2,}", " ", live_s).strip()
     phone = None
     m = _SEND_PHONE_RE.search(live_s)
     if m and _SEND_VERB_RE.search(live_s):
@@ -710,6 +725,8 @@ def _parse_send_to_command(text: str):
     if phone.startswith("0") and len(phone) == 11:
         phone = "92" + phone[1:]
     if not phone.isdigit() or len(phone) < 10:
+        return None
+    if phone in _bot_self_ids():
         return None
     if not body:
         residual = _SEND_PHONE_RE.sub(" ", live_s)
@@ -1048,9 +1065,9 @@ def _chat_completion(
             is_payload = "413" in err_s or "payload" in err_s or "too large" in err_s
             if is_payload:
                 print(f"[AGENT] Groq 413 payload too large — shrinking history (attempt {attempt+1})")
-                working = _shrink_messages(working, keep_last=5 if attempt == 0 else 3)
-                # Drop tools on the second shrink to minimize payload further
-                if attempt >= 1 and "tools" in kwargs:
+                working = _shrink_messages(working, keep_last=4 if attempt == 0 else 2)
+                # Drop tools immediately on 413 — schemas + long tool obs are the usual culprits
+                if "tools" in kwargs:
                     kwargs.pop("tools", None)
                     kwargs.pop("tool_choice", None)
                 continue
@@ -1376,26 +1393,6 @@ def run_agent(
                     ),
                 })
 
-        # --- E-mail (owner): ONE LLM-routed brain (email_agent.py). It returns a finished reply
-        # for e-mail turns (draft cards, edits, send results) and None for everything else, so an
-        # unrelated message can never be hijacked by a keyword matcher ("Koi draft save nahi hai").
-        try:
-            import email_agent
-            from agent_tools import _is_owner as _email_is_owner
-            _last_bot = ""
-            for _m in reversed(raw_history or []):
-                if (_m.get("role") or "") == "assistant":
-                    _last_bot = _m.get("content") or ""
-                    break
-            if _tool_allowed_for_chat(chat_id, "draft_email") and _email_is_owner(tool_ctx):
-                _em_reply = email_agent.handle(
-                    chat_id, latest_user_text or extra_user_note or "", last_bot=_last_bot, is_owner=True,
-                )
-                if _em_reply:
-                    return _reply(_em_reply)
-        except Exception as _ee:
-            print(f"[AGENT] email_agent failed (continuing normally): {_ee}")
-
         # Force-notice URLs from the CURRENT WhatsApp message (including quoted links)
         urls_in_last = list(force_urls or [])
         if not urls_in_last:
@@ -1473,6 +1470,8 @@ def run_agent(
             return any(m in head for m in markers)
 
         # --- Force send_message_to (owner "Send this to +92…") ---
+        # BEFORE email router: a WA phone-forward must not be hijacked into an email draft
+        # (prod 2026-10-15: "forward… whatsapp" became EMAIL_ROUTE intent=forward).
         # Live bug 2026-10-02: model rewrote the quoted capability list instead of
         # calling send_message_to; keyword memory also false-fired on "permanent notes".
         if _tool_allowed_for_chat(chat_id, "send_message_to"):
@@ -1507,6 +1506,26 @@ def run_agent(
                 if obs_s.startswith("Message sent"):
                     return _reply(f"Bhej diya → {_send_cmd['phone']}")
                 return _reply(obs_s[:500])
+
+        # --- E-mail (owner): ONE LLM-routed brain (email_agent.py). It returns a finished reply
+        # for e-mail turns (draft cards, edits, send results) and None for everything else, so an
+        # unrelated message can never be hijacked by a keyword matcher ("Koi draft save nahi hai").
+        try:
+            import email_agent
+            from agent_tools import _is_owner as _email_is_owner
+            _last_bot = ""
+            for _m in reversed(raw_history or []):
+                if (_m.get("role") or "") == "assistant":
+                    _last_bot = _m.get("content") or ""
+                    break
+            if _tool_allowed_for_chat(chat_id, "draft_email") and _email_is_owner(tool_ctx):
+                _em_reply = email_agent.handle(
+                    chat_id, latest_user_text or extra_user_note or "", last_bot=_last_bot, is_owner=True,
+                )
+                if _em_reply:
+                    return _reply(_em_reply)
+        except Exception as _ee:
+            print(f"[AGENT] email_agent failed (continuing normally): {_ee}")
 
         # Only tools the admin enabled for this chat are offered to the model.
         # Default is empty → pure conversational reply (ai_chat), no tools.

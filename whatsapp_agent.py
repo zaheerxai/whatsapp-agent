@@ -1541,6 +1541,25 @@ def _extract_xlsx_smart(path: str, max_chars: int = 60000) -> str:
     return text
 
 
+def _extract_pdf_text(path: str, max_chars: int = 60000) -> str:
+    """Plain-text extract via pypdf. Empty when the PDF is image-only / unreadable."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    parts = []
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            parts.append(t.strip())
+    text = "\n\n".join(parts).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n…[truncated]…"
+    return text
+
+
 def extract_document_text(tmp_path, mime, ext, max_chars=60000) -> str:
     """Return plain text from common document types. Raises on hard failure."""
     path = tmp_path
@@ -1592,9 +1611,9 @@ def extract_document_text(tmp_path, mime, ext, max_chars=60000) -> str:
                     parts.append(shape.text.strip())
         text = "\n".join(parts)
 
-    # --- PDF: leave to Gemini (return empty → caller uses vision path) ---
+    # --- PDF text extract (Gemini vision is preferred; this is the fallback) ---
     elif ext == ".pdf" or mime == "application/pdf":
-        return ""
+        text = _extract_pdf_text(path, max_chars=max_chars)
 
     # --- legacy .doc / .xls / .ppt ---
     elif ext in (".doc", ".xls", ".ppt"):
@@ -1694,7 +1713,7 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                 ext = ".pdf"
                 mime = "application/pdf"
 
-            # --- PDF → Gemini (do NOT openpyxl) ---
+            # --- PDF → Gemini, then pypdf text fallback ---
             if magic == "pdf" or ext == ".pdf" or mime == "application/pdf":
                 with open(tmp_path, "rb") as f:
                     media_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -1703,35 +1722,74 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     if text_content and text_content.strip()
                     else f"Summarize or explain this PDF ({filename})."
                 )
-                try:
-                    gemini_response = client_gemini.chat.completions.create(
-                        model=GEMINI_MODEL,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are Mojo. The user sent a PDF. "
-                                    "Answer from its content. Keep it WhatsApp-short."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": user_prompt},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:application/pdf;base64,{media_b64}"
+                gemini_err = None
+                for _pdf_attempt in range(2):
+                    try:
+                        gemini_response = client_gemini.chat.completions.create(
+                            model=GEMINI_MODEL,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You are Mojo. The user sent a PDF. "
+                                        "Answer from its content. Keep it WhatsApp-short."
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": user_prompt},
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:application/pdf;base64,{media_b64}"
+                                            },
                                         },
-                                    },
-                                ],
-                            },
-                        ],
+                                    ],
+                                },
+                            ],
+                        )
+                        return gemini_response.choices[0].message.content
+                    except Exception as e:
+                        gemini_err = e
+                        err_s = str(e).lower()
+                        retryable = any(x in err_s for x in ("503", "429", "unavailable", "high demand"))
+                        if retryable and _pdf_attempt == 0:
+                            log.warning("PDF_GEMINI_RETRY %s", e)
+                            time.sleep(1.5)
+                            continue
+                        break
+                log.error("PDF_GEMINI_ERROR %s", gemini_err)
+                # Fallback: extract text with pypdf and continue via run_agent
+                try:
+                    body = _extract_pdf_text(tmp_path, max_chars=60000)
+                except Exception as e2:
+                    log.error("PDF_TEXT_FALLBACK_ERROR %s", e2)
+                    body = ""
+                if body:
+                    context_str = (
+                        f"[Document: {filename}]\n{body}"
+                        if not (text_content and text_content.strip())
+                        else f"User said: {text_content}\n\n[Document: {filename}]\n{body}"
                     )
-                    return gemini_response.choices[0].message.content
-                except Exception as e:
-                    log.error("PDF_GEMINI_ERROR %s", e)
-                    return "📄 Couldn't read that PDF right now. Try again or paste the text."
+                    insert_chat_message(chat_id, "document_text", "user", context_str)
+                    if admin_commands.is_feature_enabled(chat_id, "ai_chat") or admin_commands.is_feature_enabled(chat_id, "reminders"):
+                        from agent_loop import run_agent
+                        is_group = "g.us" in (chat_id or "")
+                        return run_agent(
+                            chat_id=chat_id,
+                            sender_id=sender_id,
+                            sender_num=sender_num,
+                            history_limit=history_limit,
+                            is_group=is_group,
+                            msg_time=msg_time,
+                            extra_user_note=context_str,
+                        )
+                    return (
+                        f"📄 Read `{filename}` ({len(body)} chars). "
+                        "AI chat is off for this chat."
+                    )
+                return "📄 Couldn't read that PDF right now. Try again or paste the text."
 
             # Named like Office but bytes are not OOXML/text
             if magic not in ("zip_ooxml", "text") and ext in (".xlsx", ".docx", ".pptx"):
@@ -2005,13 +2063,18 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
 def send_proactive_message(chat_id, text):
     """Send a message that ISN'T a reply to anything. Needed because reminders
     fire on a timer, not in response to an incoming WhatsApp message — this is
-    the one place the bot speaks first."""
+    the one place the bot speaks first.
+
+    Raises on failure so callers (send_message_to tool) never report a false
+    "Message sent" (prod 2026-10-15: LID resolve failed but OBS claimed success).
+    """
     try:
         user, server = chat_id.split("@", 1)
         jid = build_jid(user, server=server)
         client.send_message(jid, text, mentions_are_lids=True)
     except Exception as e:
         log.error(f"Error sending proactive message to {chat_id}: {e}")
+        raise
 
 
 def extract_reminder_data_via_ai(text_content, user_tz_str):

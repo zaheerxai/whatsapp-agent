@@ -1376,6 +1376,22 @@ def _tool_lookup_user(args: dict, ctx: dict) -> str:
         return f"Lookup failed: {e}"
 
 
+def _bot_self_ids() -> set:
+    """Phone + LID of this bot — never valid proactive-send targets.
+
+    Reads from sys.modules only — never import whatsapp_agent here (that module
+    connects the WA client on import).
+    """
+    try:
+        import sys
+        wa = sys.modules.get("whatsapp_agent")
+        if wa is None:
+            return set()
+        return {str(x) for x in (getattr(wa, "BOT_PN", None), getattr(wa, "BOT_LID", None)) if x}
+    except Exception:
+        return set()
+
+
 def _tool_send_message_to(args: dict, ctx: dict) -> str:
     # Fail CLOSED: if OWNER_SENDER_ID isn't configured, nobody is the owner —
     # never treat an unset owner as "check disabled". Allow either sender_id
@@ -1399,6 +1415,12 @@ def _tool_send_message_to(args: dict, ctx: dict) -> str:
         if len(digits) < 10:
             return f"Invalid phone/chat_id: {chat_id!r}"
         chat_id = f"{digits}@s.whatsapp.net"
+    target_user = chat_id.split("@", 1)[0]
+    if target_user in _bot_self_ids():
+        return (
+            "Send failed: that number is this bot (group @mention), not a recipient. "
+            "Ask for a real phone like +92312… or a contact name."
+        )
     try:
         if not _send_proactive_message:
             return "Send path not configured."

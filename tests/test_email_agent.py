@@ -365,5 +365,51 @@ check("clean_body: **markdown bold** and __bold__ become plain text in e-mails",
 check("raw errors are scrubbed in the final formatter but never inside RAW cards",
       "Client Error" not in agent_loop._format_whatsapp_reply("ok\n403 Client Error: x for url: https://a.b") )
 
+# =========================================================================== WA forward must NOT open e-mail router (prod 2026-10-15)
+h = H()
+check(
+    "WA-only forward (no email/mail word): zero LLM, pass-through",
+    h.say("Word to word msg likho poora forward karna hai @73109738680505\n\n[Quoted Message]: Ahmed bhai bill…") is None
+    and not h.llm_calls,
+)
+h = H()
+check(
+    "explicit 'email nahi … whatsapp forward' skips router even with draft-looking quote",
+    h.say(
+        "@73109738680505\n\n[Quoted Message]: Internet bill… Also email nahi bhejna kisi ko send karna hai whatsapp forward"
+    )
+    is None
+    and not h.llm_calls,
+)
+# live text after quote split is the mention-only line above — put the WA phrase in live:
+h = H()
+check(
+    "whatsapp forward in live text skips e-mail",
+    h.say("email nahi bhejna kisi ko — whatsapp forward @73109738680505\n\n[Quoted Message]: hi") is None
+    and not h.llm_calls,
+)
+h = H()
+n0 = len(h.llm_calls)
+h.plan = {"intent": "forward", "recipients": [{"name": "Satyam", "email": None}], "body_mode": "verbatim", "source": "quoted"}
+out = h.say("email this to Satyam\n\n[Quoted Message]: Hello Satyam, please review.")
+check("real e-mail forward still routes", out and "Email draft" in out, out)
+
+# send_to parser: @mentions (bot wake LID) must never become the destination phone
+check(
+    "parse_send_to: @LID mention alone is not a phone target",
+    agent_loop._parse_send_to_command(
+        "forward this @73109738680505\n\n[Quoted Message]: hello there"
+    )
+    is None,
+)
+cmd = agent_loop._parse_send_to_command(
+    "bhej do isko +923161545875\n\n[Quoted Message]: hello there"
+)
+check(
+    "parse_send_to: real phone still works",
+    cmd is not None and cmd["phone"] == "923161545875" and "hello" in cmd["body"],
+    cmd,
+)
+
 print("\nall passed" if FAILS == 0 else f"\n{FAILS} failure(s)")
 sys.exit(1 if FAILS else 0)

@@ -54,8 +54,21 @@ INTENTS = ("none", "forward", "compose", "edit", "send", "cancel", "show", "undo
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _QUOTE_MARK = re.compile(r"\[quoted message\]:", re.I)
 _URL_RE = re.compile(r"https?://[^\s<>\"']+[^\s<>\"'.,;:!?)\]]")
+# Cheap gate ONLY — must NOT match bare WA verbs (forward/send/bhej/likh). Those alone
+# used to open the e-mail router on WhatsApp forwards (prod 2026-10-15: voice note
+# "word to word … forward" became an email draft with no To:).
 _EMAIL_WORDS = re.compile(
-    r"(?i)\b(e-?mails?|mails?|gmail|outlook|inbox|forward|send|bhej\w*|likh\w*|draft|cc|bcc|subject|recipient)\b"
+    r"(?i)\b(e-?mails?|mails?|gmail|outlook|inbox|draft|cc|bcc|subject|recipient)\b"
+)
+# Hard skip: user explicitly wants WhatsApp, not e-mail.
+_NOT_EMAIL = re.compile(
+    r"(?i)"
+    r"\b(?:e-?mails?|mails?)\s+nahi\b|"
+    r"\bdon'?t\s+(?:e-?mail|mail)\b|"
+    r"\b(?:no|not)\s+(?:an?\s+)?(?:e-?mail|mail)\b|"
+    r"\bwhatsapp\s+(?:forward|bhej\w*|send)\b|"
+    r"\b(?:forward|bhej\w*|send).{0,48}\bwhatsapp\b|"
+    r"\bwhatsapp.{0,48}\b(?:forward|bhej\w*|send)\b"
 )
 
 _DOMAIN_TYPOS = {
@@ -322,8 +335,8 @@ _PLAN_SYSTEM = """You are the e-mail router for a personal WhatsApp assistant. O
  "clarify": string|null}
 
 INTENTS
-- none: the message is NOT about e-mail. This is the default. Choose none for research, questions, notes, reminders, chat, links, summaries and reports — EVEN IF the text contains words like send / apply / personalize / report / draft / mail, or quotes a long text (a video transcript, an article, a forwarded post). When unsure: none.
-- forward: the user wants the content of the QUOTED message (or, if nothing is quoted and they clearly mean it, your last reply) e-mailed AS IS ("email this to Satyam", "mail ye Ali ko", "send this to hr@x.com"). body_mode "verbatim"; source "quoted" (or "last_bot").
+- none: the message is NOT about e-mail. This is the default. Choose none for research, questions, notes, reminders, chat, links, summaries, reports, WhatsApp rewrite/forward ("word to word", "reword", "whatsapp forward", "email nahi bhejna"), and any send/forward to a phone number — EVEN IF the text contains words like send / apply / personalize / report / draft / mail / forward / bhej, or quotes a long text (a video transcript, an article, a forwarded post). When unsure: none.
+- forward: the user wants the content of the QUOTED message (or, if nothing is quoted and they clearly mean it, your last reply) e-mailed AS IS ("email this to Satyam", "mail ye Ali ko", "send this to hr@x.com"). Requires e-mail intent (email/mail/gmail) and/or an address — NEVER treat a WhatsApp-only forward as e-mail. body_mode "verbatim"; source "quoted" (or "last_bot").
 - compose: write a NEW e-mail from the user's instruction ("email Ali that I'll be late", "write to HR asking for leave on Friday"). body_mode "write"; source "message" (facts live in the message) or "quoted" (quoted text is background/context).
 - edit: change the CURRENT DRAFT (only meaningful if a draft exists): recipients / cc / subject / attachment and/or wording. body_mode "none" when only fields change; "rewrite" for tone/style/shorten/expand/translate/"rewrite fully"/"make it professional"; "patch" for a specific addition, removal or replacement. instruction = what to do, concise.
 - send: send the current draft. explicit_send=true ONLY if the message clearly says send / bhej / mail kar do / go ahead / confirm. A bare "yes / ok / haan / theek hai" while a draft exists = intent send with explicit_send=false.
@@ -787,6 +800,25 @@ def _worth_routing(live: str, quoted: str, draft: Optional[Draft], has_backup: b
     return bool(_EMAIL_WORDS.search(live) or _EMAIL_RE.search(live) or _EMAIL_RE.search(quoted[:600]))
 
 
+def _is_whatsapp_not_email(live: str, quoted: str = "") -> bool:
+    """True when the user clearly wants WhatsApp delivery, not e-mail.
+
+    Checks live text and the start of a quoted instruction (prod: user @mentioned the bot
+    quoting their own 'email nahi … whatsapp forward' line).
+    """
+    blob = f"{live or ''} {(quoted or '')[:500]}".strip()
+    if not blob:
+        return False
+    if _EMAIL_RE.search(live or ""):
+        return False  # an address in the live message → still an e-mail turn
+    # Don't treat a quoted e-mail draft card as a WA-forward instruction
+    if quoted and "Email draft" in quoted[:80]:
+        blob = live or ""
+        if not blob:
+            return False
+    return bool(_NOT_EMAIL.search(blob))
+
+
 def handle(chat_id: str, text: str, *, last_bot: str = "", is_owner: bool = True,
            lang: Optional[str] = None, deps: Optional[Deps] = None) -> Optional[str]:
     """-> reply text (a RAW card or a short sentence) when this was an e-mail turn, else None."""
@@ -807,6 +839,11 @@ def handle(chat_id: str, text: str, *, last_bot: str = "", is_owner: bool = True
         if draft:
             save_draft(chat_id, draft, deps.now())
             log.info("EMAIL draft recovered from quoted card")
+    # Explicit "email nahi / whatsapp forward" — never open the e-mail router
+    # (even if a stale draft exists from a prior misroute).
+    if _is_whatsapp_not_email(live, quoted):
+        log.info("EMAIL_SKIP whatsapp_not_email live=%r", live[:120])
+        return None
     if not _worth_routing(live, quoted, draft, bool(usage_budget.kv_get(f"emailbak:{chat_id}"))):
         return None
 

@@ -21,6 +21,7 @@ Scopes required at consent:
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 import os
 import re
@@ -32,6 +33,8 @@ from email.utils import formataddr, parseaddr
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+log = logging.getLogger("mojo.email")
 
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
@@ -67,7 +70,13 @@ def _access_token() -> str:
         timeout=30,
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"Gmail token refresh failed ({r.status_code}): {r.text[:300]}")
+        body_txt = (r.text or "")[:300]
+        if "invalid_grant" in body_txt.lower():
+            # Ops: re-run scripts/get_gmail_refresh_token.py and update GMAIL_REFRESH_TOKEN.
+            log.error(
+                "GMAIL_AUTH_EXPIRED action=rotate_refresh_token status=%s", r.status_code
+            )
+        raise RuntimeError(f"Gmail token refresh failed ({r.status_code}): {body_txt}")
     body = r.json()
     token = body.get("access_token")
     if not token:
