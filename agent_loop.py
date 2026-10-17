@@ -622,7 +622,7 @@ Supported syntax (exact — no spaces between marker and text):
 - `inline code` (single backtick) → short codes, IDs, commands, order numbers, file names.
 - ```monospace block``` (three backticks on their own lines or around a short block) → multi-line code, aligned data, or a short pasted snippet that must keep spacing.
 - Bulleted list: start a line with "- " (hyphen + space). Prefer bullets for most multi-item replies.
-- Numbered list: ONLY for real sequential steps. Each item on its OWN line with increasing numbers: "1. " then "2. " then "3. ". NEVER repeat "1." on every row. Hard max 5 items. If unsure, use "- " bullets instead.
+- Numbered list: ONLY for real sequential steps. Each item on its OWN line with increasing numbers: "1. " then "2. " then "3. ". NEVER repeat "1." on every row. Max 5 items UNLESS the user asked for all/each/a specific count — then list every item. If unsure, use "- " bullets instead.
 - Labels (To / Subject / Body / etc.): each on its own line — never glue *To:*value*Subject:*value on one line.
 - Block quote: start a line with "> " to set off a short quoted line or key takeaway.
 - Combinations work when nested cleanly, e.g. *_bold italic_*, *~strike bold~*. Close in reverse order of opening. Do not over-nest.
@@ -852,6 +852,7 @@ def _build_system_prompt(
 
 === CORE RULES (SPEED + ACCURACY) ===
 1. Keep replies SHORT — WhatsApp friendly (1–3 short lines max for simple answers; up to ~6–8 lines only when a tight list or structured answer truly helps). No walls of text. No Markdown headers (### / ##). No long bullet essays. No bio dumps.
+1b. COMPLETENESS OVERRIDES BREVITY: when the user asks for "each", "all", "every", "full list", "complete", or a specific count (e.g. "20 questions", "all 38 skills"), deliver EVERY item in that count — never stop early, never merge items to save space, never claim a count you did not deliver. Brevity applies to how long each item is, not to how many items there are.
 2. Never repeat the same sentence twice in one reply.
 3. Do NOT invent timestamps, brackets around names, or internal IDs in your final reply.
 4. GREETINGS / SMALL TALK ("hi", "hello", "hows it going", "kya haal", "salam") → reply naturally in ONE short line. Do NOT call any tool. Do NOT dump agency stats or founder bio.
@@ -1037,107 +1038,71 @@ def _chat_completion(
     temperature: float = 0.4,
     max_tokens: Optional[int] = None,
 ):
-    """Primary Groq (429 + 413 aware), fallback Gemini. Returns the message object."""
-    import time as _time
-
-    working = messages
-    tok = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
-    kwargs: Dict[str, Any] = {
-        "model": _MODEL_NAME,
-        "messages": working,
-        "temperature": temperature,
-        "max_tokens": tok,
-    }
-    if tools:
-        kwargs["tools"] = tools
-        kwargs["tool_choice"] = "auto"
-
-    last_err = None
-    for attempt in range(2):  # only 2 attempts — avoid retry storms that worsen 429
-        try:
-            kwargs["messages"] = working
-            resp = _client_ai.chat.completions.create(**kwargs)
-            return resp.choices[0].message
-        except Exception as primary_err:
-            last_err = primary_err
-            err_s = str(primary_err).lower()
-            is_rate = "429" in err_s or "rate" in err_s or "too many" in err_s
-            is_payload = "413" in err_s or "payload" in err_s or "too large" in err_s
-            if is_payload:
-                print(f"[AGENT] Groq 413 payload too large — shrinking history (attempt {attempt+1})")
-                working = _shrink_messages(working, keep_last=4 if attempt == 0 else 2)
-                # Drop tools immediately on 413 — schemas + long tool obs are the usual culprits
-                if "tools" in kwargs:
-                    kwargs.pop("tools", None)
-                    kwargs.pop("tool_choice", None)
-                continue
-            if is_rate and attempt < 1:
-                sleep_s = 1.5
-                print(f"[AGENT] Groq 429/rate — retry in {sleep_s:.1f}s")
-                _time.sleep(sleep_s)
-                continue
-            print(f"[AGENT] Primary model failed: {_err_detail(primary_err)}. Trying fallback...")
-            break
-
-    # Groq limits are PER MODEL. When the big model is 429'd, a sibling model on its
-    # own bucket answers in ~1s; the Gemini detour cost 14-20s per turn in prod logs.
+    """Groq primary -> Groq sibling -> Gemini, via llm_router (TPM governor, retry-after cooldowns,
+    reasoning_effort on synthesis turns, finish_reason=length continuation). Returns the message."""
     import os as _os
-    _gfb = (_os.getenv("GROQ_FALLBACK_MODEL") or "openai/gpt-oss-20b").strip()
-    _le = str(last_err).lower() if last_err else ""
+    import llm_router as _lr
     try:
         import llm_json as _lj
-        _gfb_ok = bool(_gfb) and _lj.is_usable(_client_ai, _gfb)
+        _usable = _lj.is_usable
     except Exception:
-        _gfb_ok = bool(_gfb)
-    _auth_err = any(x in _le for x in ("401", "invalid api key", "403"))
-    if _gfb_ok and _gfb != _MODEL_NAME and not _auth_err:
-        # Attempt 1: same request on the sibling model (own TPM bucket). Attempt 2 (only after an
-        # HTTP 400): small gpt-oss models sometimes answer a synthesis turn with a malformed
-        # tool call, which Groq rejects as 400 tool_use_failed — retry WITHOUT tools and with
-        # flattened messages (prod: 3x '429, 429, 400' then a slow Gemini detour).
-        for _mode in ("normal", "no_tools"):
-            try:
-                fk = dict(kwargs)
-                fk["model"] = _gfb
-                fk["messages"] = working
-                if _mode == "no_tools":
-                    fk.pop("tools", None)
-                    fk.pop("tool_choice", None)
-                    fk["messages"] = _sanitize_messages_for_gemini(working)
-                resp = _client_ai.chat.completions.create(**fk)
-                print(f"[AGENT] served by Groq fallback {_gfb} ({_mode})")
-                return resp.choices[0].message
-            except Exception as fe:
-                print(f"[AGENT] Groq fallback {_gfb} ({_mode}) failed: {_err_detail(fe)}")
-                if "400" not in str(fe):
-                    break
+        _usable = None
+    tok = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
+    return _lr.complete_full(
+        messages, tools, temperature, tok,
+        groq_client=_client_ai,
+        groq_model=_MODEL_NAME,
+        groq_sibling=(_os.getenv("GROQ_FALLBACK_MODEL") or "openai/gpt-oss-20b").strip() or None,
+        gemini_client=_client_gemini,
+        gemini_model=_GEMINI_MODEL,
+        shrink=lambda m, k: _shrink_messages(m, keep_last=k),
+        flatten=_sanitize_messages_for_gemini,
+        is_usable=_usable,
+    )
 
-    # Gemini fallback — sanitize tool messages so we don't get 400s.
-    # Single attempt only (no nested retry storms on 503/429).
-    try:
-        clean = _sanitize_messages_for_gemini(working)
-        gkwargs: Dict[str, Any] = {
-            "model": _GEMINI_MODEL,
-            "messages": clean,
-            "temperature": temperature,
-            "max_tokens": tok,
-        }
-        resp = _client_gemini.chat.completions.create(**gkwargs)
-        return resp.choices[0].message
-    except Exception as e2:
-        print(f"[AGENT] Gemini fallback failed: {e2}")
-        # Do NOT burn more time on Gemini 503 loops. Caller uses tool OBS.
-        raise last_err or e2
+
+def gemini_vision_complete(messages: List[dict], max_tokens: int = 8192, temperature: float = 0.3):
+    """One Gemini call for vision/PDF turns: reasoning_effort=low, finish_reason logged, and a bounded
+    continuation if the answer hit the cap. Returns the final text."""
+    import llm_router as _lr
+    msg = _lr.complete_full(
+        messages, None, temperature, max(1024, max_tokens // 2),  # router doubles it for Gemini
+        groq_client=None, groq_model=None, groq_sibling=None,
+        gemini_client=_client_gemini, gemini_model=_GEMINI_MODEL,
+        shrink=lambda m, k: m, flatten=lambda m: m,  # multimodal parts must stay intact
+    )
+    return (getattr(msg, "content", None) or "").strip()
 
 
 def _err_detail(e: Exception) -> str:
-    """Error text INCLUDING the provider's response body (Groq puts the real reason — e.g.
-    tool_use_failed / failed_generation — there; str(e) alone is just '400 Bad Request')."""
-    body = getattr(e, "body", None)
-    if not body:
-        resp = getattr(e, "response", None)
-        body = getattr(resp, "text", "") if resp is not None else ""
-    return f"{str(e)[:200]} | body={str(body)[:400]}"
+    import llm_router as _lr
+    return _lr.err_detail(e)
+
+
+def build_memory_block(chat_id: str, budget: int = 3500, per_profile: int = 1200) -> str:
+    """PERMANENT NOTES (resume/profile/standing rules) for a chat. Shared by the agent loop and the
+    PDF/vision fast path so 'use my resume' works there too. Profile-like notes get up to
+    `per_profile` chars; short rules stay short; total capped at `budget`."""
+    try:
+        notes = _get_group_memory(chat_id) if _get_group_memory else []
+    except Exception:
+        notes = []
+    if not notes:
+        return ""
+    clipped: List[str] = []
+    for n in notes[:16]:
+        s_ = str(n or "").strip()
+        if not s_:
+            continue
+        take = s_[: (per_profile if len(s_) > 400 else 280)]
+        take = take[: max(0, budget)]
+        if not take:
+            break
+        clipped.append(take)
+        budget -= len(take)
+        if budget <= 0:
+            break
+    return "PERMANENT NOTES FOR THIS CHAT:\n" + "\n".join(f"- {n}" for n in clipped) if clipped else ""
 
 
 def _replay_history_messages(raw_history: List[dict], contacts_map: dict) -> List[Dict[str, Any]]:
@@ -1223,32 +1188,7 @@ def run_agent(
         effective_limit = min(history_limit or MAX_HISTORY_MSGS, MAX_HISTORY_MSGS)
         raw_history = _fetch_chat_history(chat_id, effective_limit) or []
         contacts_map, reverse_map = _get_contacts_maps() if _get_contacts_maps else ({}, {})
-        memory_notes = _get_group_memory(chat_id) if _get_group_memory else []
-        memory_block = ""
-        if memory_notes:
-            # Prefer longer clips for profile/resume notes so later turns
-            # (e.g. "write intro for this job") still see name, skills, exp.
-            # Cap total injected chars so we never blow the context budget.
-            clipped = []
-            budget = 3500
-            for n in memory_notes[:16]:
-                s = str(n or "").strip()
-                if not s:
-                    continue
-                # Profile-like notes get up to 1200 chars; short rules stay short
-                per = 1200 if len(s) > 400 else 280
-                take = s[:per]
-                if len(take) > budget:
-                    take = take[: max(0, budget)]
-                if not take:
-                    break
-                clipped.append(take)
-                budget -= len(take)
-                if budget <= 0:
-                    break
-            memory_block = "PERMANENT NOTES FOR THIS CHAT:\n" + "\n".join(
-                f"- {n}" for n in clipped
-            )
+        memory_block = build_memory_block(chat_id)
 
         tag_block = ""
         if is_group:
@@ -1952,6 +1892,10 @@ def run_agent(
                 except Exception as _fe:
                     _forced_observation = f"Tool error: {_fe}"
                 _forced_obs_str = str(_forced_observation)
+                logging.getLogger("mojo.agent").info("TOOL browse_url (forced) %s", {"url": primary_url})
+                logging.getLogger("mojo.agent").info(
+                    "OBS browse_url chars=%d head=%r", len(_forced_obs_str), _forced_obs_str[:300]
+                )
                 _cap = 12000 if _forced_obs_str.startswith(("Repo:", "GitHub @", "FILE ")) else MAX_OBS_CHARS
                 if len(_forced_obs_str) > _cap:
                     _forced_obs_str = _forced_obs_str[:_cap] + "…"
@@ -2020,11 +1964,19 @@ def run_agent(
 
         for step in range(MAX_TOOL_STEPS):
             try:
+                # A big tool observation (repo catalog, report, transcript) means a big answer:
+                # 1024 truncated a 38-item list mid-sentence in prod. The router also continues
+                # on finish_reason=length, so this is the first line of defence, not the only one.
+                _big_obs = any(
+                    m.get("role") == "tool" and len(str(m.get("content") or "")) > 6000
+                    for m in messages
+                )
+                _step_tokens = max(_reply_max_tokens, 2048) if (_big_obs and not tools_for_next) else _reply_max_tokens
                 msg = _chat_completion(
                     messages,
                     tools=tools_for_next,
                     temperature=0.3,
-                    max_tokens=_reply_max_tokens,
+                    max_tokens=_step_tokens,
                 )
             except Exception as e:
                 print(f"[AGENT] completion failed at step {step}: {e}")

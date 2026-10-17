@@ -134,6 +134,67 @@ class _FlushFileHandler(logging.FileHandler):
             pass
 
 
+class _StdTee:
+    """Mirror stdout/stderr into the persisted log file. ~170 print() diagnostics (provider 429/400
+    bodies, '[AGENT] ...' decisions, tracebacks) never reached mojo_agent.log. The console still
+    gets the original stream; the file gets one record per line via the 'mojo.print' logger
+    (propagate=False + file handler only, so nothing is double-printed or recursive)."""
+
+    def __init__(self, stream, logger: logging.Logger, level: int):
+        self._stream, self._log, self._level = stream, logger, level
+        self._buf = ""
+        self._lock = threading.Lock()
+        self._busy = threading.local()
+
+    def write(self, s):
+        try:
+            self._stream.write(s)
+        except Exception:
+            pass
+        if not isinstance(s, str) or not s or getattr(self._busy, "on", False):
+            return len(s) if isinstance(s, str) else 0
+        self._busy.on = True
+        try:
+            with self._lock:
+                self._buf += s
+                parts = self._buf.split("\n")
+                self._buf = parts.pop()
+                if len(self._buf) > 8000:
+                    parts.append(self._buf)
+                    self._buf = ""
+            for ln in parts:
+                ln = ln.rstrip()
+                if ln:
+                    self._log.log(self._level, "%s", ln[:2000])
+        except Exception:
+            pass
+        finally:
+            self._busy.on = False
+        return len(s)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _install_std_tee(file_handler: logging.Handler) -> None:
+    import sys
+    pl = logging.getLogger("mojo.print")
+    pl.setLevel(logging.INFO)
+    pl.propagate = False
+    if file_handler not in pl.handlers:
+        pl.addHandler(file_handler)
+    if not isinstance(sys.stdout, _StdTee):
+        sys.stdout = _StdTee(sys.stdout, pl, logging.INFO)
+    if not isinstance(sys.stderr, _StdTee):
+        sys.stderr = _StdTee(sys.stderr, pl, logging.ERROR)
+
+
 def setup_logging():
     """Call once at startup. Local file only — no network. Idempotent."""
     global _started, _current_day, _file_handler
@@ -169,6 +230,8 @@ def setup_logging():
         sh.setLevel(logging.INFO)
         sh.setFormatter(fmt)
         root.addHandler(sh)
+
+    _install_std_tee(fh)
 
     # Quiet noisy HTTP clients
     logging.getLogger("httpx").setLevel(logging.WARNING)

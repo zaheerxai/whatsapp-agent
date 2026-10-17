@@ -1216,6 +1216,14 @@ def _ctx_has_real_quote_or_mention(ctx) -> bool:
     if quoted is None:
         return False
     # quotedMessage object alone is not enough — it must have content
+    return _quoted_msg_has_content(quoted)
+
+
+def _quoted_msg_has_content(quoted) -> bool:
+    """True only if a quotedMessage proto actually carries text/media (neonize hands back truthy
+    empty stubs on every field)."""
+    if quoted is None:
+        return False
     if _safe_str_attr(quoted, "conversation", "Conversation"):
         return True
     q_ext = getattr(quoted, "extendedTextMessage", None) or getattr(quoted, "ExtendedTextMessage", None)
@@ -1242,6 +1250,27 @@ def _ctx_has_real_quote_or_mention(ctx) -> bool:
         ):
             return True
     return False
+
+
+def _ctx_has_real_quote(ctx) -> bool:
+    """Protobuf field-presence for 'this message QUOTES something'. A mention-only contextInfo
+    (the @bot tag) still carries an empty quotedMessage stub that is truthy in Python — prod log
+    2026-10-17 10:00: has_quote=True with stanzaId='' and quoted=''. Require a real stanzaId or a
+    quoted payload with content."""
+    if ctx is None:
+        return False
+    sid = (
+        getattr(ctx, "stanzaId", None)
+        or getattr(ctx, "StanzaID", None)
+        or getattr(ctx, "stanzaID", None)
+    )
+    if isinstance(sid, (bytes, bytearray)):
+        sid = sid.decode("utf-8", errors="ignore")
+    if isinstance(sid, str) and sid.strip():
+        return True
+    return _quoted_msg_has_content(
+        getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)
+    )
 
 
 def get_context_info(msg_obj):
@@ -1722,38 +1751,48 @@ def handle_media_message(message, media_kind, chat_id, sender_id, text_content="
                     if text_content and text_content.strip()
                     else f"Summarize or explain this PDF ({filename})."
                 )
+                # The user's saved resume/profile lives in PERMANENT NOTES. The old one-shot call never
+                # saw it, so "using my experience, skills, resume u have" got generic answers (prod
+                # 2026-10-17 09:53). Let the LLM decide how to use it; no keyword routing.
+                try:
+                    from agent_loop import build_memory_block
+                    _pdf_mem = build_memory_block(chat_id, budget=6000, per_profile=4000)
+                except Exception:
+                    _pdf_mem = ""
+                _pdf_system = (
+                    "You are Mojo, a WhatsApp assistant. The user attached a PDF; answer from its content.\n"
+                    "Follow the requested count, length and format EXACTLY (e.g. '20 questions with 2-line "
+                    "answers' means 20 items, each answer 2 lines). Be WhatsApp-short only when no size is "
+                    "requested.\n"
+                    "If the request refers to the user's own experience/skills/resume/profile, ground every "
+                    "answer in the notes below and never invent employers, dates or skills. If no such notes "
+                    "are provided, say once that you don't have their resume saved, then answer generically.\n"
+                    "Formatting: WhatsApp-native *bold* _italic_ only; no ** or # headers.\n"
+                    "Reply in the language the user wrote in (Roman Urdu stays Roman Urdu).\n\n"
+                    + (_pdf_mem or "NOTES: (none saved for this chat)")
+                )
+                _pdf_messages = [
+                    {"role": "system", "content": _pdf_system},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{media_b64}"}},
+                        ],
+                    },
+                ]
                 gemini_err = None
                 for _pdf_attempt in range(2):
                     try:
-                        gemini_response = client_gemini.chat.completions.create(
-                            model=GEMINI_MODEL,
-                            messages=[
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "You are Mojo. The user sent a PDF. "
-                                        "Answer from its content. Keep it WhatsApp-short."
-                                    ),
-                                },
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": user_prompt},
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {
-                                                "url": f"data:application/pdf;base64,{media_b64}"
-                                            },
-                                        },
-                                    ],
-                                },
-                            ],
-                        )
-                        return gemini_response.choices[0].message.content
+                        from agent_loop import gemini_vision_complete
+                        _pdf_answer = gemini_vision_complete(_pdf_messages, max_tokens=8192)
+                        if _pdf_answer:
+                            return _pdf_answer
+                        raise RuntimeError("empty Gemini PDF answer")
                     except Exception as e:
                         gemini_err = e
                         err_s = str(e).lower()
-                        retryable = any(x in err_s for x in ("503", "429", "unavailable", "high demand"))
+                        retryable = any(x in err_s for x in ("503", "429", "unavailable", "high demand", "empty"))
                         if retryable and _pdf_attempt == 0:
                             log.warning("PDF_GEMINI_RETRY %s", e)
                             time.sleep(1.5)
@@ -3198,7 +3237,7 @@ def _process_message_inner(client, message):
             _lg.getLogger("mojo").info("URL DETECT %s quoted=%r", message_urls, (quoted_text or "")[:120])
         except Exception:
             pass
-    else:
+    elif any(t in (original_text or "").lower() for t in ("http", "www.", ".com", ".io", ".app", ".ai", "/")) and not (original_text or "").lstrip().startswith("/"):
         try:
             import logging as _lg
             _qm = getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None) if ctx else None
@@ -3390,7 +3429,7 @@ def _process_message_inner(client, message):
 
     REACTION_MEDIA = {"sticker", "image", "gif"}  # optional: add "video" if you want
 
-    has_quote = bool(ctx and (getattr(ctx, "quotedMessage", None) or getattr(ctx, "QuotedMessage", None)))
+    has_quote = _ctx_has_real_quote(ctx)
 
     # Substantive caption = USER-TYPED task only (original_text).
     # NEVER scan text_content — that includes [Quoted Message] bot text which

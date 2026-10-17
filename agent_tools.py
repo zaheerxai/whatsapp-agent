@@ -2435,7 +2435,9 @@ def _ai_chat_completion_with_fallback(
                 model=_GEMINI_MODEL,
                 messages=clean,
                 temperature=temperature,
-                max_tokens=max(256, int(max_tokens)),
+                # Gemini 3.x bills thinking against max_tokens: keep it low and leave room for the answer
+                max_tokens=min(8192, max(2048, int(max_tokens) * 2)),
+                extra_body={"reasoning_effort": "low"},
             )
             choice = resp.choices[0]
             content = (choice.message.content or "").strip()
