@@ -20,5 +20,7 @@ services:
         sync: false
       - key: OWNER_SENDER_ID
         sync: false
+      - key: DIAG_TOKEN   # enables GET /diag?token=... (logs + stacks + restart) when WhatsApp is wedged
+        sync: false
       - key: RENDER_EXTERNAL_URL
         sync: false

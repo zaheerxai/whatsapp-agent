@@ -29,6 +29,7 @@ KNOWN_FEATURES = [
 # Owner-only tools still require OWNER_SENDER_ID even when the flag is ON.
 KNOWN_TOOLS = [
     "search_knowledge",
+    "forget_memory",
     "save_to_knowledge",  # chat-scoped for everyone; scope=global enforced owner-only at executor
     "forget_knowledge",
     "web_search",
@@ -237,8 +238,10 @@ def handle_admin_command(text_content):
     try:
         return COMMANDS[cmd_name]["handler"](args)
     except Exception as e:
-        print(f"Error running admin command '{cmd_name}': {e}")
-        return f"Something went wrong running that: {e}"
+        import logging, traceback
+        logging.getLogger("mojo").exception("admin command %r failed: %s", cmd_name, e)
+        # owner-only channel: full detail beats a vague apology
+        return f"❌ /{cmd_name} failed: {type(e).__name__}: {e}\n{traceback.format_exc()[-1200:]}"
 
 
 # --- Global settings ---
@@ -969,6 +972,34 @@ def cmd_kbsearch(args):
         return f"Floor={kr.MIN_SIM} (global scope)\n" + "\n".join(out)
     except Exception as e:
         return f"kbsearch failed: {e}"
+
+
+@command("tail", "Usage: /tail [n=60] — last n lines of the live log, straight from disk (no OneDrive needed).")
+def cmd_tail(args):
+    import mojo_logging
+    try:
+        n = max(5, min(int((args or "60").strip() or 60), 200))
+    except ValueError:
+        n = 60
+    return mojo_logging.tail_log(n, 3300)
+
+
+@command("threads", "Usage: /threads — where every thread is right now + running handlers (debug a hang).")
+def cmd_threads(args):
+    import mojo_logging, resilience
+    run = resilience.running_tasks()
+    head = "Running: " + (", ".join(f"{t['name']}({t['age_s']}s)" for t in run) or "none")
+    return head + "\n\n" + mojo_logging.thread_stacks(max_chars=3000)
+
+
+@command("incidents", "Usage: /incidents — recent crashes/hangs the guard recorded, with causes.")
+def cmd_incidents(args):
+    import resilience
+    d = resilience.diag_payload()
+    inc = d["incidents"]
+    lines = [f"uptime {d['uptime_s'] // 60}m | logging_ok={d['logging_ok']} | undelivered={d['undelivered_reports']}"]
+    lines += [f"{i['t']} {i['kind']} @ {i['stage']} {i['error']}" for i in inc] or ["No incidents recorded since boot."]
+    return "\n".join(lines)
 
 
 @command("help", "Lists all available commands.")

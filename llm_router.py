@@ -174,6 +174,9 @@ def complete(
                 continue
         flat = (kind == "gemini") or (model != groq_model and not work_tools)
         for attempt in range(2):
+            if attempt > 0 and kind == "groq" and _headroom(model) < est_tokens(working, work_tools, max_tokens):
+                log.info("LLM_SKIP model=%s reason=tpm-after-failure", model)
+                break
             try:
                 msgs = flatten(working) if flat else working
                 kw = _build_kwargs(kind, model, msgs, work_tools, temperature, max_tokens)
@@ -200,6 +203,10 @@ def complete(
                 if st == 429 and kind == "groq":
                     _cool(model, ra if ra is not None else 20)
                     break  # next model has its own TPM bucket — don't sleep on this one
+                if st == 400 and kind == "groq" and "tool_use_failed" in str(e):
+                    # model emitted a tool call we did not offer (prod: forget_knowledge with tools=None).
+                    # Flattening won't help and just burns TPM on the same model — go to the next provider.
+                    break
                 if st == 400 and kind == "groq" and attempt == 0 and not flat:
                     flat, work_tools = True, None  # malformed tool turn: retry flattened, no tools
                     continue

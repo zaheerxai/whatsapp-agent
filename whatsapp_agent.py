@@ -34,6 +34,7 @@ from neonize.client import NewClient
 from neonize.events import MessageEv, ConnectedEv
 from neonize.utils import build_jid
 from neonize.utils.enum import Presence
+import resilience
 from supabase import create_client, Client
 
 # Import this AFTER load_dotenv() so it can see the variables
@@ -365,10 +366,38 @@ def start_health_server():
             self.end_headers()
             self.wfile.write(body)
 
+        def _diag(self, path):
+            """Out-of-band admin channel: works even when the WhatsApp pipeline is wedged.
+            Disabled unless DIAG_TOKEN is set. GET /diag?token=...  |  GET /diag/restart?token=..."""
+            from urllib.parse import urlparse, parse_qs
+            import json as _json
+            q = parse_qs(urlparse(self.path).query)
+            tok = (q.get("token") or [self.headers.get("X-Diag-Token", "")])[0]
+            if not resilience.diag_authorized(tok):
+                self.send_response(404)  # don't advertise the endpoint
+                self.end_headers()
+                return
+            if path == "/diag/restart":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"restarting\n")
+                self.wfile.flush()
+                resilience._raw_stderr("[DIAG] restart requested via /diag/restart")
+                threading.Timer(0.5, lambda: os._exit(75)).start()
+                return
+            data = _json.dumps(resilience.diag_payload(_GIT_SHA or ""), indent=1).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             if path in ("/", "/health", "/healthz"):
                 self._send_ok()
+            elif path in ("/diag", "/diag/restart"):
+                self._diag(path)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -2642,6 +2671,8 @@ agent_loop.init_agent(
 
 # Start health endpoint + session uploader + optional self-ping
 start_health_server()
+resilience.init(_owner_notify)
+resilience.start_watchdog()
 # Change-detected session backup (default 30 min). Idle → zero session egress.
 start_session_uploader()
 start_self_ping(interval_seconds=600)         # optional, every 10 min
@@ -2903,6 +2934,46 @@ def on_connected(client: NewClient, event: ConnectedEv):
         log.warning("ConnectedEv presence setup failed: %s", e)
 
 
+def _owner_notify(text: str) -> None:
+    """Blocking send to the owner's private chat (resilience.py calls this off-thread)."""
+    owner = (os.getenv("OWNER_SENDER_ID") or "").strip()
+    if not owner:
+        raise RuntimeError("OWNER_SENDER_ID not set — cannot notify owner")
+    client.send_message(build_jid(owner, server="s.whatsapp.net"), text)
+
+
+def _fast_admin_lane(client, message) -> bool:
+    """Owner slash-commands bypass the whole agent pipeline (no LLM, RAG, history, DB writes first).
+    Runs on its own supervised thread: slow notice, hang report with stacks, full traceback on crash.
+    Returns True if the message was consumed. /upload* (needs the media pipeline) is left to the main path."""
+    try:
+        m = message.Message
+        text = (m.conversation or (m.extendedTextMessage.text if m.extendedTextMessage else "") or "").strip()
+        if not text.startswith("/") or text.lower().startswith(("/uploadimg", "/upload ")):
+            return False
+        info = message.Info
+        if getattr(info, "IsFromMe", False):
+            return False
+        src = info.MessageSource
+        chat_jid = getattr(src, "Chat", None)
+        is_group = _jid_server(chat_jid) == "g.us"
+        s_jid, s_alt = getattr(src, "Sender", None), getattr(src, "SenderAlt", None)
+        number = (_jid_user(s_alt) or "Unknown") if _jid_server(s_jid) == "lid" else (_jid_user(s_jid) or "Unknown")
+        if not admin_commands.is_admin_message(number, is_group):
+            return False
+    except Exception:
+        return False  # anything odd -> let the normal pipeline decide
+    if _should_skip_duplicate(message):
+        return True
+    resilience.run_admin(
+        text,
+        admin_commands.handle_admin_command,
+        lambda t: client.reply_message(t, message),
+        fallback_reply=lambda t: client.send_message(chat_jid, t),
+    )
+    return True
+
+
 @client.event(MessageEv)
 def on_message(client: NewClient, message: MessageEv):
     # Instantly hand off the heavy lifting to a background thread — daemon=True so
@@ -2912,6 +2983,11 @@ def on_message(client: NewClient, message: MessageEv):
         _lg.getLogger("mojo").info("incoming MessageEv — dispatching process_message")
     except Exception:
         pass
+    try:
+        if _fast_admin_lane(client, message):
+            return
+    except Exception as e:  # never let the dispatcher itself die
+        resilience.report_incident("fast admin lane error", e, stage="on_message")
     threading.Thread(target=process_message, args=(client, message), daemon=True).start()
 
 def _jid_user(jid):
@@ -3062,12 +3138,14 @@ def process_message(client, message):
             except Exception:
                 pass
             return
-        _process_message_inner(client, message)
+        with resilience.track("process_message", limit_s=180):
+            _process_message_inner(client, message)
     except Exception as e:
         import logging as _lg
         _lg.getLogger("mojo").exception("process_message CRASHED: %s", e)
         print(f"[PROCESS_MESSAGE CRASH] {e}")
         traceback.print_exc()
+        resilience.report_incident("message handler crashed", e, stage="process_message")
 
 def _process_message_inner(client, message):
     is_from_me = False
@@ -3211,17 +3289,23 @@ def _process_message_inner(client, message):
         "kya bola", "kya kaha", "word to word", "word-to-word",
         "mene kya", "maine kya", "what did i say", "what i said",
     ))
-    _link_intent = (not _voice_intent) and len(_ref_clean.split()) <= 14 and any(w in _ref_clean for w in (
-        "detail", "details", "iska", "is ka", "is ki", "uska", "us ki",
-        "about this", "about it", "about the", "this about", "what is this",
+    # STRONG cues name the link explicitly -> safe to force-fetch the last URL.
+    _strong_link_intent = (not _voice_intent) and len(_ref_clean.split()) <= 14 and any(w in _ref_clean for w in (
         "this link", "this site", "this url", "ye link", "ye site", "ye url",
-        "is link", "is site", "open this", "fetch this", "fetch latest",
-        "latest repo", "is website", "ye website", "this website",
-        "ziada detail", "more detail", "full detail", "every detail",
+        "is link", "is site", "open this", "fetch this", "fetch latest", "latest repo",
+        "is website", "ye website", "this website",
     ))
+    # WEAK cues ("details", "iska", "about it"...) are everyday words — prod 2026-10-17: "Forget about
+    # workseeker X and its all details" force-browsed a stale GitHub API URL and the forget never ran.
+    # They only attach a NON-binding hint; the model decides whether the link is relevant.
+    _weak_link_intent = (not _voice_intent) and not _strong_link_intent and len(_ref_clean.split()) <= 14 and any(w in _ref_clean for w in (
+        "detail", "details", "iska", "is ka", "is ki", "uska", "us ki",
+        "about this", "about it", "what is this", "ziada detail", "more detail", "full detail", "every detail",
+    ))
+    _link_intent = _strong_link_intent
     _quoted_has_url = bool(quoted_text and re.search(r"https?://", quoted_text))
     _referential = _link_intent or _quoted_has_url
-    if not message_urls and _referential:
+    if not message_urls and (_referential or _weak_link_intent):
         try:
             _ms = getattr(message.Info, "MessageSource", None)
             _cj = getattr(_ms, "Chat", None)
@@ -3247,7 +3331,15 @@ def _process_message_inner(client, message):
                 except Exception:
                     pass
             hist_urls = [u for u in hist_urls if not re.match(r"^https?://(?:www\.)?github\.com/[^/?#]+/?$", u)]
-            if hist_urls:
+            # API endpoints are bot/tool-generated, never something the user "shared"
+            hist_urls = [u for u in hist_urls if not re.match(r"^https?://api\.", u)]
+            if hist_urls and not _referential:
+                text_content = (text_content or "") + (
+                    "\n\n[Recent link in this chat — fetch with browse_url ONLY if the user is clearly "
+                    f"referring to it, otherwise ignore: {hist_urls[0]}]"
+                )
+                log.info("URL HISTORY HINT (non-binding) %s", hist_urls[0])
+            elif hist_urls:
                 message_urls = [hist_urls[0]]
                 print(f"[URL HISTORY FALLBACK] chat={_early_chat} -> {message_urls}")
                 try:

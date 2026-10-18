@@ -129,6 +129,22 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "forget_memory",
+            "description": (
+                "Delete saved permanent notes of THIS chat. Workflow: call get_memory, choose the notes the "
+                "user wants gone (e.g. everything about 'Work Seeker X'), then call forget_memory with their "
+                "ids. Use for 'forget / delete / remove this memory'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"ids": {"type": "array", "items": {"type": "integer"}, "description": "Note ids from get_memory"}},
+                "required": ["ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_to_knowledge",
             "description": (
                 "Index a document or text into the searchable knowledge base so it can be recalled "
@@ -990,10 +1006,25 @@ def _tool_web_search(args: dict, ctx: dict) -> str:
 
 
 
+def _normalize_github_url(url: str) -> str:
+    """api.github.com/users/<u>[/repos...] -> github.com/<u>;  api.github.com/repos/<o>/<r> -> github.com/<o>/<r>.
+    Without this the unanchored github.com regex matched INSIDE api.github.com/users/... and returned
+    the user 'users' (prod 2026-10-17: "GitHub user 'users' not found")."""
+    u = (url or "").strip()
+    m = re.match(r"(?:https?://)?api\.github\.com/(?:users|orgs)/([A-Za-z0-9_.-]+)", u, re.I)
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    m = re.match(r"(?:https?://)?api\.github\.com/repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", u, re.I)
+    if m:
+        return f"https://github.com/{m.group(1)}/{m.group(2)}"
+    return u
+
+
 def _github_user_from_url(url: str) -> Optional[str]:
     """Extract GitHub username from profile or repo URL."""
+    url = _normalize_github_url(url)
     m = re.search(
-        r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})(?:/|$|\?)",
+        r"(?<![A-Za-z0-9.-])(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})(?:/|$|\?)",
         url,
         re.I,
     )
@@ -1007,8 +1038,9 @@ def _github_user_from_url(url: str) -> Optional[str]:
 
 
 def _github_repo_from_url(url: str) -> Optional[tuple]:
+    url = _normalize_github_url(url)
     m = re.search(
-        r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/|$|\?)",
+        r"(?<![A-Za-z0-9.-])(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/|$|\?)",
         url,
         re.I,
     )
@@ -1223,10 +1255,44 @@ def _tool_get_weather(args: dict, ctx: dict) -> str:
 
 def _tool_get_memory(args: dict, ctx: dict) -> str:
     chat_id = args.get("chat_id") or ctx["chat_id"]
-    notes = _get_group_memory(chat_id) or []
-    if not notes:
+    try:  # ids let the model pick exactly which note to forget_memory
+        rows = _supabase.table("group_memory").select("id, note").eq("chat_id", chat_id).order("id").execute().data or []
+    except Exception:
+        rows = [{"id": None, "note": n} for n in (_get_group_memory(chat_id) or [])]
+    if not rows:
         return "No permanent notes stored for this chat yet."
-    return "Permanent notes:\n" + "\n".join(f"- {n}" for n in notes)
+    return "Permanent notes:\n" + "\n".join(
+        f"- [#{r['id']}] {r['note']}" if r.get("id") is not None else f"- {r['note']}" for r in rows
+    )
+
+
+def _tool_forget_memory(args: dict, ctx: dict) -> str:
+    """Delete saved notes by id (ids come from get_memory). Scoped to THIS chat only."""
+    raw = args.get("ids")
+    if isinstance(raw, (int, str)):
+        raw = [raw]
+    ids = []
+    for x in raw or []:
+        try:
+            ids.append(int(str(x).lstrip("#")))
+        except ValueError:
+            continue
+    if not ids:
+        return "Pass ids=[...] from get_memory (call get_memory first and pick the matching notes)."
+    chat_id = ctx["chat_id"]
+    try:
+        rows = _supabase.table("group_memory").select("id, note").eq("chat_id", chat_id).in_("id", ids).execute().data or []
+        if not rows:
+            return "No matching notes in this chat (ids not found)."
+        _supabase.table("group_memory").delete().eq("chat_id", chat_id).in_("id", [r["id"] for r in rows]).execute()
+    except Exception as e:
+        return f"Could not delete notes: {e}"
+    try:
+        import knowledge_rag as _kr
+        _kr.sync_chat_notes_async(chat_id)  # semantic index must forget too
+    except Exception:
+        pass
+    return "Forgot " + str(len(rows)) + " note(s): " + " | ".join(r["note"][:60] for r in rows)
 
 
 def _tool_save_memory(args: dict, ctx: dict) -> str:
@@ -4574,6 +4640,7 @@ def _tool_link_preview(args: dict, ctx: dict) -> str:
 
 TOOL_EXECUTORS: Dict[str, Callable[[dict, dict], str]] = {
     "search_knowledge": _tool_search_knowledge,
+    "forget_memory": _tool_forget_memory,
     "save_to_knowledge": _tool_save_to_knowledge,
     "forget_knowledge": _tool_forget_knowledge,
     "web_search": _tool_web_search,

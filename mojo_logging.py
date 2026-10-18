@@ -16,8 +16,15 @@ Design (bandwidth-safe, free-tier aware):
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
+import tempfile
+import shutil
+import atexit
+import queue
+import sys
 import threading
+import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -26,7 +33,7 @@ LOG_NAME = "mojo_agent.log"
 REMOTE_NAME = "mojo_agent_live.log"  # fixed name → overwrite on demand
 MAX_LOCAL_BYTES = int(os.environ.get("MOJO_LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 MB safety
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # re-entrant: log handler -> rotate may run under a caller already holding it
 _started = False
 _log_path = os.path.join(LOG_DIR, LOG_NAME)
 _current_day: Optional[str] = None  # YYYY-MM-DD (UTC)
@@ -182,17 +189,19 @@ class _StdTee:
         return getattr(self._stream, name)
 
 
-def _install_std_tee(file_handler: logging.Handler) -> None:
-    import sys
+def _install_std_tee(handler: logging.Handler) -> None:
     pl = logging.getLogger("mojo.print")
     pl.setLevel(logging.INFO)
     pl.propagate = False
-    if file_handler not in pl.handlers:
-        pl.addHandler(file_handler)
+    if handler not in pl.handlers:
+        pl.addHandler(handler)
     if not isinstance(sys.stdout, _StdTee):
         sys.stdout = _StdTee(sys.stdout, pl, logging.INFO)
     if not isinstance(sys.stderr, _StdTee):
         sys.stderr = _StdTee(sys.stderr, pl, logging.ERROR)
+
+
+_listener: Optional[logging.handlers.QueueListener] = None
 
 
 def setup_logging():
@@ -218,8 +227,18 @@ def setup_logging():
     fh = _FlushFileHandler(_log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
-    root.addHandler(fh)
     _file_handler = fh
+    # NON-BLOCKING by construction: callers only enqueue (SimpleQueue.put never blocks); ONE listener
+    # thread owns the file handler, rotation and disk I/O. A stuck upload, a full disk or a lock held
+    # elsewhere can therefore never freeze the WhatsApp callback thread that is logging "incoming".
+    global _listener
+    _q: "queue.SimpleQueue" = queue.SimpleQueue()
+    qh = logging.handlers.QueueHandler(_q)
+    qh.setLevel(logging.DEBUG)
+    root.addHandler(qh)
+    _listener = logging.handlers.QueueListener(_q, fh, respect_handler_level=True)
+    _listener.start()
+    atexit.register(lambda: _listener and _listener.stop())
 
     # Console mirror
     if not any(
@@ -231,7 +250,7 @@ def setup_logging():
         sh.setFormatter(fmt)
         root.addHandler(sh)
 
-    _install_std_tee(fh)
+    _install_std_tee(qh)
 
     # Quiet noisy HTTP clients
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -322,12 +341,22 @@ def upload_current_log(
     # Allow empty file upload (still useful as a heartbeat) but flag it
     folder = (remote_folder or os.getenv("ONEDRIVE_FOLDER") or "MojoAgent").strip("/")
 
+    # Snapshot under the lock (fast, local disk), upload OUTSIDE it. Holding the lock across a 180s
+    # HTTP call froze every log call in the process (see tests/test_logging_deadlock.py).
+    snap = os.path.join(tempfile.gettempdir(), f"mojo_log_snapshot_{os.getpid()}.log")
     with _lock:
+        shutil.copyfile(_log_path, snap)
+    try:
         meta = file_ops_module.upload_to_onedrive(
-            _log_path,
+            snap,
             remote_folder=folder,
             remote_name=REMOTE_NAME,
         )
+    finally:
+        try:
+            os.remove(snap)
+        except OSError:
+            pass
 
     result = {
         "remote_folder": folder,
@@ -384,3 +413,28 @@ def start_onedrive_log_sync(file_ops_module, interval_sec: int = 90):
         "Auto-upload disabled — use /uploadlog for on-demand sync."
     )
     setup_logging()
+
+
+def tail_log(n: int = 60, max_chars: int = 6000) -> str:
+    """Last n lines of the live log straight from disk (works even if OneDrive/WhatsApp are down)."""
+    try:
+        with open(_log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 200_000))
+            data = f.read().decode("utf-8", "replace")
+        out = "\n".join(data.splitlines()[-max(1, n):])
+        return out[-max_chars:]
+    except Exception as e:  # noqa: BLE001
+        return f"(cannot read log: {e})"
+
+
+def thread_stacks(only_idents: Optional[set] = None, max_chars: int = 9000) -> str:
+    """All (or selected) thread stacks — the direct answer to 'where is it stuck?'."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = []
+    for ident, frame in sys._current_frames().items():
+        if only_idents is not None and ident not in only_idents:
+            continue
+        out.append(f"--- {names.get(ident, '?')} ({ident}) ---\n" + "".join(traceback.format_stack(frame)[-8:]))
+    return "\n".join(out)[-max_chars:]
