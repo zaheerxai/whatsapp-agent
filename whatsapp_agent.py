@@ -2671,7 +2671,7 @@ agent_loop.init_agent(
 
 # Start health endpoint + session uploader + optional self-ping
 start_health_server()
-resilience.init(_owner_notify)
+resilience.init(lambda text: _owner_notify(text))  # late-bound: _owner_notify is defined further down
 resilience.start_watchdog()
 # Change-detected session backup (default 30 min). Idle → zero session egress.
 start_session_uploader()
