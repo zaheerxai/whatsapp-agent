@@ -411,5 +411,75 @@ check(
     cmd,
 )
 
+# =========================================================================== prod 2026-10-27 07:12 replay
+# "Apply to this job @bot" quoting a long job post whose ONLY address is at the very end (char ~1966).
+JOB_POST = ("We are hiring - *Platform Engineer*\nExperience: 5+ Years\n" + ("Responsibilities and requirements line.\n" * 45)
+            + "\n\U0001F4E9 How to Apply\nInterested candidates can share their updated CV at hr@texinity.com")
+check("job post address sits beyond the old 600-char gate window", JOB_POST.index("hr@texinity.com") > 1500)
+h = H()
+h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "hr@texinity.com"}], "body_mode": "write",
+          "source": "quoted", "instruction": "Apply to this job", "purpose": "job_application", "attach": "resume"}
+h.compose_result = {"subject": "Application for Platform Engineer", "body": "Hello,\n\nI would like to apply.\n\nBest regards,\nMuhammad Zaheeruddin"}
+out = h.say(f"Apply to this job @73109738680505\n\n[Quoted Message]: {JOB_POST}")
+d = E.load_draft("c1", h.t)
+check("job apply: router opens for an address deep in the quote (was skipped -> model faked a draft)", out and out.startswith(RAW), out)
+check("job apply: a REAL draft is stored with the JD address + resume", d is not None and d.to == ["hr@texinity.com"] and d.attach == "resume", d)
+h.plan = {"intent": "send", "explicit_send": True, "recipients": [], "body_mode": "none", "source": "none"}
+out = h.say("Send it @73109738680505", last_bot=out)
+check("job apply: 'Send it' reaches Gmail with the attachment", len(h.sent) == 1 and h.sent[0]["to"] == "hr@texinity.com" and h.sent[0]["attach_path"] == "/tmp/r.pdf", (h.sent, out))
+check("job apply: success card, no fake 'Email error'", "Sent" in out and "Email error" not in out, out)
+
+# Same incident, second layer: model wrote a fake draft in chat (nothing stored) -> 'Send it' must still work.
+FAKE = ("*Application Email Drafted:*\n\n*To:* hr@texinity.com\n*Subject:* Application for Platform Engineer\n*Body:*\n"
+        "Hi HR Team,\n\nI am interested in the role. My resume is attached.\n\nBest regards,\n*Muhammad Zaheer*\n\n"
+        "@Zaheer Agar email bhejni hai toh batayein, main send kar doonga!")
+h = H()
+h.plan = {"intent": "send", "explicit_send": True, "recipients": [], "body_mode": "none", "source": "none"}
+h.compose_result = lambda system, user: ({"is_email_draft": True, "to": ["hr@texinity.com"], "subject": "Application for Platform Engineer",
+                   "body": "Hi HR Team,\n\nI am interested in the role. My resume is attached.\n\nBest regards,\nMuhammad Zaheer", "attach_resume": True}
+                   if "draft extractor" in system else {"subject": "S", "body": "B"})
+out = h.say("Send it @73109738680505", last_bot=FAKE)
+check("recovery: draft rebuilt from the bot's own chat text and SENT", len(h.sent) == 1 and h.sent[0]["to"] == "hr@texinity.com" and h.sent[0]["attach_path"], (h.sent, out))
+check("recovery: no chatter from the fake draft leaks into the e-mail body", "kar doonga" not in h.sent[0]["body"] and "*" not in h.sent[0]["body"], h.sent[0]["body"])
+
+# Recovery must refuse hallucinated recipients and non-drafts.
+h = H()
+h.plan = {"intent": "send", "explicit_send": True, "recipients": [], "body_mode": "none", "source": "none"}
+h.compose_result = {"is_email_draft": True, "to": ["ceo@evil.com"], "subject": "x", "body": "hello", "attach_resume": False}
+out = h.say("Send it", last_bot=FAKE)
+check("recovery: an address the owner never saw is rejected -> nothing sent", not h.sent and "no draft" in out.lower(), (h.sent, out))
+h = H()
+h.plan = {"intent": "send", "explicit_send": True, "recipients": [], "body_mode": "none", "source": "none"}
+h.compose_result = {"is_email_draft": False}
+check("recovery: non-draft chat text -> honest 'no draft', nothing sent", "no draft" in (h.say("Send it", last_bot="Meet me at a@b.com tomorrow") or "").lower() and not h.sent)
+
+# Gate: last bot reply that mentions an address now opens the router; pure chat stays closed (cost gate).
+check("gate: plain chat with no draft/address stays closed", not E._worth_routing("how are you", "", None))
+check("gate: address anywhere in a long quote opens", E._worth_routing("Apply to this job", JOB_POST, None))
+
+# email_ops: access-token cache (one OAuth round trip for many sends) + 401 invalidation
+import email_ops, os, time as _t
+os.environ.update(GMAIL_CLIENT_ID="i", GMAIL_CLIENT_SECRET="s", GMAIL_REFRESH_TOKEN="r", GMAIL_SENDER="me@gmail.com")
+calls = {"token": 0, "send": 0}
+class _R:
+    def __init__(s, code, js): s.status_code, s._js, s.text = code, js, str(js)
+    def json(s): return s._js
+def _post(url, **kw):
+    if "oauth2" in url:
+        calls["token"] += 1
+        return _R(200, {"access_token": f"t{calls['token']}", "expires_in": 3600})
+    calls["send"] += 1
+    return _R(401 if calls["send"] == 3 else 200, {"id": f"m{calls['send']}"})
+email_ops.requests.post = _post
+email_ops._TOKEN_CACHE.update(token="", exp=0.0, refresh="")
+email_ops.send_email(to="a@b.com", subject="s", body="b"); email_ops.send_email(to="a@b.com", subject="s", body="b")
+check("email_ops: token fetched once for two sends", calls["token"] == 1, calls)
+try:
+    email_ops.send_email(to="a@b.com", subject="s", body="b")
+except RuntimeError:
+    pass
+email_ops.send_email(to="a@b.com", subject="s", body="b")
+check("email_ops: a 401 drops the cached token so the retry gets a fresh one", calls["token"] == 2, calls)
+
 print("\nall passed" if FAILS == 0 else f"\n{FAILS} failure(s)")
 sys.exit(1 if FAILS else 0)

@@ -879,7 +879,7 @@ def _build_system_prompt(
    - Do NOT browse_url or transcribe incidental links inside that quoted body (GitHub, LinkedIn, portfolio URLs are part of the note, not the task).
    - Confirm in 1 short line after save_memory succeeds. Do not re-dump the whole note back to chat.
 11i. GITHUB BY NAME: when the user names a repo ("the marketing agent", "my whatsapp-agent repo") and the conversation already shows the owner (a profile link or earlier repo URLs), do NOT ask for a link: browse_url the owner's profile once to list repos, pick the matching one, then browse_url the repo (and .../blob/HEAD/README.md with offset for a full README). Present exactly what the tool returned; never say a repo has no README unless the tool's "README: NO" line says so.
-11f. E-MAIL (owner only): drafting, forwarding ("email this to X"), editing, sending and cancelling are handled BEFORE you by a dedicated e-mail router — you will not normally see those turns. Use draft_email / send_email only when YOU decide an e-mail is the right output (e.g. "email me this report" right after a research answer): draft_email with the exact text, then wait for the owner to say send — never call send_email without an explicit confirmation, and never claim an e-mail was drafted or sent unless the tool returned a card/"Sent". Facts in an e-mail come ONLY from what the user gave you or the document being forwarded; never invent experience, names or dates, and never turn a normal message into a job application.
+11f. E-MAIL (owner only): a dedicated e-mail router handles clear e-mail turns before you, but if one reaches you and the owner wants an e-mail written, applied for, forwarded or sent (including "apply to this job" / "send your CV" on a post that gives an address), you MUST call draft_email with the real recipient, subject and body. NEVER write a draft, "Email drafted" card or e-mail text in the chat yourself: a draft that did not come from the tool is not stored and cannot be sent. When the owner confirms ("send it", "bhej do", "haan"), call send_email with confirm=true. Never say an e-mail was drafted, sent or failed unless the tool returned that, and never invent an error. Take the recipient from the post/quoted text; if none exists anywhere, ask for it. Facts in an e-mail come ONLY from what the user gave you, the document being forwarded, or the resume; never invent experience, names or dates, and never turn a normal message into a job application.
 
 {style_hint}
 {format_block}
@@ -1490,12 +1490,19 @@ def run_agent(
                 if (_m.get("role") or "") == "assistant":
                     _last_bot = _m.get("content") or ""
                     break
-            if _tool_allowed_for_chat(chat_id, "draft_email") and _email_is_owner(tool_ctx):
+            _em_allowed = _tool_allowed_for_chat(chat_id, "draft_email")
+            _em_owner = _email_is_owner(tool_ctx)
+            if _em_allowed and _em_owner:
                 _em_reply = email_agent.handle(
                     chat_id, latest_user_text or extra_user_note or "", last_bot=_last_bot, is_owner=True,
                 )
                 if _em_reply:
                     return _reply(_em_reply)
+            else:
+                logging.getLogger("mojo.email").info(
+                    "EMAIL_ROUTER_SKIPPED tool_allowed=%s is_owner=%s sender_id=%s sender_num=%s",
+                    _em_allowed, _em_owner, tool_ctx.get("sender_id"), tool_ctx.get("sender_num"),
+                )
         except Exception as _ee:
             print(f"[AGENT] email_agent failed (continuing normally): {_ee}")
 

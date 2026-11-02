@@ -26,6 +26,8 @@ import mimetypes
 import os
 import re
 import tempfile
+import threading
+import time
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -50,7 +52,23 @@ def gmail_configured() -> bool:
     )
 
 
+_TOKEN_CACHE: Dict[str, Any] = {"token": "", "exp": 0.0, "refresh": ""}
+_TOKEN_LOCK = threading.Lock()
+
+
 def _access_token() -> str:
+    """Access token via refresh-token grant, cached until ~60 s before expiry (Google: ~1 h)."""
+    refresh = os.getenv("GMAIL_REFRESH_TOKEN") or ""
+    with _TOKEN_LOCK:
+        if (_TOKEN_CACHE["token"] and _TOKEN_CACHE["refresh"] == refresh
+                and time.time() < _TOKEN_CACHE["exp"]):
+            return _TOKEN_CACHE["token"]
+        token, ttl = _fetch_access_token()
+        _TOKEN_CACHE.update(token=token, exp=time.time() + max(60, ttl - 60), refresh=refresh)
+        return token
+
+
+def _fetch_access_token() -> Tuple[str, int]:
     client_id = os.getenv("GMAIL_CLIENT_ID") or ""
     client_secret = os.getenv("GMAIL_CLIENT_SECRET") or ""
     refresh = os.getenv("GMAIL_REFRESH_TOKEN") or ""
@@ -74,14 +92,22 @@ def _access_token() -> str:
         if "invalid_grant" in body_txt.lower():
             # Ops: re-run scripts/get_gmail_refresh_token.py and update GMAIL_REFRESH_TOKEN.
             log.error(
-                "GMAIL_AUTH_EXPIRED action=rotate_refresh_token status=%s", r.status_code
+                "GMAIL_AUTH_EXPIRED action=rotate_refresh_token status=%s hint=%s",
+                r.status_code,
+                "if this recurs weekly the Google OAuth consent screen is in 'Testing' "
+                "(7-day refresh-token expiry): set Publishing status to 'In production' "
+                "then re-run scripts/get_gmail_refresh_token.py",
             )
         raise RuntimeError(f"Gmail token refresh failed ({r.status_code}): {body_txt}")
     body = r.json()
     token = body.get("access_token")
     if not token:
         raise RuntimeError(f"Gmail token response missing access_token: {body}")
-    return token
+    try:
+        ttl = int(body.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        ttl = 3600
+    return token, ttl
 
 
 def resolve_resume_pdf() -> Tuple[Optional[str], Optional[str]]:
@@ -287,6 +313,10 @@ def send_email(
         timeout=60,
     )
     if r.status_code >= 400:
+        if r.status_code == 401:
+            with _TOKEN_LOCK:
+                _TOKEN_CACHE["token"] = ""   # stale/revoked access token: force a fresh grant next time
+        log.error("GMAIL_SEND_FAILED status=%s body=%s", r.status_code, r.text[:200])
         raise RuntimeError(f"Gmail send failed ({r.status_code}): {r.text[:400]}")
     data = r.json()
     return {
