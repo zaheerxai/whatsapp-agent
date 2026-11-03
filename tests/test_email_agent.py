@@ -481,5 +481,46 @@ except RuntimeError:
 email_ops.send_email(to="a@b.com", subject="s", body="b")
 check("email_ops: a 401 drops the cached token so the retry gets a fresh one", calls["token"] == 2, calls)
 
+# =========================================================================== prod 2026-11-02 18:16 replay: Google 403
+# Gmail API disabled in the Cloud project. Real body shape (see Google error format).
+GOOGLE_403 = {"error": {"code": 403, "message": "Gmail API has not been used in project 6502305062 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=6502305062 then retry.",
+    "errors": [{"message": "x", "domain": "usageLimits", "reason": "accessNotConfigured"}], "status": "PERMISSION_DENIED",
+    "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "SERVICE_DISABLED", "domain": "googleapis.com",
+                 "metadata": {"service": "gmail.googleapis.com", "consumer": "projects/6502305062"}}]}}
+ge = email_ops._google_error(_R(403, GOOGLE_403))
+check("google error: structured reason + project enable-link extracted", ge.reason == "SERVICE_DISABLED" and ge.enable_url.endswith("gmail.googleapis.com/overview?project=6502305062"), (ge.reason, ge.enable_url))
+check("google error: str() stays short and keeps the '(403' prefix", str(ge).startswith("Gmail send failed (403") and len(str(ge)) < 330, str(ge))
+h = H()
+h.send_errors = [ge]
+h.plan = {"intent": "send", "explicit_send": True, "recipients": [], "body_mode": "none", "source": "none"}
+E.save_draft("c1", E.Draft(to=["noor@theeduassist.com"], subject="S", body="B", attach="none", purpose="general"), h.t)
+out = h.say("send it")
+check("403 disabled: actionable message with the enable link (was truncated raw JSON)", "Gmail API is switched off" in out and "project=6502305062" in out and '"error"' not in out, out)
+check("403 disabled: not retried (non-transient) and draft kept", len(h.send_errors) == 0 and E.load_draft("c1", h.t) is not None, out)
+# the scope error must still map to the scope message, not the new one
+e2 = email_ops.GmailAPIError(403, "insufficientPermissions", "Request had insufficient authentication scopes")
+check("403 scope: still the scope message", "send permission" in E._friendly_send_error(str(e2), "en", e2), E._friendly_send_error(str(e2), "en", e2))
+
+# =========================================================================== attachment consistency (draft said 'I have attached my CV' with Attachment: none)
+h = H()
+seen = {}
+def _writer(system, user):
+    seen["user"] = json.loads(user); seen["system"] = system
+    return {"subject": "Application", "body": "Hello,\n\nPlease find my CV attached.\n\nRegards,\nZ"}
+h.compose_result = _writer
+h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@theeduassist.com"}], "body_mode": "write", "source": "quoted",
+          "instruction": "Apply to this job", "purpose": "job_application", "attach": "keep"}
+out = h.say("Apply to this job\n\n[Quoted Message]: Send your CV (PDF format) to: noor@theeduassist.com")
+d = E.load_draft("c1", h.t)
+check("job apply with attach=keep -> resume attached", d.attach == "resume" and "*Attachment:* none" not in out, out[:160])
+check("writer is told RESUME_ATTACHED=true", seen["user"].get("RESUME_ATTACHED") is True, seen["user"].keys())
+check("writer rule forbids claiming an attachment that is not there", "RESUME_ATTACHED" in seen["system"])
+h2 = H()
+h2.compose_result = _writer
+h2.plan = dict(h.plan, attach="none")
+h2.say("Apply to this job but no attachment\n\n[Quoted Message]: Send your CV to: noor@theeduassist.com")
+check("explicit 'no attachment' -> writer told RESUME_ATTACHED=false", seen["user"].get("RESUME_ATTACHED") is False and E.load_draft("c1", h2.t).attach == "none", seen["user"].get("RESUME_ATTACHED"))
+
+
 print("\nall passed" if FAILS == 0 else f"\n{FAILS} failure(s)")
 sys.exit(1 if FAILS else 0)

@@ -21,6 +21,7 @@ Scopes required at consent:
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import mimetypes
 import os
@@ -50,6 +51,42 @@ def gmail_configured() -> bool:
         and os.getenv("GMAIL_REFRESH_TOKEN")
         and os.getenv("GMAIL_SENDER")
     )
+
+
+class GmailAPIError(RuntimeError):
+    """Gmail/Google API failure with the structured fields Google returns.
+
+    str(e) keeps the "Gmail send failed (<status>" prefix that email_agent's error mapper keys on,
+    but stays short: the raw JSON body used to be cut mid-URL and shown to the user verbatim.
+    """
+
+    def __init__(self, status: int, reason: str, message: str, enable_url: str = ""):
+        self.status, self.reason, self.message, self.enable_url = status, reason, message, enable_url
+        super().__init__(f"Gmail send failed ({status} {reason or 'error'}): {message[:240]}")
+
+
+def _google_error(r) -> GmailAPIError:
+    """Parse a Google JSON error body (error.errors[].reason, error.details[] ErrorInfo)."""
+    status, reason, msg, url = r.status_code, "", "", ""
+    try:
+        err = (r.json() or {}).get("error") or {}
+        msg = str(err.get("message") or "")
+        reason = str((err.get("errors") or [{}])[0].get("reason") or "")
+        for det in err.get("details") or []:
+            if not isinstance(det, dict):
+                continue
+            if det.get("@type", "").endswith("ErrorInfo"):
+                reason = str(det.get("reason") or reason)
+                md = det.get("metadata") or {}
+                proj = str(md.get("consumer") or "").replace("projects/", "")
+                svc = str(md.get("service") or "")
+                if proj and svc and not url:
+                    url = f"https://console.developers.google.com/apis/api/{svc}/overview?project={proj}"
+            for ln in det.get("links") or []:
+                url = url or str((ln or {}).get("url") or "")
+    except Exception:
+        msg = msg or (getattr(r, "text", "") or "")[:240]
+    return GmailAPIError(status, reason, msg or (getattr(r, "text", "") or "")[:240], url)
 
 
 _TOKEN_CACHE: Dict[str, Any] = {"token": "", "exp": 0.0, "refresh": ""}
@@ -316,8 +353,10 @@ def send_email(
         if r.status_code == 401:
             with _TOKEN_LOCK:
                 _TOKEN_CACHE["token"] = ""   # stale/revoked access token: force a fresh grant next time
-        log.error("GMAIL_SEND_FAILED status=%s body=%s", r.status_code, r.text[:200])
-        raise RuntimeError(f"Gmail send failed ({r.status_code}): {r.text[:400]}")
+        ge = _google_error(r)
+        log.error("GMAIL_SEND_FAILED status=%s reason=%s enable_url=%s msg=%s",
+                  ge.status, ge.reason, ge.enable_url or "-", ge.message[:300])
+        raise ge
     data = r.json()
     return {
         "id": data.get("id"),

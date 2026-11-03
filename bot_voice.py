@@ -115,6 +115,10 @@ _M: Dict[str, Dict[str, str]] = {
         "en": "Gmail's login has expired (refresh token). A new token is needed before I can send. Your draft is safe.",
         "ur": "Gmail ka login expire ho gaya (refresh token). Bhejne se pehle naya token chahiye. Draft safe hai.",
     },
+    "api_disabled": {
+        "en": "Gmail refused the send because the *Gmail API is switched off* in your Google Cloud project. Enable it here, wait ~1 minute, then say *send* again — your draft is safe:\n{url}",
+        "ur": "Gmail ne send reject kar diya kyunke aapke Google Cloud project mein *Gmail API band hai*. Yahan se enable karo, ~1 minute ruko, phir dobara *send* likho — draft safe hai:\n{url}",
+    },
     "send_scope": {
         "en": "Gmail refused the send — the token is missing the send permission. Your draft is safe.",
         "ur": "Gmail ne send reject kar diya — token mein send ki permission nahi hai. Draft safe hai.",
