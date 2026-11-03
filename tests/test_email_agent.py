@@ -505,7 +505,8 @@ check("403 scope: still the scope message", "send permission" in E._friendly_sen
 h = H()
 seen = {}
 def _writer(system, user):
-    seen["user"] = json.loads(user); seen["system"] = system
+    if "tailored job-application" in system or "RESUME_ATTACHED" in system:   # the writer call, not the fact-check
+        seen["user"] = json.loads(user); seen["system"] = system
     return {"subject": "Application", "body": "Hello,\n\nPlease find my CV attached.\n\nRegards,\nZ"}
 h.compose_result = _writer
 h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@theeduassist.com"}], "body_mode": "write", "source": "quoted",
@@ -513,7 +514,7 @@ h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@thee
 out = h.say("Apply to this job\n\n[Quoted Message]: Send your CV (PDF format) to: noor@theeduassist.com")
 d = E.load_draft("c1", h.t)
 check("job apply with attach=keep -> resume attached", d.attach == "resume" and "*Attachment:* none" not in out, out[:160])
-check("writer is told RESUME_ATTACHED=true", seen["user"].get("RESUME_ATTACHED") is True, seen["user"].keys())
+check("writer is told RESUME_ATTACHED=true", seen["user"].get("RESUME_ATTACHED") is True, list(seen["user"].keys()))
 check("writer rule forbids claiming an attachment that is not there", "RESUME_ATTACHED" in seen["system"])
 h2 = H()
 h2.compose_result = _writer
@@ -521,6 +522,100 @@ h2.plan = dict(h.plan, attach="none")
 h2.say("Apply to this job but no attachment\n\n[Quoted Message]: Send your CV to: noor@theeduassist.com")
 check("explicit 'no attachment' -> writer told RESUME_ATTACHED=false", seen["user"].get("RESUME_ATTACHED") is False and E.load_draft("c1", h2.t).attach == "none", seen["user"].get("RESUME_ATTACHED"))
 
+
+# =========================================================================== prod 2026-11-03: JD ignored / invented experience
+JD = ("Now Hiring: Remote - Web FullStack Developer Intern\nRequirements\nStrong proficiency in HTML5, CSS3, JavaScript, TypeScript, React.js.\n"
+      "Experience with Next.js. Sanity CMS. Firebase. Cloudflare.\nSubject Line: Application - Web FullStack Developer Intern\n"
+      "Send your CV (PDF format) to: noor@theeduassist.com")
+PROFILE = ("Muhammad Zaheer\nB.Sc. Computer Science, Federal Urdu University\n"
+           "Interact Health PRO - AI Intern: built AI-supported workflows for healthcare coordination using Claude AI and Claude.md; "
+           "automations via Airtable and Make.com for onboarding and reporting.\n"
+           "Abdanix Solutions - Automation Engineer: shipped six n8n automation systems, an agentic chatbot with Clerk-authenticated sessions, "
+           "dynamic PDF proposal generation.\n" + ("Additional experience line with details.\n" * 200) + "ENDMARK-LAST-LINE-OF-RESUME")
+check("fixture: resume is longer than the old 3500-char cap", len(PROFILE) > 3600)
+
+def _mk(audit=None, writer_obj=None):
+    h = H()
+    h.deps.profile_fn = lambda: PROFILE
+    calls = {"writer": [], "audit": []}
+    def wfn(system, user):
+        u = json.loads(user)
+        if "fact-checker" in system:
+            calls["audit"].append(u)
+            return audit(u) if callable(audit) else (audit or {"unsupported": [], "role_ok": True, "fixed_body": ""})
+        calls["writer"].append((system, u))
+        return writer_obj(u) if callable(writer_obj) else (writer_obj or {
+            "role_title": "Web FullStack Developer Intern", "company": None, "requirements": ["React"], "gaps": ["Sanity CMS"],
+            "matches": [{"requirement": "Python/TS", "evidence": "shipped six n8n automation systems", "where": "Abdanix"}],
+            "subject": "Application - Web FullStack Developer Intern",
+            "body": "Hello,\n\nI am applying for the Web FullStack Developer Intern role. At Abdanix I shipped six n8n automation systems.\n\nBest regards,\nMuhammad Zaheeruddin"})
+    h.deps.writer_json_fn = wfn
+    return h, calls
+
+# 1) planner mislabels the source ("draft") -> the JD must STILL reach the writer, with the FULL resume
+h, calls = _mk()
+h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@theeduassist.com"}], "body_mode": "rewrite", "source": "draft",
+          "instruction": "apply to this job", "purpose": "job_application", "attach": "keep"}
+out = h.say(f"apply to this job\n\n[Quoted Message]: {JD}")
+w = calls["writer"][0][1]
+check("JD reaches the writer even when the planner mislabels the source", "Web FullStack Developer Intern" in w["JOB_DESCRIPTION"] and "Next.js" in w["JOB_DESCRIPTION"], w["JOB_DESCRIPTION"][:80])
+check("writer receives the FULL resume (old cap cut it at 3500)", w["CANDIDATE_PROFILE"].endswith("ENDMARK-LAST-LINE-OF-RESUME"), len(w["CANDIDATE_PROFILE"]))
+check("application uses the stronger writer model path, not the side model", len(calls["writer"]) == 1 and not any("tailored job-application" in sy for sy, _ in h.llm_calls))
+d = E.load_draft("c1", h.t)
+check("JD is persisted on the draft for later edits", "Web FullStack Developer Intern" in d.job_brief)
+check("the body is for the JD's role (not 'AI Engineer')", "AI Engineer" not in d.body and "Web FullStack Developer Intern" in d.body, d.body)
+check("evidence-first prompt: requirements/matches/gaps precede the body", E._APPLY_SYSTEM.index('"matches"') < E._APPLY_SYSTEM.index('"body"') and "COPIED VERBATIM" in E._APPLY_SYSTEM)
+check("audit ran once on the finished body, with resume + JD + draft", len(calls["audit"]) == 1 and "applying for the Web FullStack Developer Intern role" in calls["audit"][0]["BODY"] and calls["audit"][0]["CANDIDATE_PROFILE"] == PROFILE and "FullStack" in calls["audit"][0]["JOB_DESCRIPTION"])
+
+# 2) the owner's complaint turn has NO quote: the JD must come from the draft, and the correction must be remembered
+h.plan = {"intent": "edit", "recipients": [], "body_mode": "patch", "source": "message", "purpose": "general", "attach": "keep",
+          "instruction": "I did not use next.js, react in IHP internship. Remove that."}
+h.say("I did not use next.js, react in IHP internship. Why are you making stuff up")
+w2 = calls["writer"][-1][1]
+check("edit turn: the model receives the JD (not re-quoted) AND the full resume", "Next.js" in w2["JOB_DESCRIPTION"] and w2["candidate_profile"].endswith("ENDMARK-LAST-LINE-OF-RESUME"), list(w2.keys()))
+check("edit turn: the model receives the owner's correction as OWNER_NOTES", any("did not use next.js" in n.lower() for n in w2["OWNER_NOTES"]), w2["OWNER_NOTES"])
+check("edit turn: owner correction stored on the draft", any("did not use next.js" in n.lower() for n in E.load_draft("c1", h.t).owner_notes))
+check("edit turn: the edited body is fact-checked too", len(calls["audit"]) == 2, len(calls["audit"]))
+h.plan = dict(h.plan, instruction="make it shorter")
+h.say("make it shorter")
+w3 = calls["writer"][-1][1]
+check("later edit still carries the earlier correction (cannot be reintroduced)", len(w3["OWNER_NOTES"]) == 2 and any("did not use next.js" in n.lower() for n in w3["OWNER_NOTES"]), w3["OWNER_NOTES"])
+
+# 3) fact-check removes an invented claim (JD tech attached to the wrong employer)
+FABRICATED = "Hello,\n\nDuring my internship at Interact Health PRO I built workflows using Next.js and React.\n\nBest regards,\nMuhammad Zaheeruddin"
+FIXED = "Hello,\n\nDuring my internship at Interact Health PRO I built AI-supported workflows using Claude AI.\n\nBest regards,\nMuhammad Zaheeruddin"
+h, calls = _mk(writer_obj={"role_title": "Web FullStack Developer Intern", "matches": [{"requirement": "Next.js", "evidence": "built workflows using Next.js and React", "where": "IHP"}],
+                           "subject": "S", "body": FABRICATED},
+               audit={"unsupported": [{"claim": "Next.js and React at Interact Health PRO", "why": "profile does not mention them there"}], "role_ok": True, "fixed_body": FIXED})
+h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@theeduassist.com"}], "body_mode": "write", "source": "quoted",
+          "instruction": "apply", "purpose": "job_application", "attach": "keep"}
+h.say(f"apply\n\n[Quoted Message]: {JD}")
+d = E.load_draft("c1", h.t)
+check("fact-check: invented 'Next.js at IHP' replaced by the corrected body", d.body == FIXED and "Next.js" not in d.body, d.body)
+check("fact-check: invented evidence quote is flagged as unverified to the auditor", calls["audit"][0]["UNVERIFIED_EVIDENCE"] == ["built workflows using Next.js and React"], calls["audit"][0]["UNVERIFIED_EVIDENCE"])
+
+# 4) audit unavailable -> draft still produced; audit returns a collapsed body -> rejected
+h, calls = _mk(audit=lambda u: None)
+h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@theeduassist.com"}], "body_mode": "write", "source": "quoted", "instruction": "apply", "purpose": "job_application", "attach": "keep"}
+out = h.say(f"apply\n\n[Quoted Message]: {JD}")
+check("audit outage: the draft is still delivered", out.startswith(RAW) and "Web FullStack Developer Intern" in E.load_draft("c1", h.t).body)
+h, calls = _mk(audit={"unsupported": [{"claim": "x", "why": "y"}], "role_ok": True, "fixed_body": "Hi."})
+h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "noor@theeduassist.com"}], "body_mode": "write", "source": "quoted", "instruction": "apply", "purpose": "job_application", "attach": "keep"}
+h.say(f"apply\n\n[Quoted Message]: {JD}")
+check("audit returning a gutted body is rejected", "applying for the Web FullStack" in E.load_draft("c1", h.t).body)
+
+# 5) non-application mail is untouched: no JD, no audit, side model
+h = H(); h.plan = {"intent": "compose", "recipients": [{"name": None, "email": "a@b.com"}], "body_mode": "write", "source": "message", "instruction": "tell him I'll be late", "purpose": "general", "attach": "keep"}
+h.say("email a@b.com that I'll be late")
+check("general mail: no application machinery (no audit, no profile)", not any("fact-checker" in c[0] for c in h.llm_calls) and not any("CANDIDATE_PROFILE" in c[1] for c in h.llm_calls))
+
+# tool_draft fallback (chat model wrote the body itself) is fact-checked for job applications only
+h, calls = _mk(audit={"unsupported": [{"claim": "Next.js at IHP", "why": "not in profile"}], "role_ok": True, "fixed_body": FIXED})
+r = E.tool_draft({"action": "create", "to": "noor@theeduassist.com", "subject": "S", "body": FABRICATED, "purpose": "job_application"}, "c1", True, h.deps)
+check("tool_draft: a job-application body written by the chat model is fact-checked", E.load_draft("c1", h.t).body == FIXED and len(calls["audit"]) == 1, E.load_draft("c1", h.t).body)
+h, calls = _mk()
+E.tool_draft({"action": "create", "to": "a@b.com", "subject": "S", "body": "Hello, I will be late.", "purpose": "general"}, "c1", True, h.deps)
+check("tool_draft: ordinary mail is not audited", len(calls["audit"]) == 0)
 
 print("\nall passed" if FAILS == 0 else f"\n{FAILS} failure(s)")
 sys.exit(1 if FAILS else 0)
