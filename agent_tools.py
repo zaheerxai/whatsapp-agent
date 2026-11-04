@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import bot_voice
 import usage_budget
+import yt_access
 import github_ops
 import research
 import web_search_providers
@@ -2985,6 +2986,7 @@ def _try_piped_captions(
         "Accept": "application/json",
     }
 
+    responded = False  # any host answered HTTP 200 -> the service is alive even if this video has no subs
     for host in _PIPED_API_HOSTS:
         try:
             r = requests.get(
@@ -2995,6 +2997,7 @@ def _try_piped_captions(
             if r.status_code != 200:
                 print(f"[transcribe_video] Piped {host} → HTTP {r.status_code}")
                 continue
+            responded = True
             data = r.json()
             subs = data.get("subtitles") or []
             if not subs:
@@ -3047,6 +3050,10 @@ def _try_piped_captions(
         except Exception as e:
             print(f"[transcribe_video] Piped {host} error: {e}")
             continue
+    if responded:
+        yt_access.health.success("piped")
+    else:
+        yt_access.health.failure("piped")  # every host dead/blocked: 3 in a row -> skipped for 6 h
     return None
 
 
@@ -3059,7 +3066,8 @@ def _is_owner(ctx: dict) -> bool:
     )
 
 
-def _try_supadata(url: str, language: str, with_timestamps: bool, privileged: bool = False) -> Optional[str]:
+def _try_supadata(url: str, language: str, with_timestamps: bool, privileged: bool = False,
+                  allow_generate: bool = True, only_generate: bool = False) -> Optional[str]:
     """
     Managed API — YouTube, TikTok, Instagram, Facebook, X (cloud-friendly).
     Requires SUPADATA_API_KEY. FREE PLAN = 100 credits/month, no rollover:
@@ -3263,14 +3271,23 @@ def _try_supadata(url: str, language: str, with_timestamps: bool, privileged: bo
     if usage_budget.kv_get(f"supadata_fail:{mkey}"):
         print(f"[transcribe_video] Supadata skipped — failed recently for {mkey} (6h negative cache)")
         return None
-    got = _one_mode("native")
-    if got and len(got.strip()) >= 20:
-        return got
-    if got:
-        print(
-            f"[transcribe_video] Supadata native too short ({len(got.strip())} chars) "
-            f"— NOT escalating to paid AI transcription"
-        )
+    # YouTube callers split the ladder (free ASR runs between them): native now (allow_generate=False),
+    # generate last (only_generate=True). The short-native rule must survive that split.
+    if not only_generate:
+        got = _one_mode("native")
+        if got and len(got.strip()) >= 20:
+            return got
+        if got:
+            print(
+                f"[transcribe_video] Supadata native too short ({len(got.strip())} chars) "
+                f"— NOT escalating to paid AI transcription"
+            )
+            usage_budget.kv_set(f"supadata_noescalate:{mkey}", "1", 6 * 3600)
+            return None
+        if not allow_generate:
+            return None
+    elif usage_budget.kv_get(f"supadata_noescalate:{mkey}"):
+        print("[transcribe_video] Supadata generate skipped — native returned a short real transcript")
         return None
     got = _one_mode("generate")
     if got and len(got.strip()) >= 20:
@@ -3278,6 +3295,18 @@ def _try_supadata(url: str, language: str, with_timestamps: bool, privileged: bo
     if call_state["made"]:  # only a REAL failed attempt is remembered, never a budget block
         usage_budget.kv_set(f"supadata_fail:{mkey}", "1", 6 * 3600)
     return None
+
+
+def _make_transcript_api(cls):
+    """YouTubeTranscriptApi, routed through YT_PROXY when configured (optional; off by default)."""
+    p = yt_access.proxy_url()
+    if p:
+        try:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+            return cls(proxy_config=GenericProxyConfig(http_url=p, https_url=p))
+        except Exception as e:  # noqa: BLE001
+            print(f"[transcribe_video] YT_PROXY set but transcript-api proxy config failed: {e}")
+    return cls()
 
 
 def _try_youtube_captions(
@@ -3316,7 +3345,7 @@ def _try_youtube_captions(
         preferred = [lang, "hi", "ur", "en", "en-US"]
 
     try:
-        ytt = YouTubeTranscriptApi()
+        ytt = _make_transcript_api(YouTubeTranscriptApi)
         try:
             fetched = ytt.fetch(video_id, languages=preferred)
             segs = [
@@ -3335,11 +3364,19 @@ def _try_youtube_captions(
                     raise inner
             raise
     except blocked_types as e:
-        print(f"[transcribe_video] captions unavailable/blocked for {video_id}: {e}")
+        print(f"[transcribe_video] captions unavailable/blocked for {video_id}: {str(e)[:300]}")
+        reason = yt_access.classify(e)
+        if reason == "blocked":
+            # IP is flagged: stop adding traffic from it for a while (also protects yt-dlp's reputation)
+            yt_access.health.failure("transcript_api", hard=True, cooldown=1800)
+        elif reason == "no_captions":
+            yt_access.set_outcome(video_id, "no_captions")   # TranscriptsDisabled: authoritative
+            yt_access.health.success("transcript_api")
         return None
     except Exception as e:
         # Cloud IP blocks, rate limits, etc. — fall through to ASR
         print(f"[transcribe_video] youtube-transcript-api failed for {video_id}: {e}")
+        yt_access.health.failure("transcript_api")
         return None
 
 
@@ -3503,6 +3540,7 @@ def _resolve_ytdlp_cookies(*, context: str = "ytdlp") -> Optional[str]:
             logging.getLogger("mojo").info(msg)
         except Exception:
             pass
+        yt_access.log_environment_once(None)
         return None
     if os.path.isfile(raw):
         try:
@@ -3517,7 +3555,10 @@ def _resolve_ytdlp_cookies(*, context: str = "ytdlp") -> Optional[str]:
             logging.getLogger("mojo").info(msg)
         except Exception:
             pass
-        return raw
+        # yt-dlp re-saves its cookie jar on close; Render mounts /etc/secrets read-only (Errno 30 in prod
+        # 2026-11-03 09:48). Hand it a writable per-call copy instead of the mount itself.
+        yt_access.log_environment_once(raw)
+        return yt_access.prepare_cookiefile(raw, context)
     msg = (
         f"[cookies] {context}: YTDLP_COOKIES set but not a file path={raw!r} "
         f"(cwd={os.getcwd()!r}) — cookies NOT applied"
@@ -3655,18 +3696,69 @@ def _about_fallback_pack(url: str, mode: str) -> Optional[str]:
     return None
 
 
+def _ytdlp_pick_subtitle(info: dict, user_agent: str, with_timestamps: bool, label: str) -> tuple:
+    """Pick + download the best subtitle track from a yt-dlp info dict.
+    Returns (text_or_None, had_tracks). Prefers hi/ur/en, any other language after that."""
+    subs = info.get("subtitles") or {}
+    autos = info.get("automatic_captions") or {}
+    had_tracks = bool(subs or autos)
+    ordered_langs: List[str] = []
+    for key in ("hi", "ur", "en", "en-US", "en-GB"):
+        for bag in (subs, autos):
+            for lang in bag:
+                if lang.lower().startswith(key.lower()) and lang not in ordered_langs:
+                    ordered_langs.append(lang)
+    for lang in list(subs.keys()) + list(autos.keys()):
+        if lang not in ordered_langs:
+            ordered_langs.append(lang)
+
+    for lang in ordered_langs:
+        entries = (subs.get(lang) or autos.get(lang) or [])
+        if not entries:
+            continue
+        entries = sorted(entries, key=lambda e: 0 if (e.get("ext") or "") in ("vtt", "srv3", "ttml") else 1)
+        sub_url = entries[0].get("url")
+        if not sub_url:
+            continue
+        try:
+            r = requests.get(sub_url, headers={"User-Agent": user_agent}, timeout=30,
+                             proxies=yt_access.requests_proxies())
+        except Exception as e:  # noqa: BLE001
+            print(f"[transcribe_video] yt-dlp subs download error lang={lang}: {e}")
+            continue
+        if r.status_code != 200 or not (r.text or "").strip():
+            continue
+        segs = _parse_ttml_or_vtt(r.text)
+        if not segs or len(segs) < 5:
+            text = re.sub(r"<[^>]+>", " ", r.text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) < 80 or _looks_like_youtube_description(text):
+                continue
+            print(f"[transcribe_video] yt-dlp subs OK lang={lang} raw_chars={len(text)} via={label}")
+            return text, had_tracks
+        text = _format_segments(segs, with_timestamps)
+        if text and not _looks_like_youtube_description(text):
+            print(f"[transcribe_video] yt-dlp subs OK lang={lang} segs={len(segs)} via={label}")
+            return text, had_tracks
+    return None, had_tracks
+
+
 def _try_ytdlp_subs(url: str, with_timestamps: bool) -> Optional[str]:
     """
-    Fetch auto/manual subtitles via yt-dlp without downloading audio.
-    Prefer hi/ur tracks for South-Asian lectures; works when timedtext APIs
-    are blocked but yt-dlp player_client cascade still gets tracks.
+    Fetch auto/manual subtitles via yt-dlp without downloading audio — the strongest FREE route from a
+    datacenter IP (needs valid cookies on most hosts).
+
+    Attempt plan (yt_access.subtitle_attempts): android_vr without cookies (no PO token, never exposes the
+    account) -> tv with cookies (supports cookies, no PO token) -> yt-dlp defaults. The old plan used
+    android/ios, which IGNORE account cookies, and every attempt crashed on the read-only cookie mount.
+    Records WHY it failed (yt_access.set_outcome) so the caller can skip pointless audio downloads and
+    only spend Supadata credits when YouTube is genuinely refusing this server.
     """
     try:
         import yt_dlp
     except ImportError:
         return None
 
-    # Strip tracking
     clean = url
     if "youtu" in url.lower() and "?" in url:
         base, _, qs = url.partition("?")
@@ -3677,15 +3769,19 @@ def _try_ytdlp_subs(url: str, with_timestamps: bool) -> Optional[str]:
                     break
         else:
             clean = base
-
-    clients_try = (
-        ["tv", "android", "ios", "web"],
-        ["android", "ios"],
-        ["tv"],
-    )
+    vid = _extract_youtube_id(url) or ""
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
     cookies = _resolve_ytdlp_cookies(context="caption_or_dl")
+    deadline = time.time() + float(os.getenv("YTDLP_SUBS_DEADLINE_S", "45"))
+    reasons: List[str] = []
+    listed_ok = False        # a captions-capable client (tv / default) completed extraction
+    tracks_unusable = False
 
-    for clients in clients_try:
+    for att in yt_access.subtitle_attempts(bool(cookies)):
+        if time.time() > deadline:
+            print("[transcribe_video] yt-dlp subs deadline reached")
+            break
         opts: Dict[str, Any] = {
             "skip_download": True,
             "writesubtitles": True,
@@ -3696,83 +3792,57 @@ def _try_ytdlp_subs(url: str, with_timestamps: bool) -> Optional[str]:
             "no_warnings": True,
             "noprogress": True,
             "noplaylist": True,
-            "socket_timeout": 25,
-            "retries": 2,
-            "extractor_args": {"youtube": {"player_client": clients}},
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-            },
+            "socket_timeout": 20,
+            "retries": 1,
+            "extractor_args": {"youtube": {"player_client": list(att.clients)}},
+            "http_headers": {"User-Agent": ua},
         }
-        if cookies:
+        yt_access.apply_common(opts)
+        if att.use_cookies and cookies:
             opts["cookiefile"] = cookies
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(clean, download=False)
-            if not info:
-                continue
-            # Prefer requested lang tracks from subtitles / automatic_captions
-            subs = info.get("subtitles") or {}
-            autos = info.get("automatic_captions") or {}
-            # Merge: prefer manual over auto for same lang
-            ordered_langs = []
-            for key in ("hi", "ur", "en", "en-US", "en-GB"):
-                for bag in (subs, autos):
-                    for lang in bag:
-                        if lang.lower().startswith(key.lower()) and lang not in ordered_langs:
-                            ordered_langs.append(lang)
-            for lang in list(subs.keys()) + list(autos.keys()):
-                if lang not in ordered_langs:
-                    ordered_langs.append(lang)
-
-            for lang in ordered_langs:
-                entries = (subs.get(lang) or autos.get(lang) or [])
-                if not entries:
-                    continue
-                # Prefer vtt / srv3
-                entries = sorted(
-                    entries,
-                    key=lambda e: (
-                        0 if (e.get("ext") or "") in ("vtt", "srv3", "ttml") else 1
-                    ),
-                )
-                sub_url = entries[0].get("url")
-                if not sub_url:
-                    continue
-                r = requests.get(
-                    sub_url,
-                    headers={"User-Agent": opts["http_headers"]["User-Agent"]},
-                    timeout=30,
-                )
-                if r.status_code != 200 or not (r.text or "").strip():
-                    continue
-                segs = _parse_ttml_or_vtt(r.text)
-                if not segs or len(segs) < 5:
-                    # raw text fallback
-                    text = re.sub(r"<[^>]+>", " ", r.text)
-                    text = re.sub(r"\s+", " ", text).strip()
-                    if len(text) < 80:
-                        continue
-                    if _looks_like_youtube_description(text):
-                        continue
-                    print(
-                        f"[transcribe_video] yt-dlp subs OK lang={lang} "
-                        f"raw_chars={len(text)} clients={clients}"
-                    )
-                    return text
-                text = _format_segments(segs, with_timestamps)
-                if text and not _looks_like_youtube_description(text):
-                    print(
-                        f"[transcribe_video] yt-dlp subs OK lang={lang} "
-                        f"segs={len(segs)} clients={clients}"
-                    )
-                    return text
-        except Exception as e:
-            print(f"[transcribe_video] yt-dlp subs clients={clients} err={e}")
+        except Exception as e:  # noqa: BLE001
+            reason = yt_access.classify(e)
+            reasons.append(reason)
+            print(f"[transcribe_video] yt-dlp subs attempt={att.name} reason={reason} err={str(e)[:200]}")
+            if reason in yt_access.TERMINAL:
+                break
+            if reason == "cookies_invalid":
+                cookies = None  # a broken cookie file must not poison the cookie-free attempts
             continue
+        if not info:
+            continue
+        text, had_tracks = _ytdlp_pick_subtitle(info, ua, with_timestamps, att.name)
+        if text:
+            yt_access.health.success("ytdlp_subs")
+            if vid:
+                yt_access.set_outcome(vid, "ok")
+            return text
+        if att.clients != ("android_vr",):   # android_vr may not list captions at all; tv/default do
+            listed_ok = True
+        if had_tracks:
+            tracks_unusable = True
+        print(f"[transcribe_video] yt-dlp subs attempt={att.name} extracted OK but no usable track "
+              f"(tracks_listed={had_tracks})")
+
+    # ---- why did it fail? (decides what the caller does next) ----
+    if tracks_unusable:
+        outcome = "subs_unusable"
+    elif listed_ok:
+        outcome = "no_captions"          # a captions-capable client saw the video and no track exists
+    else:
+        term = next((r for r in reasons if r in yt_access.TERMINAL), None)
+        blocked = next((r for r in reversed(reasons) if r in yt_access.BLOCKED), None)
+        outcome = term or blocked or (reasons[-1] if reasons else "unknown")
+    if vid:
+        yt_access.set_outcome(vid, outcome)
+    if outcome in yt_access.BLOCKED:
+        yt_access.health.failure("ytdlp_subs")
+    elif listed_ok:
+        yt_access.health.success("ytdlp_subs")
+    print(f"[transcribe_video] yt-dlp subs FAILED outcome={outcome} reasons={reasons}")
     return None
 
 
@@ -3871,18 +3941,16 @@ def _download_audio_ytdlp(url: str, out_dir: str) -> tuple[str, float]:
         # YouTube bot-check workaround for datacenter IPs (2026).
         # Clients that often still work without cookies/PO tokens:
         # tv_simply, tv, android_vr, web_embedded, mweb.
-        for clients in (
-            "tv_simply,tv,android_vr",
-            "android_vr,web_embedded,mweb",
-            "tv,android,ios",
-            "web_embedded",
-        ):
+        # Cookie-correct plan (yt_access.audio_attempts): android/ios/tv_simply ignore account cookies, so they
+        # never get them; each client is its own list item (the Python API does not split "a,b,c" like the
+        # CLI, so the old comma-joined strings were most likely rejected as unknown clients).
+        for att in yt_access.audio_attempts(bool(cookies_path)):
             opts = dict(base_opts)
-            opts["extractor_args"] = {
-                "youtube": {"player_client": [clients]}
-            }
+            opts["extractor_args"] = {"youtube": {"player_client": list(att.clients)}}
+            if not att.use_cookies:
+                opts.pop("cookiefile", None)
+            yt_access.apply_common(opts)
             attempt_opts.append(opts)
-        attempt_opts.append(dict(base_opts))
     elif _is_instagram_url(url):
         # Instagram: mobile UA + Referer; cookies help a lot for restricted posts
         url = _normalize_ig_fb_url(url)
@@ -4049,6 +4117,40 @@ def _transcribe_with_groq(audio_path: str, language: str) -> str:
             )
         return _format_segments(segs, with_timestamps=True)  # always keep ts internally; caller decides
     return (getattr(result, "text", None) or str(result) or "").strip()
+
+
+def _try_youtube_asr(url: str, with_ts: bool) -> tuple:
+    """Free ASR for YouTube (yt-dlp audio -> ffmpeg -> Groq Whisper) as a stand-alone attempt that never
+    returns user-facing prose. Returns (text_or_None, error_or_None).
+    Runs BEFORE any paid Supadata call when YouTube is not blocking this server: Whisper costs no Supadata
+    credit, whereas Supadata's AI mode bills 2 credits per video minute.
+    (The legacy ASR block at the end of _tool_transcribe_video_core stays as the last resort and re-uses
+    this attempt's error instead of downloading again.)"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="mojo_vidasr_") as tmp:
+            audio_path, duration = _download_audio_ytdlp(url, tmp)
+            if duration and duration > _MAX_ASR_SECONDS + 5:
+                return None, f"Video too long for transcription (~{int(duration // 60)} min)"
+            audio_path = _reencode_if_needed(audio_path, tmp)
+            size = os.path.getsize(audio_path)
+            if size > _GROQ_MAX_UPLOAD_BYTES:
+                return None, f"Audio too large after compression ({size // (1024 * 1024)} MB)"
+            raw = _transcribe_with_groq(audio_path, "auto")
+            if not raw or not raw.strip():
+                return None, "Transcription returned empty text (silent video or unsupported language)."
+            if not with_ts and raw.lstrip().startswith("["):
+                cleaned = re.sub(r"(?m)^\[\d{1,2}(?::\d{2}){1,2}\]\s*", "", raw)
+                text = re.sub(r"\s+", " ", cleaned).strip()
+            else:
+                text = raw.strip()
+            words = len(re.findall(r"\w+", text))
+            print(f"[transcribe_video] early ASR words={words} duration={duration:.1f}s chars={len(text)}")
+            if (duration and duration >= 12 and words < 12) or words < 4:
+                return None, f"ASR too thin ({words} words for {duration:.0f}s) — likely wrong/partial audio"
+            return text, None
+    except Exception as e:  # noqa: BLE001
+        print(f"[transcribe_video] early ASR failed: {str(e)[:240]}")
+        return None, str(e) or e.__class__.__name__
 
 
 def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
@@ -4264,33 +4366,77 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
         if packed:
             return packed
 
-    # YouTube: real caption tracks first. youtube2text is last — it often returns
-    # the video *description* when speech tracks are missing for a language.
+    # ---- YouTube: FREE routes first, Supadata (100 credits/month) strictly last ------------------------
+    # Order: youtube-transcript-api (1 cheap request) -> yt-dlp subtitles (cookie-aware, the workhorse)
+    # -> Piped (public hosts, mostly dead) -> free ASR (only if YouTube is not refusing this server)
+    # -> Supadata native (1 credit, only on success) -> youtube2text -> legacy ASR -> Supadata AI (last).
+    # Each free source sits behind a circuit breaker (yt_access.health): a dead/blocked source stops costing
+    # seconds — and stops adding traffic from an already-flagged IP — on every request.
+    early_asr_err: Optional[str] = None
+    yt_reason: Optional[str] = None
     if yt_id:
-        packed = _take(
-            f"Piped captions (video {yt_id})",
-            _try_piped_captions(yt_id, fetch_lang, with_ts),
-        )
-        if packed:
-            return packed
-        packed = _take(
-            f"YouTube captions (video {yt_id})",
-            _try_youtube_captions(yt_id, fetch_lang, with_ts),
-        )
-        if packed:
-            return packed
-        # yt-dlp subtitle URL fetch (no audio) — better on cloud than Innertube
-        packed = _take(
-            "yt-dlp subtitles",
-            _try_ytdlp_subs(url, with_ts),
-        )
-        if packed:
-            return packed
+        if yt_access.health.allow("transcript_api"):
+            packed = _take(
+                f"YouTube captions (video {yt_id})",
+                _try_youtube_captions(yt_id, fetch_lang, with_ts),
+            )
+            if packed:
+                yt_access.health.success("transcript_api")
+                return packed
+        else:
+            print(f"[transcribe_video] skip youtube-transcript-api (breaker open "
+                  f"{yt_access.health.remaining('transcript_api'):.0f}s)")
+        if yt_access.health.allow("ytdlp_subs"):
+            packed = _take("yt-dlp subtitles", _try_ytdlp_subs(url, with_ts))
+            if packed:
+                return packed
+        else:
+            print(f"[transcribe_video] skip yt-dlp subtitles (breaker open "
+                  f"{yt_access.health.remaining('ytdlp_subs'):.0f}s)")
+        if yt_access.health.allow("piped"):
+            packed = _take(
+                f"Piped captions (video {yt_id})",
+                _try_piped_captions(yt_id, fetch_lang, with_ts),
+            )
+            if packed:
+                return packed
+        else:
+            print(f"[transcribe_video] skip Piped (all hosts dead; breaker open "
+                  f"{yt_access.health.remaining('piped') / 3600:.1f}h)")
 
-    # Managed API (SUPADATA) — strong for YT + best for IG/FB/TikTok
-    packed = _take("Supadata", _try_supadata(url, fetch_lang, with_ts, privileged=_is_owner(ctx)))
-    if packed:
-        return packed
+        yt_reason = yt_access.get_outcome(yt_id)
+        msg = f"[transcribe_video] YT_FREE_CAPTIONS_EXHAUSTED id={yt_id} reason={yt_reason or 'unknown'}"
+        print(msg)
+        try:
+            logging.getLogger("mojo").info(msg)
+        except Exception:
+            pass
+        if yt_reason in yt_access.BLOCKED:
+            # YouTube refuses this server: an audio download would be refused the same way (and add more
+            # traffic from a flagged IP). Replayed later as the bot-check message by the legacy ASR block.
+            early_asr_err = "Sign in to confirm you're not a bot (YouTube is blocking this server's IP)"
+        elif yt_reason in yt_access.TERMINAL:
+            early_asr_err = f"video not available ({yt_reason})"
+        else:
+            # Not blocked: free speech-to-text BEFORE any paid call.
+            text, early_asr_err = _try_youtube_asr(url, with_ts)
+            if text:
+                packed = _take("speech-to-text (audio download)", text)
+                if packed:
+                    return packed
+
+    # Managed API (SUPADATA, 100 credits/month, no rollover). YouTube: native only (1 credit, billed only on
+    # success); its 2-credits-per-minute AI mode is deferred to the very end. Skipped when the free layer
+    # proved the video has no captions (native would just return "unavailable").
+    if yt_id and (yt_reason == "no_captions" or yt_reason in yt_access.TERMINAL):
+        print(f"[transcribe_video] skip Supadata native — {yt_reason} (authoritative, would just return nothing)")
+    else:
+        packed = _take(
+            "Supadata",
+            _try_supadata(url, fetch_lang, with_ts, privileged=_is_owner(ctx), allow_generate=not yt_id),
+        )
+        if packed:
+            return packed
 
     # youtube2text: only for summary/key_points, NEVER for full transcript mode
     # (too often returns description which users mistake for speech).
@@ -4317,6 +4463,8 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
     try:
         with tempfile.TemporaryDirectory(prefix="mojo_vid_") as tmp:
             try:
+                if early_asr_err is not None:
+                    raise RuntimeError(early_asr_err)  # already tried/ruled out above — don't download twice
                 audio_path, duration = _download_audio_ytdlp(url, tmp)
             except Exception as e:
                 msg = str(e)
@@ -4425,6 +4573,17 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
         low = err_s.lower()
         print(f"[transcribe_video] ASR path failed: {err_s[:240]}")
 
+        # --- 4b. Supadata AI transcript (2 credits/min): the very last resort, YouTube only ---------
+        # (non-YouTube platforms already went through native -> generate above). Budget/cap/negative-cache
+        # gating lives inside _try_supadata; "video not available" outcomes never spend credits.
+        if yt_id and yt_reason not in yt_access.TERMINAL and "too long" not in low:
+            gen = _take(
+                "Supadata (AI transcript)",
+                _try_supadata(url, fetch_lang, with_ts, privileged=_is_owner(ctx), only_generate=True),
+            )
+            if gen:
+                return gen
+
         # --- 5. About / caption fallback (esp. Instagram + Facebook) ---
         # Public caption/description is often still readable when audio download
         # is blocked (restricted audience, login wall, cloud IP).
@@ -4469,7 +4628,8 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
             "TikTok" in asr_error_msg or "YouTube" in asr_error_msg
         ):
             return asr_error_msg
-        traceback.print_exc()
+        if early_asr_err is None:  # an already-diagnosed failure (blocked/private/…) needs no stack dump
+            traceback.print_exc()
         return (
             f"Could not download audio from this link ({err_s[:180]}). "
             "Is the video public and supported?"
