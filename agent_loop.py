@@ -907,6 +907,28 @@ Brief agency summary:
 """
 
 
+def _tool_call_entry(tc: Any, fallback_id: str) -> Dict[str, Any]:
+    """OpenAI-style assistant tool_call dict for message history. Gemini 3 issues an opaque
+    extra_content.google.thought_signature on tool calls and 400s if it is not replayed verbatim, so it is
+    carried over untouched (object or dict style). The router strips it again for providers that reject it."""
+    fn = getattr(tc, "function", None)
+    fn_name = getattr(fn, "name", None) or ""
+    fn_args = getattr(fn, "arguments", None) or "{}"
+    if isinstance(fn_args, dict):
+        fn_args = json.dumps(fn_args)
+    entry: Dict[str, Any] = {
+        "id": getattr(tc, "id", None) or fallback_id,
+        "type": "function",
+        "function": {"name": fn_name, "arguments": fn_args},
+    }
+    extra = getattr(tc, "extra_content", None)
+    if extra is None:
+        extra = (getattr(tc, "model_extra", None) or {}).get("extra_content")
+    if isinstance(extra, dict) and extra:
+        entry["extra_content"] = extra
+    return entry
+
+
 def _normalize_tool_calls(msg) -> List[Any]:
     """Return a list of tool-call-like objects with .id, .function.name, .function.arguments."""
     raw = getattr(msg, "tool_calls", None)
@@ -945,6 +967,7 @@ def _normalize_tool_calls(msg) -> List[Any]:
             o = _Tc()
             o.id = tc.get("id") or f"call_{i}"
             o.function = fn
+            o.extra_content = tc.get("extra_content")
             normalized.append(o)
     return normalized
 
@@ -2108,17 +2131,7 @@ def run_agent(
             if tool_calls:
                 assistant_entry["tool_calls"] = []
                 for tc in tool_calls:
-                    fn_name = getattr(getattr(tc, "function", None), "name", None) or ""
-                    fn_args = getattr(getattr(tc, "function", None), "arguments", None) or "{}"
-                    if isinstance(fn_args, dict):
-                        fn_args = json.dumps(fn_args)
-                    assistant_entry["tool_calls"].append(
-                        {
-                            "id": getattr(tc, "id", None) or f"call_{step}",
-                            "type": "function",
-                            "function": {"name": fn_name, "arguments": fn_args},
-                        }
-                    )
+                    assistant_entry["tool_calls"].append(_tool_call_entry(tc, f"call_{step}"))
             messages.append(assistant_entry)
 
             if not tool_calls:

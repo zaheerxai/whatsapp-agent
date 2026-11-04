@@ -36,6 +36,17 @@ Groq was skipped every time): system 3.3k + 24 tool schemas 5.3k + history + 1k 
     turns are kept; orphaned tool messages are dropped) and the request is re-checked.
   * Every skip/trim/OK line carries a sys/msgs/tools/out token breakdown plus cached_tokens, so the
     next live log shows exactly what is costing budget and whether Groq prompt caching is hitting.
+
+Gemini tool calling (Task 3): Gemini used to be text-only here, so whenever Groq was skipped the agent
+silently lost every tool. Now a tool-selection turn on Gemini offers the tools too:
+  * Gemini 3 requires each assistant tool call to be replayed with the opaque
+    tool_calls[].extra_content.google.thought_signature it issued (400 otherwise). The agent loop keeps it
+    verbatim; for calls that came from another model (e.g. Groq) the documented dummy
+    "skip_thought_signature_validator" is added to the first call of that assistant turn.
+  * Groq never sees extra_content (provider-specific field stripped).
+  * Tool schemas are reduced to the Gemini-accepted subset (e.g. "default" removed) per request.
+  * Fail-safe: a 400 on a tools request retries the same model flattened without tools (the previous,
+    proven behaviour) and remembers that for GEMINI_TOOLS_BAD_TTL_S. GEMINI_TOOLS=0 disables.
 """
 from __future__ import annotations
 
@@ -64,6 +75,11 @@ _GEMINI_COOLDOWN_S = float(os.getenv("LLM_GEMINI_COOLDOWN_S", "30"))
 _RETIRED_COOLDOWN_S = 3600.0
 _BACKOFF_BASE_S = 0.8
 _BACKOFF_CAP_S = 4.0
+_GEMINI_TOOLS = os.getenv("GEMINI_TOOLS", "1").strip() != "0"
+_GEMINI_TOOLS_BAD_TTL_S = float(os.getenv("GEMINI_TOOLS_BAD_TTL_S", "600"))
+_DUMMY_SIGNATURE = "skip_thought_signature_validator"
+_GEMINI_STRIP_KEYS = frozenset({"default", "additionalProperties", "$schema", "$id", "$ref", "$defs",
+                                "definitions", "examples", "deprecated", "propertyNames", "patternProperties"})
 _RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 _NET_ERRORS = frozenset({"APIConnectionError", "APITimeoutError", "ReadTimeout", "ConnectTimeout",
                          "ConnectError", "RemoteProtocolError", "TimeoutException"})
@@ -71,6 +87,7 @@ _NET_ERRORS = frozenset({"APIConnectionError", "APITimeoutError", "ReadTimeout",
 _lock = threading.Lock()
 _used: Dict[str, deque] = {}
 _cooldown: Dict[str, float] = {}
+_gem_tools_bad: Dict[str, float] = {}
 
 
 # --------------------------------------------------------------------------- estimation / governor
@@ -111,6 +128,89 @@ def _cooled(model: str) -> float:
 def _cool(model: str, seconds: float, cap: float = 60.0) -> None:
     with _lock:
         _cooldown[model] = time.time() + max(1.0, min(float(seconds), float(cap)))
+
+
+def gemini_tool_schemas(tools: Optional[list]) -> Optional[list]:
+    """Deep copy of OpenAI-style tool schemas reduced to the subset Gemini function declarations accept.
+    Only keys in _GEMINI_STRIP_KEYS are removed (property NAMES that happen to match are kept: the walk only
+    strips keys of schema objects, never entries of a 'properties' map)."""
+    if not tools:
+        return tools
+
+    def walk(o: Any, in_properties: bool = False) -> Any:
+        if isinstance(o, dict):
+            out = {}
+            for k, v in o.items():
+                if not in_properties and k in _GEMINI_STRIP_KEYS:
+                    continue
+                out[k] = walk(v, in_properties=(k == "properties" and not in_properties))
+            return out
+        if isinstance(o, list):
+            return [walk(x) for x in o]
+        return o
+
+    return walk(tools)
+
+
+def _tc_signature(tc: Any) -> Optional[str]:
+    try:
+        return (((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def strip_provider_extras(messages: List[dict]) -> List[dict]:
+    """Groq (and other strict OpenAI-compatible hosts) may reject Gemini's tool_calls[].extra_content."""
+    if not any(m.get("tool_calls") and any(isinstance(t, dict) and "extra_content" in t for t in m["tool_calls"])
+               for m in messages or []):
+        return messages
+    out = []
+    for m in messages:
+        if m.get("tool_calls"):
+            m = {**m, "tool_calls": [{k: v for k, v in t.items() if k != "extra_content"} if isinstance(t, dict) else t
+                                     for t in m["tool_calls"]]}
+        out.append(m)
+    return out
+
+
+def prepare_gemini_tool_messages(messages: List[dict]) -> List[dict]:
+    """History for a Gemini request that keeps tool_calls / tool results structured.
+      * first tool call of every assistant turn gets the dummy signature if it has no real one
+        (calls produced by Groq or injected by the app have none; Gemini 3 400s without it)
+      * tool results are strings; None content becomes "" (Gemini compat is picky about None)
+      * leading system messages are merged; later ones become user notes (Gemini takes one system prompt)"""
+    out: List[dict] = []
+    lead_sys: List[str] = []
+    seen_non_sys = False
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            text = content if isinstance(content, str) else json.dumps(content, default=str)
+            if not seen_non_sys:
+                lead_sys.append(text)
+            else:
+                out.append({"role": "user", "content": "[System note] " + text})
+            continue
+        seen_non_sys = True
+        if role == "tool":
+            out.append({**m, "content": content if isinstance(content, str) else json.dumps(content, default=str)})
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            tcs, first = [], True
+            for t in m["tool_calls"]:
+                if isinstance(t, dict):
+                    if first and not _tc_signature(t):
+                        t = {**t, "extra_content": {"google": {"thought_signature": _DUMMY_SIGNATURE}}}
+                    first = False
+                tcs.append(t)
+            out.append({**m, "tool_calls": tcs})  # content may stay None (Google's own sample shape)
+            continue
+        out.append({**m, "content": content if content is not None else "",
+                    "role": role if role in ("user", "assistant") else "user"})
+    if lead_sys:
+        out.insert(0, {"role": "system", "content": "\n\n".join(lead_sys)})
+    return out
 
 
 def groq_budget() -> int:
@@ -175,6 +275,7 @@ def reset_state() -> None:  # tests
     with _lock:
         _used.clear()
         _cooldown.clear()
+        _gem_tools_bad.clear()
 
 
 # --------------------------------------------------------------------------- error helpers
@@ -253,6 +354,9 @@ def _build_kwargs(kind: str, model: str, messages: List[dict], tools: Optional[l
         # thinking is billed as output -> give it room, and keep it cheap
         kw["max_tokens"] = min(8192, max(int(max_tokens) * 2, 2048))
         kw["extra_body"] = {"reasoning_effort": "low"}
+        if tools:
+            kw["tools"] = gemini_tool_schemas(tools)
+            kw["tool_choice"] = "auto"
         return kw
     kw["max_tokens"] = int(max_tokens)
     if tools:
@@ -327,16 +431,24 @@ def complete(
                 log.info("LLM_FALLBACK from=%s to=%s", prev_gem, model)
             prev_gem = model
             client = _no_sdk_retry(client)
-        flat = (kind == "gemini") or (model != groq_model and not work_tools)
+        gem_tools = (kind == "gemini" and bool(work_tools) and _GEMINI_TOOLS
+                     and _gem_tools_bad.get(model, 0.0) <= time.time())
+        flat = (kind == "gemini" and not gem_tools) or (model != groq_model and not work_tools)
         drop_reasoning = False
-        for attempt in range(2):
+        for attempt in range(3 if kind == "gemini" else 2):
             if attempt > 0 and kind == "groq" and _headroom(model) < est_tokens(cand_msgs, work_tools, max_tokens):
                 log.info("LLM_SKIP model=%s reason=tpm-after-failure", model)
                 break
             kw: Dict[str, Any] = {}
             try:
-                msgs = flatten(cand_msgs) if flat else cand_msgs
-                kw = _build_kwargs(kind, model, msgs, work_tools, temperature, max_tokens)
+                if kind == "gemini" and gem_tools:
+                    msgs = prepare_gemini_tool_messages(cand_msgs)
+                elif flat:
+                    msgs = flatten(cand_msgs)
+                else:
+                    msgs = strip_provider_extras(cand_msgs)  # Groq: no Gemini-only fields
+                kw = _build_kwargs(kind, model, msgs, work_tools if (kind != "gemini" or gem_tools) else None,
+                                   temperature, max_tokens)
                 if drop_reasoning:
                     kw.pop("extra_body", None)
                 t0 = time.time()
@@ -349,9 +461,9 @@ def complete(
                 if kind == "groq":
                     _record(model, total)
                 cached = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None)
-                log.info("LLM_OK provider=%s model=%s finish=%s tokens=%s est=%s cached=%s ms=%d (%s)",
+                log.info("LLM_OK provider=%s model=%s finish=%s tokens=%s est=%s cached=%s ms=%d tools=%s (%s)",
                          kind, model, finish, total, cand_est, cached, int((time.time() - t0) * 1000),
-                         _fmt_parts(cand_msgs, work_tools, max_tokens))
+                         "on" if ("tools" in kw) else "off", _fmt_parts(cand_msgs, work_tools, max_tokens))
                 return msg, finish, kind
             except Exception as e:  # noqa: BLE001
                 last_err = e
@@ -359,10 +471,19 @@ def complete(
                 log.warning("LLM_FAIL provider=%s model=%s attempt=%d status=%s retry_after=%s %s",
                             kind, model, attempt + 1, st, ra, err_detail(e))
                 if kind == "gemini":
+                    if st == 400 and gem_tools and "tools" in kw:
+                        # Gemini rejected the tool request (schema subset / signature / history shape):
+                        # same model, flattened, no tools = the previous behaviour. Remember for a while.
+                        gem_tools = False
+                        flat = True
+                        _gem_tools_bad[model] = time.time() + _GEMINI_TOOLS_BAD_TTL_S
+                        log.warning("LLM_GEMINI_TOOLS_REJECTED model=%s -> retry without tools for %.0fs",
+                                    model, _GEMINI_TOOLS_BAD_TTL_S)
+                        continue
                     if st == 404:  # retired / mistyped model id: stop paying for it on every request
                         _cool(model, _RETIRED_COOLDOWN_S, cap=_RETIRED_COOLDOWN_S)
                         break
-                    if st == 400 and attempt == 0 and "extra_body" in kw and not drop_reasoning:
+                    if st == 400 and "extra_body" in kw and not drop_reasoning:
                         drop_reasoning = True  # this model rejects reasoning_effort: same model, without it
                         continue
                     if _retryable(e, st):
