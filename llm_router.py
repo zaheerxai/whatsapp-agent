@@ -1,5 +1,5 @@
 """
-llm_router.py — single LLM routing layer: Groq primary -> Groq sibling -> Gemini.
+llm_router.py — single LLM routing layer: Groq primary -> Groq sibling -> Gemini model ladder.
 
 Why this exists (prod log 2026-10-17):
   * Groq free tier is 8K TPM per model, sliding window, input + output counted. A 12K-char
@@ -17,12 +17,24 @@ What it does:
     larger max_tokens because thinking is billed as output.
   * finish_reason="length" -> bounded continuation, so a long answer is completed, not cut.
   * Every call logs provider/model/finish/tokens/latency and failures log the response body.
+
+Gemini resilience (prod log 2026-11-03 12:00: two Gemini 503s ended the whole turn):
+  * Gemini capacity is per model, so a 503 "high demand" on one model fails over to the next
+    model in a ladder (GEMINI_FALLBACK_MODELS) instead of re-hitting the saturated one.
+  * SDK-level retries are disabled for these calls (with_options(max_retries=0)) so retries are
+    only ours: the old stack was SDK retry x router retry = 4 POSTs on one overloaded model.
+  * Transient failures (408/429/5xx, connection/timeout errors) fail over immediately; the last
+    model in the ladder gets one jittered-backoff retry that honours retry-after.
+  * A failed model is put on a short cooldown so the next user message skips it instead of
+    paying the failure latency again; 404 (retired model id) cools it for an hour.
+  * A wall-clock deadline (LLM_GEMINI_DEADLINE_S) bounds total time spent walking the ladder.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -36,6 +48,17 @@ GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))  # free tier gpt-oss-*
 _TPM_SAFETY = 0.92
 _WINDOW_S = 60.0
 _MAX_CONTINUATIONS = 2
+
+# Gemini model ladder (capacity is per model). Override with GEMINI_FALLBACK_MODELS=a,b,c
+_DEFAULT_GEMINI_FALLBACKS = "gemini-3.8-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+_GEMINI_DEADLINE_S = float(os.getenv("LLM_GEMINI_DEADLINE_S", "25"))
+_GEMINI_COOLDOWN_S = float(os.getenv("LLM_GEMINI_COOLDOWN_S", "30"))
+_RETIRED_COOLDOWN_S = 3600.0
+_BACKOFF_BASE_S = 0.8
+_BACKOFF_CAP_S = 4.0
+_RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+_NET_ERRORS = frozenset({"APIConnectionError", "APITimeoutError", "ReadTimeout", "ConnectTimeout",
+                         "ConnectError", "RemoteProtocolError", "TimeoutException"})
 
 _lock = threading.Lock()
 _used: Dict[str, deque] = {}
@@ -77,9 +100,9 @@ def _cooled(model: str) -> float:
     return max(0.0, _cooldown.get(model, 0.0) - time.time())
 
 
-def _cool(model: str, seconds: float) -> None:
+def _cool(model: str, seconds: float, cap: float = 60.0) -> None:
     with _lock:
-        _cooldown[model] = time.time() + max(1.0, min(float(seconds), 60.0))
+        _cooldown[model] = time.time() + max(1.0, min(float(seconds), float(cap)))
 
 
 def reset_state() -> None:  # tests
@@ -114,6 +137,48 @@ def err_detail(e: Exception) -> str:
     return f"{str(e)[:200]} | body={str(body)[:500]}"
 
 
+def _retryable(e: Exception, st: Optional[int]) -> bool:
+    return st in _RETRY_STATUS or type(e).__name__ in _NET_ERRORS
+
+
+def _backoff(attempt: int, ra: Optional[float]) -> float:
+    """Full-jitter exponential backoff, never shorter than a provider-supplied retry-after (capped)."""
+    top = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
+    d = random.uniform(top * 0.5, top)
+    return max(d, min(float(ra), _BACKOFF_CAP_S)) if ra else d
+
+
+def _no_sdk_retry(client: Any) -> Any:
+    """OpenAI SDK retries on its own (default 2, or whatever the client was built with). Turn that off so
+    every retry is a router decision and logged. Fakes/clients without with_options pass through."""
+    try:
+        wo = getattr(client, "with_options", None)
+        return wo(max_retries=0) if callable(wo) else client
+    except Exception:  # noqa: BLE001
+        return client
+
+
+def _gemini_models(primary: Optional[str], fallbacks: Optional[List[str]]) -> List[str]:
+    """Ordered, de-duplicated Gemini ladder with cooled-down models removed. If every model is cooling
+    down, probe the one that recovers soonest rather than failing without trying."""
+    if not primary:
+        return []
+    if fallbacks is None:
+        fallbacks = [x for x in re.split(r"[,\s]+", os.getenv("GEMINI_FALLBACK_MODELS", _DEFAULT_GEMINI_FALLBACKS)) if x]
+    ladder: List[str] = []
+    for m in [primary, *fallbacks]:
+        m = (m or "").strip()
+        if m and m not in ladder:
+            ladder.append(m)
+    live = [m for m in ladder if _cooled(m) <= 0]
+    if live:
+        for m in ladder:
+            if m not in live:
+                log.info("LLM_SKIP model=%s reason=cooldown %.0fs", m, _cooled(m))
+        return live
+    return [min(ladder, key=_cooled)]
+
+
 # --------------------------------------------------------------------------- core
 def _build_kwargs(kind: str, model: str, messages: List[dict], tools: Optional[list],
                   temperature: float, max_tokens: int) -> Dict[str, Any]:
@@ -146,8 +211,10 @@ def complete(
     shrink: Callable[[List[dict], int], List[dict]],
     flatten: Callable[[List[dict]], List[dict]],
     is_usable: Optional[Callable[[Any, str], bool]] = None,
+    gemini_fallbacks: Optional[List[str]] = None,
 ) -> Tuple[Any, str, str]:
-    """Returns (message, finish_reason, provider_tag). Raises the last error if every provider fails."""
+    """Returns (message, finish_reason, provider_tag). Raises the last error if every provider fails.
+    gemini_fallbacks=None -> GEMINI_FALLBACK_MODELS env (or the built-in ladder); [] -> primary only."""
     est = est_tokens(messages, tools, max_tokens)
     chain: List[Tuple[str, Any, str]] = []
     for m in (groq_model, groq_sibling):
@@ -158,11 +225,15 @@ def complete(
             except Exception:
                 chain.append(("groq", groq_client, m))
     if gemini_client and gemini_model:
-        chain.append(("gemini", gemini_client, gemini_model))
+        for gm in _gemini_models(gemini_model, gemini_fallbacks):
+            chain.append(("gemini", gemini_client, gm))
 
     last_err: Optional[Exception] = None
     working, work_tools = messages, tools
-    for kind, client, model in chain:
+    gem_deadline: Optional[float] = None
+    prev_gem: Optional[str] = None
+    for idx, (kind, client, model) in enumerate(chain):
+        has_next_gemini = any(c[0] == "gemini" for c in chain[idx + 1:])
         if kind == "groq":
             cd = _cooled(model)
             if cd > 0:
@@ -172,14 +243,29 @@ def complete(
             if hr < est:
                 log.info("LLM_SKIP model=%s reason=tpm est=%s headroom=%s", model, est, hr)
                 continue
+        else:
+            now = time.time()
+            if gem_deadline is None:
+                gem_deadline = now + _GEMINI_DEADLINE_S
+            elif now >= gem_deadline:
+                log.warning("LLM_SKIP model=%s reason=deadline %.0fs", model, _GEMINI_DEADLINE_S)
+                break
+            if prev_gem:
+                log.info("LLM_FALLBACK from=%s to=%s", prev_gem, model)
+            prev_gem = model
+            client = _no_sdk_retry(client)
         flat = (kind == "gemini") or (model != groq_model and not work_tools)
+        drop_reasoning = False
         for attempt in range(2):
             if attempt > 0 and kind == "groq" and _headroom(model) < est_tokens(working, work_tools, max_tokens):
                 log.info("LLM_SKIP model=%s reason=tpm-after-failure", model)
                 break
+            kw: Dict[str, Any] = {}
             try:
                 msgs = flatten(working) if flat else working
                 kw = _build_kwargs(kind, model, msgs, work_tools, temperature, max_tokens)
+                if drop_reasoning:
+                    kw.pop("extra_body", None)
                 t0 = time.time()
                 resp = client.chat.completions.create(**kw)
                 choice = resp.choices[0]
@@ -197,6 +283,24 @@ def complete(
                 st, ra = _status(e), _retry_after(e)
                 log.warning("LLM_FAIL provider=%s model=%s attempt=%d status=%s retry_after=%s %s",
                             kind, model, attempt + 1, st, ra, err_detail(e))
+                if kind == "gemini":
+                    if st == 404:  # retired / mistyped model id: stop paying for it on every request
+                        _cool(model, _RETIRED_COOLDOWN_S, cap=_RETIRED_COOLDOWN_S)
+                        break
+                    if st == 400 and attempt == 0 and "extra_body" in kw and not drop_reasoning:
+                        drop_reasoning = True  # this model rejects reasoning_effort: same model, without it
+                        continue
+                    if _retryable(e, st):
+                        if has_next_gemini:
+                            # capacity is per model: don't re-hit the saturated one, go to the next
+                            _cool(model, ra if ra else _GEMINI_COOLDOWN_S)
+                            break
+                        delay = _backoff(attempt, ra)
+                        if attempt == 0 and gem_deadline is not None and time.time() + delay < gem_deadline:
+                            time.sleep(delay)
+                            continue
+                        _cool(model, ra if ra else _GEMINI_COOLDOWN_S)
+                    break
                 if st == 413 and kind == "groq" and attempt == 0:
                     working, work_tools = shrink(working, 4), None
                     continue
@@ -209,9 +313,6 @@ def complete(
                     break
                 if st == 400 and kind == "groq" and attempt == 0 and not flat:
                     flat, work_tools = True, None  # malformed tool turn: retry flattened, no tools
-                    continue
-                if kind == "gemini" and attempt == 0 and (st in (429, 500, 502, 503, 504)):
-                    time.sleep(min(ra, 3.0) if ra else 1.5)
                     continue
                 break
     raise last_err or RuntimeError("no LLM provider available")

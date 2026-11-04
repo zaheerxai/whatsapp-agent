@@ -122,7 +122,7 @@ R.time.sleep = lambda s: None
 msg, _, prov = run(FakeClient([]), gem)
 R.time.sleep = orig_sleep
 R._TPM_SAFETY = 0.92
-check("gemini 503 retry", msg.content == "gem-after-503" and len(gem.calls) == 2)
+check("gemini 503 -> served (fails over to next model)", msg.content == "gem-after-503" and len(gem.calls) == 2)
 
 # 7) everything fails -> raises last error (callers fall back to tool OBS)
 R.reset_state()
@@ -131,6 +131,113 @@ try:
     check("raises when all fail", False)
 except Exception:
     check("raises when all fail", True)
+
+# ---- Gemini ladder (Task 1: 2026-11-03 12:00 two 503s ended the turn) ----------------------------------
+SLEEPS = []
+R.time.sleep = lambda s: SLEEPS.append(s)
+R._TPM_SAFETY = 0.0  # force the Gemini path for everything below
+
+
+def grun(gem, fallbacks=("g-b", "g-c"), primary="g-a", **kw):
+    return R.complete(
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}], None, 0.3, 1024,
+        groq_client=None, groq_model=None, groq_sibling=None,
+        gemini_client=gem, gemini_model=primary, gemini_fallbacks=list(fallbacks),
+        shrink=lambda m, k: m, flatten=lambda m: m, **kw)
+
+
+class NetErr(Exception):
+    pass
+
+
+NetErr.__name__ = "APIConnectionError"
+
+# 8) 503 on primary -> immediate fail-over to next model (no sleep), primary cooled for the next request
+R.reset_state(); SLEEPS.clear()
+gem = FakeClient([HTTPErr(503), resp("from-b"), resp("again-b")])
+msg, _, prov = grun(gem)
+check("503 -> next Gemini model", msg.content == "from-b" and [c["model"] for c in gem.calls] == ["g-a", "g-b"])
+check("no sleep on fail-over", SLEEPS == [])
+msg, _, _ = grun(gem)
+check("failed model skipped on next request", [c["model"] for c in gem.calls][2] == "g-b" and len(gem.calls) == 3)
+
+# 9) every model 503 -> raises; non-last models tried once, last model gets one backoff retry
+R.reset_state(); SLEEPS.clear()
+gem = FakeClient([HTTPErr(503)] * 4)
+try:
+    grun(gem); check("all 503 raises", False)
+except Exception as e:
+    check("all 503 raises", getattr(e, "status_code", None) == 503)
+check("1 try per non-last model + 2 on last", [c["model"] for c in gem.calls] == ["g-a", "g-b", "g-c", "g-c"], [c["model"] for c in gem.calls])
+check("one jittered backoff <= cap", len(SLEEPS) == 1 and 0 < SLEEPS[0] <= R._BACKOFF_CAP_S, SLEEPS)
+
+# 10) retry-after honoured (capped) on the last model
+R.reset_state(); SLEEPS.clear()
+gem = FakeClient([resp("ok-after-ra")] if False else [HTTPErr(429, retry_after=3), resp("ok-after-ra")])
+msg, _, _ = grun(gem, fallbacks=())
+check("single-model ladder retries after 429", msg.content == "ok-after-ra" and len(gem.calls) == 2)
+check("retry-after respected", SLEEPS and SLEEPS[0] >= 3, SLEEPS)
+
+# 11) 404 (retired model id) -> next model, and cooled for an hour
+R.reset_state()
+gem = FakeClient([HTTPErr(404), resp("from-b")])
+msg, _, _ = grun(gem)
+check("404 -> next model", msg.content == "from-b")
+check("404 cools model ~1h", R._cooled("g-a") > 3000, R._cooled("g-a"))
+
+# 12) 400 on reasoning_effort -> same model retried without extra_body
+R.reset_state()
+gem = FakeClient([HTTPErr(400, body="reasoning_effort unsupported"), resp("no-reasoning")])
+msg, _, _ = grun(gem)
+check("400 -> same model without extra_body",
+      msg.content == "no-reasoning" and gem.calls[1]["model"] == "g-a" and "extra_body" not in gem.calls[1]
+      and "extra_body" in gem.calls[0])
+
+# 13) connection/timeout errors (no HTTP status) are treated as transient
+R.reset_state()
+gem = FakeClient([NetErr("Connection error."), resp("from-b")])
+msg, _, _ = grun(gem)
+check("connection error -> next model", msg.content == "from-b")
+
+# 14) every model cooling down -> still probes one instead of failing untried
+R.reset_state()
+for m in ("g-a", "g-b", "g-c"):
+    R._cool(m, 30)
+gem = FakeClient([resp("probed")])
+msg, _, _ = grun(gem)
+check("all cooled -> probe one", msg.content == "probed" and len(gem.calls) == 1)
+
+# 15) deadline bounds the walk
+R.reset_state()
+old = R._GEMINI_DEADLINE_S
+R._GEMINI_DEADLINE_S = 0.0
+gem = FakeClient([HTTPErr(503), resp("never")])
+try:
+    grun(gem); check("deadline stops ladder", False)
+except Exception:
+    check("deadline stops ladder", len(gem.calls) == 1, len(gem.calls))
+R._GEMINI_DEADLINE_S = old
+
+# 16) SDK retries are disabled for Gemini calls (no nested retry storm)
+R.reset_state()
+class OptClient(FakeClient):
+    def __init__(self, script):
+        super().__init__(script); self.opts = None
+    def with_options(self, **o):
+        self.opts = o; return self
+gem = OptClient([resp("ok")])
+grun(gem)
+check("with_options(max_retries=0)", gem.opts == {"max_retries": 0}, gem.opts)
+
+# 17) default ladder comes from env / built-in list, primary first, de-duplicated
+R.reset_state()
+os.environ["GEMINI_FALLBACK_MODELS"] = "g-b, g-a ,g-c"
+check("env ladder dedup/order", R._gemini_models("g-a", None) == ["g-a", "g-b", "g-c"], R._gemini_models("g-a", None))
+del os.environ["GEMINI_FALLBACK_MODELS"]
+check("built-in ladder", R._gemini_models("gemini-3.6-flash", None)[0] == "gemini-3.6-flash"
+      and "gemini-3.8-flash" in R._gemini_models("gemini-3.6-flash", None))
+R._TPM_SAFETY = 0.92
+R.time.sleep = orig_sleep
 
 print("FAILS:", FAILS)
 sys.exit(1 if FAILS else 0)
