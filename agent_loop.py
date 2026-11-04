@@ -1033,6 +1033,53 @@ def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
     return out
 
 
+def _fit_tools_for_budget(messages: List[dict], tools: Optional[List], max_tokens: int,
+                          latest_user_text: str) -> Optional[List]:
+    """Owner chats enable every tool (~5.3k tokens of schemas + ~3.3k system prompt), which can never fit
+    Groq's single-request ceiling, so Groq was skipped on every turn (prod log 2026-11-03). When — and only
+    when — the full set does not fit, ask an LLM (clean JSON, tool_budget.plan_tools) which tools this turn
+    can need and offer just those. Fail-open: any problem returns the full set unchanged. Set
+    TOOL_PLANNER=0 to disable."""
+    import os as _os
+    import time as _time
+    if not tools or _os.getenv("TOOL_PLANNER", "1").strip() == "0" or _client_ai is None:
+        return tools
+    try:
+        import llm_router as _lr
+        import tool_budget as _tb
+        budget = _lr.groq_budget()
+        est = _lr.est_tokens(messages, tools, max_tokens)
+        if est <= budget or _client_gemini is None:
+            return tools
+        recent = []
+        for m in (messages or [])[:-1][-2:]:
+            c = m.get("content")
+            if m.get("role") in ("user", "assistant") and isinstance(c, str):
+                recent.append(f"{m.get('role')}: {c}")
+        models = [x.strip() for x in (_os.getenv("TOOL_PLANNER_MODELS") or
+                                       "gemini-3.5-flash-lite," + (_GEMINI_MODEL or "")).split(",") if x.strip()]
+        t0 = _time.time()
+        names = _tb.plan_tools(
+            tools, latest_user_text, recent,
+            gemini_client=_lr._no_sdk_retry(_client_gemini), models=models,
+            is_cooled=_lr.is_cooled, mark_failed=_lr.mark_failed,
+        )
+        ms = int((_time.time() - t0) * 1000)
+        log = logging.getLogger("mojo.tools")
+        if names is None:
+            log.warning("TOOL_PLAN_FAIL offered=%d keeping full set est=%d budget=%d ms=%d",
+                        len(tools), est, budget, ms)
+            return tools
+        sub = _tb.subset(tools, names)
+        est2 = _lr.est_tokens(messages, sub or None, max_tokens)
+        log.info("TOOL_PLAN offered=%d->%d est=%d->%d budget=%d ms=%d tools=%s",
+                 len(tools), len(sub), est, est2, budget, ms, ",".join(names) or "-")
+        return sub or None
+    except Exception as e:  # noqa: BLE001
+        print(f"[AGENT] tool planner failed (keeping full tool set): {e}")
+        return tools
+
+
 def _chat_completion(
     messages: List[dict],
     tools: Optional[List] = None,
@@ -2000,6 +2047,9 @@ def run_agent(
                 _reply_max_tokens = max(MAX_COMPLETION_TOKENS, 3000)
         except Exception:
             _reply_max_tokens = MAX_COMPLETION_TOKENS
+
+        if tools_for_next:
+            tools_for_next = _fit_tools_for_budget(messages, tools_for_next, _reply_max_tokens, latest_user_text)
 
         for step in range(MAX_TOOL_STEPS):
             try:

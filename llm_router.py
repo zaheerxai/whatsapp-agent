@@ -28,6 +28,14 @@ Gemini resilience (prod log 2026-11-03 12:00: two Gemini 503s ended the whole tu
   * A failed model is put on a short cooldown so the next user message skips it instead of
     paying the failure latency again; 404 (retired model id) cools it for an hour.
   * A wall-clock deadline (LLM_GEMINI_DEADLINE_S) bounds total time spent walking the ladder.
+
+Prompt budget (Task 2; prod log 2026-11-03: owner turns estimated 11-12k tokens vs a 7.36k Groq cap, so
+Groq was skipped every time): system 3.3k + 24 tool schemas 5.3k + history + 1k reserved output.
+  * Groq counts input + the max_tokens you DECLARE against TPM, so the reserve is part of the request.
+  * Before skipping a Groq model for TPM, older history is trimmed (all system messages and the latest
+    turns are kept; orphaned tool messages are dropped) and the request is re-checked.
+  * Every skip/trim/OK line carries a sys/msgs/tools/out token breakdown plus cached_tokens, so the
+    next live log shows exactly what is costing budget and whether Groq prompt caching is hitting.
 """
 from __future__ import annotations
 
@@ -103,6 +111,64 @@ def _cooled(model: str) -> float:
 def _cool(model: str, seconds: float, cap: float = 60.0) -> None:
     with _lock:
         _cooldown[model] = time.time() + max(1.0, min(float(seconds), float(cap)))
+
+
+def groq_budget() -> int:
+    """Largest single request (input + declared output) a Groq model can accept on an empty window."""
+    return int(GROQ_TPM_LIMIT * _TPM_SAFETY)
+
+
+def is_cooled(model: str) -> bool:
+    return _cooled(model) > 0
+
+
+def mark_failed(model: str, seconds: float = 30.0) -> None:
+    """Let side callers (e.g. the tool planner) share the router's per-model cooldowns."""
+    _cool(model, seconds)
+
+
+def budget_parts(messages: List[dict], tools: Optional[list] = None, max_out: int = 0) -> Dict[str, int]:
+    """Token estimate split by origin, for logs: system / other messages / tool schemas / reserved output."""
+    sysm = [m for m in messages or [] if m.get("role") == "system"]
+    rest = [m for m in messages or [] if m.get("role") != "system"]
+    return {"sys": est_tokens(sysm) - 60 if sysm else 0, "msgs": est_tokens(rest) - 60 if rest else 0,
+            "tools": int(len(json.dumps(tools, default=str)) / 3.3) if tools else 0, "out": int(max_out or 0)}
+
+
+def _fmt_parts(messages: List[dict], tools: Optional[list], max_out: int) -> str:
+    p = budget_parts(messages, tools, max_out)
+    return "sys=%d msgs=%d tools=%d out=%d" % (p["sys"], p["msgs"], p["tools"], p["out"])
+
+
+def trim_history(messages: List[dict], keep_last: int) -> List[dict]:
+    """Keep EVERY system message (in place) and only the last `keep_last` non-system messages, so the latest
+    user turn always survives and the original ordering is preserved. Leading 'tool' messages whose assistant
+    tool_calls were trimmed away are dropped: providers reject a tool result with no matching call."""
+    idx = [i for i, m in enumerate(messages) if m.get("role") != "system"]
+    if len(idx) <= keep_last:
+        return list(messages)
+    kept = idx[-max(1, keep_last):]
+    while len(kept) > 1 and messages[kept[0]].get("role") == "tool":
+        kept.pop(0)
+    keep = set(kept)
+    return [m for i, m in enumerate(messages) if m.get("role") == "system" or i in keep]
+
+
+def fit_messages(messages: List[dict], tools: Optional[list], max_out: int, budget: int) -> Optional[Tuple[List[dict], int]]:
+    """Trim older history until the request fits `budget`. Returns (messages, est) or None if even the
+    most aggressive trim does not fit (system + tools + reserve alone are too big, or the latest message is)."""
+    est = est_tokens(messages, tools, max_out)
+    if est <= budget:
+        return messages, est
+    non_sys = sum(1 for m in messages if m.get("role") != "system")
+    for k in (10, 8, 6, 4, 2):
+        if non_sys <= k:
+            continue
+        cand = trim_history(messages, k)
+        e = est_tokens(cand, tools, max_out)
+        if e <= budget:
+            return cand, e
+    return None
 
 
 def reset_state() -> None:  # tests
@@ -233,6 +299,7 @@ def complete(
     gem_deadline: Optional[float] = None
     prev_gem: Optional[str] = None
     for idx, (kind, client, model) in enumerate(chain):
+        cand_msgs, cand_est = working, est
         has_next_gemini = any(c[0] == "gemini" for c in chain[idx + 1:])
         if kind == "groq":
             cd = _cooled(model)
@@ -241,8 +308,14 @@ def complete(
                 continue
             hr = _headroom(model)
             if hr < est:
-                log.info("LLM_SKIP model=%s reason=tpm est=%s headroom=%s", model, est, hr)
-                continue
+                fitted = fit_messages(working, work_tools, max_tokens, hr)
+                if fitted is None:
+                    log.info("LLM_SKIP model=%s reason=tpm est=%s headroom=%s (%s)", model, est, hr,
+                             _fmt_parts(working, work_tools, max_tokens))
+                    continue
+                cand_msgs, cand_est = fitted
+                log.info("LLM_TRIM model=%s est=%s->%s headroom=%s msgs=%d->%d", model, est, cand_est, hr,
+                         len(working), len(cand_msgs))
         else:
             now = time.time()
             if gem_deadline is None:
@@ -257,12 +330,12 @@ def complete(
         flat = (kind == "gemini") or (model != groq_model and not work_tools)
         drop_reasoning = False
         for attempt in range(2):
-            if attempt > 0 and kind == "groq" and _headroom(model) < est_tokens(working, work_tools, max_tokens):
+            if attempt > 0 and kind == "groq" and _headroom(model) < est_tokens(cand_msgs, work_tools, max_tokens):
                 log.info("LLM_SKIP model=%s reason=tpm-after-failure", model)
                 break
             kw: Dict[str, Any] = {}
             try:
-                msgs = flatten(working) if flat else working
+                msgs = flatten(cand_msgs) if flat else cand_msgs
                 kw = _build_kwargs(kind, model, msgs, work_tools, temperature, max_tokens)
                 if drop_reasoning:
                     kw.pop("extra_body", None)
@@ -275,8 +348,10 @@ def complete(
                 total = getattr(usage, "total_tokens", None) or est
                 if kind == "groq":
                     _record(model, total)
-                log.info("LLM_OK provider=%s model=%s finish=%s tokens=%s est=%s ms=%d",
-                         kind, model, finish, total, est, int((time.time() - t0) * 1000))
+                cached = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None)
+                log.info("LLM_OK provider=%s model=%s finish=%s tokens=%s est=%s cached=%s ms=%d (%s)",
+                         kind, model, finish, total, cand_est, cached, int((time.time() - t0) * 1000),
+                         _fmt_parts(cand_msgs, work_tools, max_tokens))
                 return msg, finish, kind
             except Exception as e:  # noqa: BLE001
                 last_err = e
@@ -303,6 +378,7 @@ def complete(
                     break
                 if st == 413 and kind == "groq" and attempt == 0:
                     working, work_tools = shrink(working, 4), None
+                    cand_msgs = working
                     continue
                 if st == 429 and kind == "groq":
                     _cool(model, ra if ra is not None else 20)
