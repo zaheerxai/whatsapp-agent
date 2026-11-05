@@ -2621,16 +2621,25 @@ def _groq_chat(
     return content, finish
 
 
+_CONTINUE_SOURCE_CHARS = 7000
+
+
 def _continue_text_only(
     so_far: str,
     *,
     lang_rule: str,
     max_tokens: int = 1200,
     rounds: int = 3,
+    source: Optional[str] = None,
 ) -> str:
     """
-    Continue a truncated answer WITHOUT resending the raw transcript
-    (avoids Groq 413). Minimal context: system + assistant so_far + continue.
+    Continue a truncated answer with minimal context: system + assistant tail + continue.
+
+    GROUNDING (prod 2026-11-03 09:36): this helper used to run with NO source text. A model told to
+    "complete all remaining sections" without the transcript invented whole sections — a 'How to get
+    started' flow, daily quotas and a '$9.99/month Pro tier' — for a 280-word promo reel. When `source`
+    is given it is included (bounded, so no 413) as the ONLY allowed fact base, and the model may answer
+    DONE when nothing is left. Callers pass the transcript / partial summaries whenever they have them.
     """
     text = (so_far or "").strip()
     if not text:
@@ -2640,14 +2649,26 @@ def _continue_text_only(
         if not _looks_incomplete(text) and r > 0:
             break
         # Only continue if clearly incomplete or first round after length stop
+        sys_content = (
+            "Continue the WhatsApp reply exactly from where it stopped. "
+            "Do NOT repeat earlier text. Finish remaining points. "
+            f"{lang_rule} WhatsApp *bold* only (no **). No code fences."
+        )
+        if source:
+            src = source if len(source) <= _CONTINUE_SOURCE_CHARS else (
+                source[: _CONTINUE_SOURCE_CHARS * 2 // 3] + "\n[...]\n" + source[-_CONTINUE_SOURCE_CHARS // 3:]
+            )
+            sys_content += (
+                "\n\nSOURCE (the ONLY facts you may use):\n<<<\n" + src + "\n>>>\n"
+                "Add ONLY points that are in the SOURCE and not yet covered above. Do NOT add how-to steps, "
+                "pricing, plans, limits, quotas, availability, links or use-cases unless the SOURCE states them. "
+                "If the reply already covers everything in the SOURCE (or you only need to finish a cut-off "
+                "sentence that is already complete in meaning), answer with exactly: DONE"
+            )
         msgs = [
             {
                 "role": "system",
-                "content": (
-                    "Continue the WhatsApp reply exactly from where it stopped. "
-                    "Do NOT repeat earlier text. Finish remaining points. "
-                    f"{lang_rule} WhatsApp *bold* only (no **). No code fences."
-                ),
+                "content": sys_content,
             },
             {
                 "role": "assistant",
@@ -2660,6 +2681,9 @@ def _continue_text_only(
         ]
         piece, finish = _groq_chat(msgs, max_tokens=max_tokens, temperature=0.2)
         if not piece:
+            break
+        if piece.strip().strip(".!").upper() == "DONE":
+            print(f"[continue] round={r+1} DONE — source fully covered, nothing added")
             break
         # Avoid pure duplication
         if piece in text:
@@ -2764,12 +2788,13 @@ def _map_reduce_summary(
             merged = "\n\n".join(
                 re.sub(r"^\[Part \d+\]\s*", "", p).strip() for p in partials
             )
-        if finish == "length" or _looks_incomplete(merged or ""):
+        if finish == "length" or (finish not in ("stop", "end_turn") and _looks_incomplete(merged or "")):
             merged = _continue_text_only(
                 merged or "",
                 lang_rule=lang_rule,
                 max_tokens=min(1500, max_tok_final),
                 rounds=3,
+                source=join_body,
             )
 
     return (merged or "").strip()
@@ -2819,6 +2844,15 @@ def _refine_transcript_compact(
     cleaned = _clean_raw_transcript(raw)
     if _client_ai is None or not _MODEL_NAME:
         return cleaned[:3000] + ("…" if len(cleaned) > 3000 else "")
+
+    # A summary cannot honestly be longer than its source. "Tell me in detail" auto-sets ~1000 words; applied
+    # to a ~280-word reel it forced the model to pad with invented content (prod 2026-11-03 09:36).
+    src_words = len(cleaned.split())
+    capped_from: Optional[int] = None
+    if mode == "summary" and tw is not None:
+        cap = max(80, int(src_words * 1.15))
+        if tw > cap:
+            capped_from, tw = tw, cap
 
     want_latin = out_lang not in ("urdu_script", "hindi_script", "ur", "hi")
 
@@ -2870,6 +2904,12 @@ def _refine_transcript_compact(
     system_core = (
         "You turn a raw video transcript into a WhatsApp reply.\n"
         "CRITICAL: Use ONLY facts from the transcript. Do not invent.\n"
+        "GROUNDING: every statement must be traceable to the transcript. If the user asks for something the "
+        "transcript does not contain (steps, pricing, plans, limits, quotas, availability, links, or names of "
+        "items the speaker did not name), say in one line that the video does not say it — never fill it in "
+        "from memory or common sense. If the speaker says more is behind a comment / link / DM, say exactly "
+        "that and do not guess what it contains. Never lengthen the reply to reach a word target: a short "
+        "transcript deserves a short reply.\n"
         "The transcript is automatic speech recognition: repair obviously garbled brand/"
         "product/person names from context and world knowledge (e.g. 'एंत्रोफिक' -> Anthropic, "
         "'क्लोड कोड' -> Claude Code); if unsure, give your best guess followed by (?).\n"
@@ -2911,12 +2951,15 @@ def _refine_transcript_compact(
                 temperature=0.2,
             )
             print(f"[refine] single finish={finish} chars={len(out or '')}")
-            if out and (finish == "length" or _looks_incomplete(out)):
+            # finish=stop means the model ended on its own: trust it (the heuristic alone used to trigger an
+            # ungrounded "continue" that padded the reply). Heuristic only when the finish reason is unknown.
+            if out and (finish == "length" or (finish not in ("stop", "end_turn") and _looks_incomplete(out))):
                 out = _continue_text_only(
                     out,
                     lang_rule=script_rule,
                     max_tokens=min(1500, max_tok),
                     rounds=3,
+                    source=cleaned,
                 )
 
         if not out:
@@ -2954,6 +2997,14 @@ def _refine_transcript_compact(
 
         if len(out) > hard_cap:
             out = _trim_to_sentence(out, hard_cap)
+        if capped_from is not None:
+            # The user asked for more detail than the video contains: say so instead of padding.
+            out = out.rstrip() + (
+                f"\n\n_(Video mein sirf ~{src_words} alfaaz ki baat hai — is liye ye poora content hai.)_"
+                if out_lang not in ("en", "english") and want_latin
+                else f"\n\n_(The video only has about {src_words} words of spoken content, so this covers all of it.)_"
+            )
+            print(f"[refine] target {capped_from} words capped to {tw} (source has {src_words} words)")
         return out
     except Exception as e:
         print(f"[transcribe_video] refine failed: {e}")

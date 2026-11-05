@@ -1056,6 +1056,31 @@ def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
     return out
 
 
+_RESEARCH_FOLLOWUP_NOTE = (
+    "EXCEPTION to the above: the user asked you to RESEARCH beyond the video. The video content above is the "
+    "ONLY source for what the video says. Call web_search (at most 2 calls) for what the video does NOT cover"
+    "{hint}. Use correct brand/product names, never ASR-garbled spellings. Then reply in the user's language in "
+    "two labelled parts: *From the video* (only what it says — and say plainly what it does NOT say or name, "
+    "e.g. items it teases but never lists) and *From the web* (only what the search results show; name the "
+    "source site for each item). Do NOT state prices, quotas, limits, plans, steps or availability unless a "
+    "search result shows them. If the search finds nothing credible, say so — never fill gaps from memory. "
+    "Be concise."
+)
+_RESEARCH_OFF_NOTE = "\n\n_Note: web search is turned off in this chat, so this covers only what the video itself says._"
+
+
+def _video_followup_kind(vplan: Any, direct: Optional[str], web_search_allowed: bool) -> Optional[str]:
+    """After the forced video tool ran: should the agent loop continue with web_search instead of replying
+    with the video result directly? 'verify' (is it true?) or 'research' (find out more than the video says)."""
+    if vplan is None or not direct or not web_search_allowed:
+        return None
+    if getattr(vplan, "verify", False):
+        return "verify"
+    if getattr(vplan, "research", False):
+        return "research"
+    return None
+
+
 def _fit_tools_for_budget(messages: List[dict], tools: Optional[List], max_tokens: int,
                           latest_user_text: str) -> Optional[List]:
     """Owner chats enable every tool (~5.3k tokens of schemas + ~3.3k system prompt), which can never fit
@@ -1910,11 +1935,13 @@ def run_agent(
                     except Exception as _ue:
                         print(f"[AGENT] untranslated-dump gate skip: {_ue}")
 
-                _verify_followup = bool(
-                    vplan is not None and vplan.verify and direct
-                    and _tool_allowed_for_chat(chat_id, "web_search")
-                )
-                if direct and len(direct) >= 20 and not _verify_followup:
+                _ws_ok = _tool_allowed_for_chat(chat_id, "web_search")
+                _followup = _video_followup_kind(vplan, direct, _ws_ok)
+                _verify_followup = _followup == "verify"
+                _research_followup = _followup == "research"
+                if direct and vplan is not None and getattr(vplan, "research", False) and not _ws_ok:
+                    direct = direct.rstrip() + _RESEARCH_OFF_NOTE   # be honest: research was asked, none possible
+                if direct and len(direct) >= 20 and _followup is None:
                     print(
                         "[AGENT] force transcribe/preview → direct OBS reply "
                         f"(chars={len(direct)}, starts={direct[:40]!r})"
@@ -1958,6 +1985,21 @@ def run_agent(
                         if (s_.get("function") or {}).get("name") == "web_search"
                     ] or None
                     print("[AGENT] verify follow-up — web_search enabled for one step")
+                elif _research_followup:
+                    _hint = (f" (suggested query: {vplan.research_query!r})"
+                             if getattr(vplan, "research_query", "") else "")
+                    messages.append({
+                        "role": "system",
+                        "content": _RESEARCH_FOLLOWUP_NOTE.replace("{hint}", _hint),
+                    })
+                    tools_for_next = [
+                        s_ for s_ in (_schemas_for_chat(chat_id) or [])
+                        if (s_.get("function") or {}).get("name") == "web_search"
+                    ] or None
+                    logging.getLogger("mojo.agent").info(
+                        "VIDEO_RESEARCH_FOLLOWUP query=%r", getattr(vplan, "research_query", "")[:120]
+                    )
+                    print("[AGENT] research follow-up — web_search enabled")
                 else:
                     tools_for_next = None  # synthesis only — no tool schema payload
                 # Long summary / transcript needs a higher completion budget
