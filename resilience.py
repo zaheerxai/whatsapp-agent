@@ -124,6 +124,28 @@ def report_incident(kind: str, exc: Optional[BaseException] = None, *, stage: st
         pass
 
 
+def notify_owner(text: str, *, key: str = "", cooldown_s: float = 0.0) -> bool:
+    """Send a plain, already-formatted message to the owner (no incident header / log tail).
+    Same delivery guarantees as report_incident: sent off-thread with a timeout, and parked in the
+    undelivered queue (retried by the watchdog) if WhatsApp is down. Optional per-`key` cooldown.
+    Never raises, never blocks the caller. Returns True when a send was dispatched."""
+    try:
+        now = time.time()
+        if key and cooldown_s > 0:
+            if now - _last_sent.get("notify:" + key, 0) < cooldown_s:
+                return False
+            _last_sent["notify:" + key] = now
+
+        def send():
+            if not _deliver(text):
+                _undelivered.append(text)
+
+        threading.Thread(target=send, daemon=True, name="guard-notify-owner").start()
+        return True
+    except Exception:  # noqa: BLE001 — a notifier must never become the problem
+        return False
+
+
 # ------------------------------------------------------------------ handler tracking
 @contextlib.contextmanager
 def track(name: str, limit_s: Optional[int] = None):

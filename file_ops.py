@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+
+import onedrive_auth
 
 # ---------------------------------------------------------------------------
 # Config
@@ -26,7 +29,7 @@ def _folder() -> str:
 
 
 def onedrive_configured() -> bool:
-    return bool(os.getenv("ONEDRIVE_CLIENT_ID") and os.getenv("ONEDRIVE_REFRESH_TOKEN"))
+    return onedrive_auth.configured()
 
 
 # ---------------------------------------------------------------------------
@@ -69,34 +72,36 @@ def safe_remove(path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _onedrive_access_token() -> str:
-    client_id = os.getenv("ONEDRIVE_CLIENT_ID")
-    client_secret = os.getenv("ONEDRIVE_CLIENT_SECRET")
-    refresh = os.getenv("ONEDRIVE_REFRESH_TOKEN")
-    if not client_id or not refresh:
-        raise RuntimeError(
-            "OneDrive not configured. Set ONEDRIVE_CLIENT_ID and ONEDRIVE_REFRESH_TOKEN."
-        )
+    """Kept for backwards compatibility. Cached + rotation-safe: see onedrive_auth.py."""
+    return onedrive_auth.get_access_token()
 
-    data = {
-        "client_id": client_id,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh,
-        "scope": "https://graph.microsoft.com/Files.ReadWrite offline_access",
-    }
-    if client_secret:
-        data["client_secret"] = client_secret
 
-    r = requests.post(
-        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-        data=data,
-        timeout=30,
-    )
-    r.raise_for_status()
-    body = r.json()
-    # Optional: if body has a new refresh_token, log a reminder to update env
-    if body.get("refresh_token") and body["refresh_token"] != refresh:
-        print("[file_ops] NOTE: Microsoft rotated refresh_token — update ONEDRIVE_REFRESH_TOKEN")
-    return body["access_token"]
+def _graph(method: str, url: str, *, retries: int = 2, **kw) -> requests.Response:
+    """Authenticated Microsoft Graph request.
+    * Bearer token comes from the shared cache (one token call per ~hour, not per file operation).
+    * 401 -> drop the cached token and retry once (token revoked/expired early).
+    * 429 / 502 / 503 / 504 -> bounded retry honouring Retry-After (a RAG sync touches many files).
+    The caller still does raise_for_status(), so existing error handling is unchanged."""
+    kw.setdefault("timeout", 60)
+    base_headers = dict(kw.pop("headers", None) or {})
+    reauthed = False
+    attempt = 0
+    while True:
+        headers = {**base_headers, "Authorization": f"Bearer {onedrive_auth.get_access_token()}"}
+        r = requests.request(method, url, headers=headers, **kw)
+        if r.status_code == 401 and not reauthed:
+            reauthed = True
+            onedrive_auth.invalidate()
+            continue
+        if r.status_code in (429, 502, 503, 504) and attempt < retries:
+            attempt += 1
+            try:
+                wait = float(r.headers.get("Retry-After") or 0) or 2.0 * attempt
+            except (TypeError, ValueError):
+                wait = 2.0 * attempt
+            time.sleep(min(wait, 10.0))
+            continue
+        return r
 
 
 # ---------------------------------------------------------------------------
@@ -117,17 +122,13 @@ def upload_to_onedrive(
 
     folder = (remote_folder or _folder()).strip("/")
     name = remote_name or os.path.basename(local_path)
-    access = _onedrive_access_token()
 
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder}/{name}:/content"
-    headers = {
-        "Authorization": f"Bearer {access}",
-        "Content-Type": "application/octet-stream",
-    }
+    headers = {"Content-Type": "application/octet-stream"}
     with open(local_path, "rb") as f:
         data = f.read()
 
-    up = requests.put(url, headers=headers, data=data, timeout=180)
+    up = _graph("PUT", url, headers=headers, data=data, timeout=180)
     up.raise_for_status()
     meta = up.json()
     print(f"[file_ops] uploaded → {folder}/{name} ({meta.get('size')} bytes)")
@@ -143,11 +144,9 @@ def download_from_onedrive(
     Returns local absolute path.
     """
     remote_path = remote_path.lstrip("/")
-    access = _onedrive_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
-    headers = {"Authorization": f"Bearer {access}"}
 
-    r = requests.get(url, headers=headers, timeout=180)
+    r = _graph("GET", url, timeout=180)
     r.raise_for_status()
 
     if not local_path:
@@ -162,13 +161,12 @@ def download_from_onedrive(
 def list_onedrive_folder(remote_folder: Optional[str] = None) -> list[dict]:
     """List children of a folder under drive root."""
     folder = (remote_folder or _folder()).strip("/")
-    access = _onedrive_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder}:/children"
     items: list[dict] = []
     while url:
-        r = requests.get(
+        r = _graph(
+            "GET",
             url,
-            headers={"Authorization": f"Bearer {access}"},
             timeout=60,
             params={"$top": 200} if ":" in url and "children" in url else None,
         )
@@ -187,20 +185,16 @@ def ensure_onedrive_folder(remote_folder: str) -> dict:
     remote_folder = (remote_folder or "").strip().strip("/")
     if not remote_folder:
         raise ValueError("remote_folder required")
-    access = _onedrive_access_token()
-    headers = {
-        "Authorization": f"Bearer {access}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     parts = [p for p in remote_folder.split("/") if p]
     parent_path = ""
     leaf_meta: dict = {}
     for part in parts:
         current = f"{parent_path}/{part}" if parent_path else part
         # Does it exist?
-        probe = requests.get(
+        probe = _graph(
+            "GET",
             f"https://graph.microsoft.com/v1.0/me/drive/root:/{current}",
-            headers={"Authorization": f"Bearer {access}"},
             timeout=30,
         )
         if probe.status_code == 200:
@@ -219,14 +213,14 @@ def ensure_onedrive_folder(remote_folder: str) -> dict:
             "folder": {},
             "@microsoft.graph.conflictBehavior": "fail",
         }
-        cr = requests.post(create_url, headers=headers, json=body, timeout=30)
+        cr = _graph("POST", create_url, headers=headers, json=body, timeout=30)
         if cr.status_code in (200, 201):
             leaf_meta = cr.json()
         elif cr.status_code == 409:
             # Race: already exists
-            again = requests.get(
+            again = _graph(
+                "GET",
                 f"https://graph.microsoft.com/v1.0/me/drive/root:/{current}",
-                headers={"Authorization": f"Bearer {access}"},
                 timeout=30,
             )
             again.raise_for_status()
@@ -248,7 +242,6 @@ def list_onedrive_recursive(
     Each item: {name, path, size, id, webUrl, lastModifiedDateTime}.
     """
     remote_folder = (remote_folder or "").strip().strip("/")
-    access = _onedrive_access_token()
     out: list[dict] = []
     stack = [remote_folder]
 

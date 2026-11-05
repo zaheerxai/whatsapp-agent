@@ -49,6 +49,12 @@ def init(supabase_client) -> None:
 
 
 # ----------------------------------------------------------------------------- KV cache
+def db_client():
+    """The attached Supabase client (or None) for modules that own their own tables, e.g. secret_store.
+    Independent of the kv_cache circuit breaker: a kv outage must not disable unrelated tables."""
+    return _supabase
+
+
 def _kv_ok() -> bool:
     return _supabase is not None and time.time() >= _kv_down_until
 

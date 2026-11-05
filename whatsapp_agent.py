@@ -40,6 +40,7 @@ from supabase import create_client, Client
 # Import this AFTER load_dotenv() so it can see the variables
 import admin_commands
 import file_ops
+import onedrive_auth
 import bot_voice
 import voice_pipeline  # voice note -> typed-equivalent text (single front door)
 
@@ -2672,6 +2673,11 @@ agent_loop.init_agent(
 # Start health endpoint + session uploader + optional self-ping
 start_health_server()
 resilience.init(lambda text: _owner_notify(text))  # late-bound: _owner_notify is defined further down
+# OneDrive auth alerts (token rejected by Microsoft / reconnected) go to the owner through the same
+# guarded, retried delivery path as incident reports. onedrive_auth stays transport-agnostic.
+onedrive_auth.set_alert_handler(
+    lambda kind, text: resilience.notify_owner(text, key=f"onedrive:{kind}", cooldown_s=300)
+)
 resilience.start_watchdog()
 # Change-detected session backup (default 30 min). Idle → zero session egress.
 start_session_uploader()

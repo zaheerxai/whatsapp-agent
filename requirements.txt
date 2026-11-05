@@ -11,3 +11,4 @@ ddgs
 youtube-transcript-api
 yt-dlp[default,curl-cffi]>=2026.8.19
 pypdf>=4.0.0
+cryptography>=42.0.0
