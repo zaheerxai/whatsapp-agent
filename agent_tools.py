@@ -670,6 +670,14 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                             "'400 word summary' or '600 words'. Clamp 80–800."
                         ),
                     },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["brief", "standard", "detailed"],
+                        "description": (
+                            "Depth the user wants: detailed = in detail / point by point / in depth; "
+                            "brief = short gist. Omit for standard."
+                        ),
+                    },
                     "language": {
                         "type": "string",
                         "description": (
@@ -2432,20 +2440,6 @@ def _has_arabic_or_devanagari(text: str) -> bool:
 # ---------------------------------------------------------------------------
 # Adaptive length, map-reduce summary, safe continuation (no 413 loops)
 # ---------------------------------------------------------------------------
-_THOROUGH_MARKERS = frozenset({
-    "break down", "breakdown", "har cheez", "har baat", "poora", "pura",
-    "in depth", "indepth", "in-depth", "detailed", "detail me", "detail mein",
-    "sab kuch", "everything", "complete", "full summary", "deep dive",
-    "step by step", "step-by-step", "point by point", "har point",
-    "thorough", "comprehensive", "exhaustive", "lengthy", "long summary",
-})
-
-
-def _request_is_thorough(user_request: str) -> bool:
-    t = (user_request or "").lower()
-    return any(m in t for m in _THOROUGH_MARKERS)
-
-
 def _looks_incomplete(text: str) -> bool:
     s = (text or "").strip()
     if not s:
@@ -2807,9 +2801,15 @@ def _refine_transcript_compact(
     target_words: Optional[int] = None,
     output_lang: str = "auto",
     user_request: str = "",
+    detail: Optional[str] = None,
+    name_hints: Optional[List[str]] = None,
 ) -> str:
     """
     Robust LLM refine for WhatsApp.
+
+    `detail` ("brief" | "standard" | "detailed") is decided by the router / tool-calling LLM; there is no
+    phrase list any more. `name_hints` are probable product/person names from transcript_repair (medium
+    confidence) that the summary may use, marked with (?).
 
     - Long input → map-reduce (avoids Groq 413)
     - finish_reason=length → minimal-context continuation (no full transcript resend)
@@ -2838,8 +2838,12 @@ def _refine_transcript_compact(
             tw = None
         if tw is not None:
             tw = max(80, min(2500, tw))
-    if tw is None and mode == "summary" and _request_is_thorough(user_request):
-        tw = 1000
+    detail = (detail or "").strip().lower()
+    if tw is None and mode == "summary":
+        if detail == "detailed":
+            tw = 1000          # still capped below by the size of the source
+        elif detail == "brief":
+            tw = 150
 
     cleaned = _clean_raw_transcript(raw)
     if _client_ai is None or not _MODEL_NAME:
@@ -2904,7 +2908,12 @@ def _refine_transcript_compact(
     system_core = (
         "You turn a raw video transcript into a WhatsApp reply.\n"
         "CRITICAL: Use ONLY facts from the transcript. Do not invent.\n"
-        "GROUNDING: every statement must be traceable to the transcript. If the user asks for something the "
+        + (
+            "PROBABLE NAMES (speech recognition likely garbled these; use them, and add (?) after one if you "
+            "rely on it): " + ", ".join(name_hints[:10]) + "\n"
+            if name_hints else ""
+        )
+        + "GROUNDING: every statement must be traceable to the transcript. If the user asks for something the "
         "transcript does not contain (steps, pricing, plans, limits, quotas, availability, links, or names of "
         "items the speaker did not name), say in one line that the video does not say it — never fill it in "
         "from memory or common sense. If the speaker says more is behind a comment / link / DM, say exactly "
@@ -4170,6 +4179,24 @@ def _transcribe_with_groq(audio_path: str, language: str) -> str:
     return (getattr(result, "text", None) or str(result) or "").strip()
 
 
+def _repair_asr_names(text: str, title: str = "", user_request: str = ""):
+    """LLM-based repair of mis-heard proper nouns (transcript_repair). Fail-open; returns a RepairResult."""
+    import transcript_repair as _tr
+    if _client_gemini is None or os.getenv("NAME_REPAIR", "1").strip() == "0":
+        return _tr.RepairResult(text=text)
+    try:
+        import llm_router as _lr
+        cooled, failed = _lr.is_cooled, _lr.mark_failed
+        client = _lr._no_sdk_retry(_client_gemini)
+    except Exception:  # noqa: BLE001
+        cooled, failed, client = None, None, _client_gemini
+    models = [m.strip() for m in (os.getenv("NAME_REPAIR_MODELS") or
+                                   "gemini-3.5-flash-lite," + (_GEMINI_MODEL or "")).split(",") if m.strip()]
+    ctx = " | ".join(x for x in (f"title: {title}" if title else "", f"user asked: {user_request[:200]}" if user_request else "") if x)
+    return _tr.repair_names(text, context=ctx, gemini_client=client, models=models,
+                            is_cooled=cooled, mark_failed=failed)
+
+
 def _try_youtube_asr(url: str, with_ts: bool) -> tuple:
     """Free ASR for YouTube (yt-dlp audio -> ffmpeg -> Groq Whisper) as a stand-alone attempt that never
     returns user-facing prose. Returns (text_or_None, error_or_None).
@@ -4217,6 +4244,9 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
     except (TypeError, ValueError):
         target_words = None
     user_request = (args.get("user_request") or args.get("query") or "").strip()
+    detail = str(args.get("detail") or "").strip().lower()
+    if detail not in ("brief", "standard", "detailed"):
+        detail = ""
 
     if not url:
         return "URL required. Example: https://www.youtube.com/watch?v=..."
@@ -4225,7 +4255,7 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
 
     # Include mode + length in cache so summary ≠ 400-word summary ≠ transcript
     cache_k = _cache_key(
-        f"{url}|{mode}|tw={target_words or 0}", language, with_ts
+        f"{url}|{mode}|tw={target_words or 0}|d={detail}", language, with_ts
     )
     cached = _cache_get(cache_k)
     if cached:
@@ -4301,6 +4331,10 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
             )
         # Persist real speech for other modes (transcript ↔ summary ↔ answer)
         _raw_cache_set(raw_body, source)
+        # Fix mis-heard product / person names ("Notebook LN" -> "NotebookLM") for EVERY mode: summary,
+        # answer, transcript. LLM proposes, transcript_repair validates against the text, then injects.
+        _rep = _repair_asr_names(raw_body, title=title or "", user_request=user_request)
+        raw_body, _name_hints = _rep.text, _rep.hints
         if args.get("_raw_only"):  # answer mode wants the speech itself, no render/refine
             return f"Source: {source} | mode=raw\n\n{raw_body}"
 
@@ -4337,6 +4371,8 @@ def _tool_transcribe_video_core(args: dict, ctx: dict) -> str:
                 target_words=target_words,
                 output_lang=out_lang,
                 user_request=user_request,
+                detail=detail or None,
+                name_hints=_name_hints,
             )
             if _looks_like_youtube_description(refined):
                 raise RuntimeError(

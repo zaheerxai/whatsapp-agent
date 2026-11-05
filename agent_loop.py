@@ -1056,6 +1056,35 @@ def _shrink_messages(messages: List[dict], keep_last: int = 6) -> List[dict]:
     return out
 
 
+def _target_words_fallback(text_low: str) -> Optional[int]:
+    """OFFLINE SAFETY NET ONLY: pull '400 words' / '1.5k words' out of the message when the router LLM chain
+    was down. Normally the router's LLM-extracted target_words is used (see _resolve_video_length)."""
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*[kK]\s*(?:words?|lafz)?", text_low)
+    if m:
+        try:
+            return max(80, min(2500, int(float(m.group(1).replace(",", ".")) * 1000)))
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d{2,4})\s*[- ]?\s*(?:words?|lafz)", text_low)
+    if not m:
+        m = re.search(r"(\d{2,4})\s*word", text_low)
+    if not m:
+        return None
+    try:
+        return max(80, min(2500, int(m.group(1).replace(",", ""))))
+    except ValueError:
+        return None
+
+
+def _resolve_video_length(vplan: Any, intent_low: str):
+    """(target_words, detail) for a video reply. The router LLM decides both (it reads Roman Urdu / Hindi /
+    English by meaning); the regex is used only when the router did not run or its LLM chain was down.
+    No phrase list decides depth any more (a hard-coded ladder used to force 1000 words for 'explain')."""
+    if vplan is not None and getattr(vplan, "source", "") == "llm":
+        return getattr(vplan, "target_words", None), getattr(vplan, "detail", None)
+    return _target_words_fallback(intent_low or ""), None
+
+
 _RESEARCH_FOLLOWUP_NOTE = (
     "EXCEPTION to the above: the user asked you to RESEARCH beyond the video. The video content above is the "
     "ONLY source for what the video says. Call web_search (at most 2 calls) for what the video does NOT cover"
@@ -1485,31 +1514,6 @@ def run_agent(
         tw = None
         spoken_mode = None
 
-        def _parse_target_words(text_low: str) -> Optional[int]:
-            # 1.2k / 1.5k / 2k words (optional trailing me/mein)
-            m = _re.search(
-                r"(\d+(?:[.,]\d+)?)\s*[kK]\s*(?:words?|lafz)?",
-                text_low,
-            )
-            if m:
-                try:
-                    n = int(float(m.group(1).replace(",", ".")) * 1000)
-                    return max(80, min(2500, n))
-                except ValueError:
-                    pass
-            m = _re.search(
-                r"(\d{1,3}(?:,\d{3})+|\d{2,4})\s*[- ]?\s*(?:words?|lafz)",
-                text_low,
-            )
-            if not m:
-                m = _re.search(r"(\d{2,4})\s*word", text_low)
-            if not m:
-                return None
-            try:
-                n = int(m.group(1).replace(",", ""))
-                return max(80, min(2500, n))
-            except ValueError:
-                return None
 
         def _obs_looks_failed_or_thin(obs: str) -> bool:
             o = (obs or "").strip().lower()
@@ -1714,7 +1718,7 @@ def run_agent(
                 # If caption-only is weak and speech tools allowed, try transcribe
                 if (not caption_only) and _obs_looks_failed_or_thin(_forced_obs_str) and can_transcribe:
                     print("[AGENT] link_preview thin/failed → fallback transcribe_video")
-                    tw = _parse_target_words(_intent_low)
+                    tw, _detail = _resolve_video_length(vplan, _intent_low)
                     targs: Dict[str, Any] = {
                         "url": primary_url,
                         "mode": spoken_mode or "summary",
@@ -1723,6 +1727,8 @@ def run_agent(
                     }
                     if tw:
                         targs["target_words"] = tw
+                    if _detail:
+                        targs["detail"] = _detail
                     _forced_obs_str = _force_tool(
                         "transcribe_video", targs, "call_forced_transcribe_0"
                     )
@@ -1735,7 +1741,7 @@ def run_agent(
                 tools_for_next = None
 
             elif use_video and can_transcribe:
-                tw = _parse_target_words(_intent_low)
+                tw, _detail = _resolve_video_length(vplan, _intent_low)
                 # Caption language stays auto (Hindi auto-captions still fetch).
                 # Shared language policy (default Roman Urdu; en only if explicit)
                 try:
@@ -1771,20 +1777,8 @@ def run_agent(
                         tool_args["include_caption"] = True
                     if vplan.wants_stats:
                         tool_args["include_stats"] = True
-                    if vplan.target_words and not tw:
-                        tw = vplan.target_words
-                if not tw and spoken_mode == "summary":
-                    _il = (_intent_low or "")
-                    if any(
-                        m in _il
-                        for m in (
-                            "break down", "breakdown", "har cheez", "in depth",
-                            "indepth", "detailed", "sab kuch", "poora", "thorough",
-                            "point by point", "step by step", "action by action",
-                            "analysis", "analyse", "analyze", "explain",
-                        )
-                    ):
-                        tw = 1000
+                if _detail and spoken_mode in ("summary", "answer", "key_points"):
+                    tool_args["detail"] = _detail   # LLM-decided depth (replaces the old phrase ladder)
                 if tw and spoken_mode in ("summary", "transcript", "key_points"):
                     tool_args["target_words"] = tw
                 print(
@@ -1846,6 +1840,7 @@ def run_agent(
                                         title="",
                                         mode=spoken_mode or "summary",
                                         target_words=tw,
+                                        detail=_detail,
                                         output_lang=_retry_lang,
                                         user_request=(_intent_text or "")[:500],
                                     )
@@ -1917,7 +1912,8 @@ def run_agent(
                                     _raw,
                                     title="",
                                     mode="summary",
-                                    target_words=tw or 1000,
+                                    target_words=tw,
+                                    detail=_detail,
                                     output_lang=_rl,
                                     user_request=(_intent_text or "")[:500],
                                 )

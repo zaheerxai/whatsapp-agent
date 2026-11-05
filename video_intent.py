@@ -34,9 +34,10 @@ import llm_json
 log = logging.getLogger("mojo.video_intent")
 
 TASKS = ("summary", "key_points", "transcript", "answer", "caption", "about", "none")
+DETAILS = ("brief", "standard", "detailed")
 
 _SYSTEM = """You route a WhatsApp user's message that contains a video link (YouTube / Instagram / TikTok / Facebook / X). Reply with ONE JSON object only:
-{"task": "summary"|"key_points"|"transcript"|"answer"|"caption"|"about"|"none", "wants_caption": boolean, "wants_stats": boolean, "verify": boolean, "research": boolean, "research_query": string, "question": string, "target_words": integer|null}
+{"task": "summary"|"key_points"|"transcript"|"answer"|"caption"|"about"|"none", "wants_caption": boolean, "wants_stats": boolean, "verify": boolean, "research": boolean, "research_query": string, "detail": "brief"|"standard"|"detailed", "question": string, "target_words": integer|null}
 
 task:
 - "answer": a SPECIFIC question about or using the video's content: is it true/real/legit/a scam, give the steps / how to do it, what does he say about X, price, names, explain a part, pros/cons, translate it, "kya process hai".
@@ -50,6 +51,7 @@ wants_caption: true ONLY if the user explicitly asks for the caption / descripti
 wants_stats: true ONLY if the user explicitly asks for likes / views / comments / shares / posting date / creator details.
 verify: true if the user asks whether the video's claims are true / real / legit / fake / a scam, or to fact-check or verify them.
 research: true if the user asks you to research / look up / find out more / compare / get current facts (pricing, availability, alternatives, reviews, "the other N" things the video mentions but does not name) — information the video itself does not contain. Not for a bare summary request and not for plain "is this true" (that is verify). The video is still the starting point, so pick the task that fits how the video content should be read (usually "summary" or "answer").
+detail: how deep the user wants a summary/answer to be. "brief" = quick / short / gist / tl;dr / in a line or two. "detailed" = in detail / in depth / point by point / step by step / every point / thorough / explain fully / don't miss anything. Otherwise "standard". Judge by meaning in any language (Roman Urdu, Hindi, English, mixed), not by exact words.
 research_query: when research is true, ONE precise English web-search query using correct brand/product names (never ASR-garbled spellings); otherwise "".
 question: ONE standalone sentence stating what the user wants to know or get from the video, in the user's own language/style. Empty string for none.
 target_words: integer if the user gave a length (e.g. "400 word summary"), else null.
@@ -64,6 +66,7 @@ class VideoPlan:
     verify: bool = False
     research: bool = False
     research_query: str = ""
+    detail: str = "standard"
     question: str = ""
     target_words: Optional[int] = None
     source: str = "llm"  # "llm" | "legacy"
@@ -91,6 +94,9 @@ def _coerce(obj: dict) -> Optional[VideoPlan]:
         tw = max(80, min(2500, int(tw))) if tw not in (None, "", 0) else None
     except (TypeError, ValueError):
         tw = None
+    detail = str(obj.get("detail") or "standard").strip().lower()
+    if detail not in DETAILS:
+        detail = "standard"
     return VideoPlan(
         task=task,
         wants_caption=bool(obj.get("wants_caption")),
@@ -98,6 +104,7 @@ def _coerce(obj: dict) -> Optional[VideoPlan]:
         verify=bool(obj.get("verify")),
         research=bool(obj.get("research")),
         research_query=str(obj.get("research_query") or "").strip()[:300] if obj.get("research") else "",
+        detail=detail,
         question=str(obj.get("question") or "").strip()[:400],
         target_words=tw,
         source="llm",
@@ -139,8 +146,9 @@ def route(
         if plan:
             if not plan.question and plan.task in ("answer", "summary"):
                 plan.question = user
-            log.info("VIDEO_ROUTE task=%s caption=%s stats=%s verify=%s research=%s q=%r",
-                     plan.task, plan.wants_caption, plan.wants_stats, plan.verify, plan.research, plan.question[:100])
+            log.info("VIDEO_ROUTE task=%s caption=%s stats=%s verify=%s research=%s detail=%s tw=%s q=%r",
+                     plan.task, plan.wants_caption, plan.wants_stats, plan.verify, plan.research, plan.detail,
+                     plan.target_words, plan.question[:100])
             return plan
     except Exception as e:  # pragma: no cover - defensive
         log.warning("video route crashed: %s", e)
